@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<model type="com.apple.IDECoreDataModeler.DataModel" documentVersion="1.0" lastSavedToolsVersion="22757" systemVersion="23D2057" minimumToolsVersion="Automatic" sourceLanguage="Swift" userDefinedModelVersionIdentifier="1">
+    <entity name="CloudKitLocalEntity" representedClassName="CloudKitLocalEntity" syncable="YES">
+        <attribute name="id" attributeType="String"/>
+        <attribute name="localId" attributeType="String"/>
+        <fetchIndex name="byIdIndex">
+            <fetchIndexElement property="id" type="Binary" order="ascending"/>
+        </fetchIndex>
+        <fetchIndex name="byLocalIdIndex">
+            <fetchIndexElement property="localId" type="Binary" order="ascending"/>
+        </fetchIndex>
+    </entity>
+    <entity name="CloudKitRemoval" representedClassName=".CloudKitRemoval" syncable="YES">
+        <attribute name="id" attributeType="String"/>
+        <relationship name="sharedZone" optional="YES" maxCount="1" deletionRule="Nullify" destinationEntity="CloudKitZone" inverseName="removals" inverseEntity="CloudKitZone"/>
+        <fetchIndex name="byIdIndex">
+            <fetchIndexElement property="id" type="Binary" order="ascending"/>
+        </fetchIndex>
+    </entity>
+    <entity name="CloudKitShare" representedClassName="CloudKitShare" syncable="YES">
+        <attribute name="id" attributeType="String"/>
+        <attribute name="rawShare" optional="YES" attributeType="Binary"/>
+        <fetchIndex name="byIdIndex">
+            <fetchIndexElement property="id" type="Binary" order="ascending"/>
+        </fetchIndex>
+    </entity>
+    <entity name="CloudKitUpdate" representedClassName=".CloudKitUpdate" syncable="YES">
+        <attribute name="id" attributeType="String"/>
+        <attribute name="lastChangeDate" attributeType="Date" usesScalarValueType="NO"/>
+        <attribute name="rawChangedKeys" attributeType="String" defaultValueString=""/>
+        <attribute name="recordType" attributeType="String"/>
+        <relationship name="sharedZone" optional="YES" maxCount="1" deletionRule="Nullify" destinationEntity="CloudKitZone" inverseName="updates" inverseEntity="CloudKitZone"/>
+        <fetchIndex name="byIdIndex">
+            <fetchIndexElement property="id" type="Binary" order="ascending"/>
+        </fetchIndex>
+    </entity>
+    <entity name="CloudKitZone" representedClassName="CloudKitZone" syncable="YES">
+        <attribute name="name" attributeType="String"/>
+        <attribute name="owner" attributeType="String"/>
+        <attribute name="rawChangeToken" optional="YES" attributeType="Binary"/>
+        <relationship name="removals" optional="YES" toMany="YES" deletionRule="Cascade" destinationEntity="CloudKitRemoval" inverseName="sharedZone" inverseEntity="CloudKitRemoval"/>
+        <relationship name="updates" optional="YES" toMany="YES" deletionRule="Cascade" destinationEntity="CloudKitUpdate" inverseName="sharedZone" inverseEntity="CloudKitUpdate"/>
+        <fetchIndex name="byNameAndOwnerIndex">
+            <fetchIndexElement property="name" type="Binary" order="ascending"/>
+            <fetchIndexElement property="owner" type="Binary" order="ascending"/>
+        </fetchIndex>
+    </entity>
+    <entity name="SDSSynchronizerSavedState" representedClassName="SDSSynchronizerSavedState" syncable="YES">
+        <attribute name="didCreatePrivateSubscription" attributeType="Boolean" defaultValueString="NO" usesScalarValueType="YES"/>
+        <attribute name="didCreateSharedSubscription" attributeType="Boolean" defaultValueString="NO" usesScalarValueType="YES"/>
+        <attribute name="didCreateZone" attributeType="Boolean" defaultValueString="NO" usesScalarValueType="YES"/>
+        <attribute name="rawChangeToken" optional="YES" attributeType="Binary"/>
+        <attribute name="rawUserId" optional="YES" attributeType="Binary"/>
+    </entity>
+</model>

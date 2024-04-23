@@ -1,0 +1,146 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "ckerror.bootstrapFailed" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bootstrap Failed"
+          }
+        }
+      }
+    },
+    "settings.sync" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sync"
+          }
+        }
+      }
+    },
+    "settings.sync.forceSyncButtonTitle" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Force Sync"
+          }
+        }
+      }
+    },
+    "share.error.couldNotFindObject" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Could not find object to share"
+          }
+        }
+      }
+    },
+    "share.error.objectIsNotSharable" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Object is not sharable"
+          }
+        }
+      }
+    },
+    "sharing.uploadingPopover.text" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Uploading..."
+          }
+        }
+      }
+    },
+    "sync.state.bootstrapping" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bootstrapping..."
+          }
+        }
+      }
+    },
+    "sync.state.error %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sync Error: %@"
+          }
+        }
+      }
+    },
+    "sync.state.lastSyncDate %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Last Sync: %@"
+          }
+        }
+      }
+    },
+    "sync.state.notLoggedIntoIcloud" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Not Logged Into iCloud"
+          }
+        }
+      }
+    },
+    "sync.state.synchronizing" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Synchronizing..."
+          }
+        }
+      }
+    },
+    "sync.state.waitingForApp" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Waiting for App"
+          }
+        }
+      }
+    },
+    "sync.state.waitingForNetwork" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Waiting for Network"
+          }
+        }
+      }
+    },
+    "sync.updatesToSend %lld" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld Uploads remaining"
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.0"
+}
