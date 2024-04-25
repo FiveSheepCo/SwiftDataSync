@@ -137,8 +137,6 @@ private extension NSRelationshipDescription {
             case .without(let without):
                 if without.contains(name) {
                     shouldDefinetelyNotSync = true
-                } else {
-                    shouldDefinetelySync = true
                 }
             }
         }
