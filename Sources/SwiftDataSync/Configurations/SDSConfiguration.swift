@@ -14,24 +14,24 @@ public struct SDSConfiguration {
             case noSync
             
             /// Indicates synchronization with specified properties.
-            case sync(PropertiesSync, parentKey: AnyKeyPath? = nil, isSharable: Bool = false)
+            case sync(PropertiesSync, parentKey: String? = nil, isSharable: Bool = false)
             
             /// Description of properties synchronization settings.
             public enum PropertiesSync {
                 
                 /// Sync with specified properties.
-                case with([AnyKeyPath])
+                case with([String])
                 
                 /// Sync without specified properties.
-                case without([AnyKeyPath])
+                case without([String])
                 
                 /// Convert PropertiesSync enum to its raw form.
                 var raw: Entity.PropertiesSync {
                     switch self {
                     case .with(let with):
-                        return .with(with.map(\.propertyString))
+                        return .with(with)
                     case .without(let without):
-                        return .without(without.map(\.propertyString))
+                        return .without(without)
                     }
                 }
             }
@@ -89,7 +89,7 @@ public struct SDSConfiguration {
             case .sync(let propertiesSync, let parentKey, let isSharable):
                 .sync(
                     propertiesSync.raw,
-                    parentKey: parentKey?.propertyString,
+                    parentKey: parentKey,
                     isSharable: isSharable
                 )
             }

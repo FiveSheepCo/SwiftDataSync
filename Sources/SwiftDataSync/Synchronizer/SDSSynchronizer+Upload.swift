@@ -38,13 +38,13 @@ extension SDSSynchronizer {
             operation.perRecordSaveBlock = { _, result in
                 switch result {
                 case .success(let record): doneRecords.append(record)
-                case .failure(let error): self.logger.log("Error while uploading single record: \(error)")
+                case .failure(let error): self.logger.log("Error while uploading single record: \(error, privacy: .public)") // TODO: This should propably hold the auto upload for 15 minutes or something and show the error for the user to display
                 }
             }
             operation.perRecordDeleteBlock = { recordId, result in
                 switch result {
                 case .success: doneDeletes.append(recordId)
-                case .failure(let error): self.logger.log("Error while deleting single record: \(error)")
+                case .failure(let error): self.logger.log("Error while deleting single record: \(error, privacy: .public)")
                 }
             }
             operation.modifyRecordsResultBlock = { operationResult in
@@ -73,19 +73,19 @@ extension SDSSynchronizer {
         let updates = CloudKitUpdate.retrieve()
         let records = updates.filter({ object -> Bool in
             (object.sharedZone != nil) == sharedDatabase
-        }).map(record(for:))
+        }).compactMap(record(for:))
         
         return records
     }
     
-    private func record(for update: CloudKitUpdate) -> CKRecord {
+    private func record(for update: CloudKitUpdate) -> CKRecord? {
         let id = update.id
         let recordId = update.recordId
         let record = CKRecord(recordType: update.recordType, recordID: recordId)
         
         let changedKeys = update.changedKeys
         logger.log("[Upload] Changed from `CloudKitUpdate`: \(changedKeys)")
-        self.observedUpdateContext!.performAndWait {
+        let shouldContinue = self.observedUpdateContext!.performAndWait {
             guard let container = find(for: id) else {
                 fatalError("This should never happen, it cannot be that the object doesn't exist, unless the background context is out of sync with the viewContext.")
             }
@@ -106,15 +106,20 @@ extension SDSSynchronizer {
             let syncKeys = changedKeys.filter { key in
                 container.syncKeys.contains(key)
             }
+            if syncKeys.isEmpty {
+                return false
+            }
             
             for (key, value) in container.changeDictionary(for: syncKeys) {
-                #if DEBUG
-                logger.log("Setting `\(String(describing: value))` for \(key)")
-                #else
-                logger.log("Setting value for \(key)")
-                #endif
+                logger.log("Setting `\(String(describing: value), privacy: .private)` for \(key, privacy: .public)")
                 record[key] = value
             }
+            return true
+        }
+        
+        if !shouldContinue {
+            update.delete()
+            return nil
         }
         
         return record
