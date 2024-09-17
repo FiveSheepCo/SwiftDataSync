@@ -15,16 +15,6 @@ private let bootstrapFailedError: SDSSyncError = SDSSyncError(title: "ckerror.bo
 
 extension SDSSynchronizer {
     
-    var uploadDelta: TimeInterval {
-        let lastUploadInterval = lastCompletedUpload?.timeIntervalSinceNow ?? -TimeInterval.greatestFiniteMagnitude
-        return -lastUploadInterval - minUploadDeltaInterval
-    }
-    
-    var downloadDelta: TimeInterval {
-        let lastDownloadInterval = lastCompletedDownload?.timeIntervalSinceNow ?? -TimeInterval.greatestFiniteMagnitude
-        return -lastDownloadInterval - minRoutineDownloadDeltaInterval
-    }
-    
     public func forceDownload() {
         lastCompletedDownload = nil
         startSync()
@@ -133,11 +123,11 @@ extension SDSSynchronizer {
         Task { @MainActor in
             let minInterval: TimeInterval
             if case .error(let error) = viewModel.state, let retryAfterSeconds = (error as? CKError)?.retryAfterSeconds {
-                minInterval = retryAfterSeconds
+                minInterval = retryAfterSeconds * 1.5
             } else {
-                minInterval = -self.downloadDelta
+                minInterval = minRoutineDownloadDeltaInterval
             }
-            self.routineSyncTimer = Timer.scheduledTimer(withTimeInterval: minInterval * 2, repeats: false) { _ in
+            self.routineSyncTimer = Timer.scheduledTimer(withTimeInterval: minInterval, repeats: false) { _ in
                 self.routineSyncTimer = nil
                 self.startSync()
             }
