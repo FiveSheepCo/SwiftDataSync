@@ -8,8 +8,8 @@ import Network
 private let notificationCenter = NotificationCenter.default
 
 public class SDSSynchronizer {
-    
     public static let shared = SDSSynchronizer()
+    public static var appGroupToStoreSyncData: String?
     
     enum Constants {
         static let zoneName = "CoreData"
@@ -71,6 +71,14 @@ public class SDSSynchronizer {
             managedObjectModel: model
         )
         
+        if
+            let appGroup = Self.appGroupToStoreSyncData,
+            let containerUrl = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup)
+        {
+            container.persistentStoreDescriptions = [
+                .init(url: containerUrl.appendingPathComponent("CloudKitSync.sqlite"))
+            ]
+        }
         container.loadPersistentStores(completionHandler: { (storeDescription, error) in
             if let error {
                 fatalError("Unresolved error \(error)")
