@@ -48,9 +48,9 @@ extension SDSSynchronizer {
                     let nserror = error as NSError
                     fatalError("Unresolved error saving SDSSynchronizer.context \(nserror), \(nserror.userInfo)")
                 }
+                
+                self.startSync()
             }
-            
-            self.startSync()
         }
     }
 }

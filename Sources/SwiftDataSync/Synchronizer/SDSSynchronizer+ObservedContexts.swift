@@ -45,9 +45,7 @@ extension SDSSynchronizer {
         // Changes cannot be handled here as we do not get useful information about the properties that have changed
         handleChangedObjects(insertedObjects, inserted: true)
         
-        if self.context.hasChanges {
-            self.save()
-        }
+        self.save()
     }
     
     func handleChangedObjects(_ objects: [SDSSynchronizableContainer], inserted: Bool = false) {
