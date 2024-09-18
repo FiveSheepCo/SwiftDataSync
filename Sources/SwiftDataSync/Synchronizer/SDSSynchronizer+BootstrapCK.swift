@@ -3,10 +3,6 @@ import CoreData
 import CloudKit
 import OSLog
 
-private var minUploadDeltaInterval: TimeInterval {
-    return generalLoadMultiplier
-}
-
 private var minRoutineDownloadDeltaInterval: TimeInterval {
     return generalLoadMultiplier * 60
 }
@@ -106,7 +102,7 @@ extension SDSSynchronizer {
             await set(state: (error as? SDSStateError)?.state ?? .error(error))
         }
         
-        self.setRoutineTimer()
+        await self.setRoutineTimer()
     }
     
     internal func updateUpdatesToSend() async {
@@ -117,8 +113,8 @@ extension SDSSynchronizer {
         await viewModel.set(updatesToSend: updatesToSend)
     }
     
-    private func setRoutineTimer() {
-        guard routineSyncTimer == nil else { return }
+    private func setRoutineTimer() async {
+        guard routineSyncTimer == nil, case .error = await viewModel.state else { return }
         
         Task { @MainActor in
             let minInterval: TimeInterval
