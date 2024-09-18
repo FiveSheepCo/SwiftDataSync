@@ -141,54 +141,58 @@ private class CKDownloadHandler {
             return
         }
         
-        guard let container = retrieveObject(for: record) else { return }
-        let object = container.object
-        for (key, value) in kVPs {
-            if key != SDSSynchronizer.Constants.parentWorkaroundKey {
-                
-                // This workaround is needed for some records where there can be a merge conflict
-                // when the parent object references the child because it uses an ordered set.
-                // When 2 devices add an item at the same time this can create an item with a missing parent.
-                // This is the sending end fix.
-                // TODO(later): This is only done for parent references right now, should propably be done for others too?
-                if let value = (value as? NSOrderedSet)?.array as? [NSManagedObject],
-                   let before = (object.value(forKey: key) as? NSOrderedSet)?.array as? [NSManagedObject] {
+        guard let container = retrieveObject(for: record, preliminaryUpdateHandler: { container in
+            guard let container else { return }
+            
+            let object = container.object
+            for (key, value) in kVPs {
+                if key != SDSSynchronizer.Constants.parentWorkaroundKey {
                     
-                    for child in before
-                        where !value.contains(child) && child.synchronizableContainer?.parent == object
-                    {
-                        objectsToEnsureParentReferencesFor.append((container, CKRecord.Reference(record: record, action: .none)))
+                    // This workaround is needed for some records where there can be a merge conflict
+                    // when the parent object references the child because it uses an ordered set.
+                    // When 2 devices add an item at the same time this can create an item with a missing parent.
+                    // This is the sending end fix.
+                    // TODO(later): This is only done for parent references right now, should propably be done for others too?
+                    if let value = (value as? NSOrderedSet)?.array as? [NSManagedObject],
+                       let before = (object.value(forKey: key) as? NSOrderedSet)?.array as? [NSManagedObject] {
+                        
+                        for child in before
+                            where !value.contains(child) && child.synchronizableContainer?.parent == object
+                        {
+                            objectsToEnsureParentReferencesFor.append((container, CKRecord.Reference(record: record, action: .none)))
+                        }
                     }
-                }
-                
-                let type = object.entity.attributesByName[key]?.type
-                if let value = value as? SDSSynchronizableContainer {
-                    object.setValue(value.object, forKey: key)
-                } else if let data = value as? Data, type != .binaryData {
-                    if let transformerName = object.entity.attributesByName[key]?.valueTransformerName {
-                        let transformer = ValueTransformer(forName: .init(transformerName))!
-                        object.setValue(transformer.reverseTransformedValue(data), forKey: key)
+                    
+                    let type = object.entity.attributesByName[key]?.type
+                    if let value = value as? SDSSynchronizableContainer {
+                        object.setValue(value.object, forKey: key)
+                    } else if let data = value as? Data, type != .binaryData {
+                        if let transformerName = object.entity.attributesByName[key]?.valueTransformerName {
+                            let transformer = ValueTransformer(forName: .init(transformerName))!
+                            object.setValue(transformer.reverseTransformedValue(data), forKey: key)
+                        } else {
+                            do {
+                                object.setValue(try JSONSerialization.jsonObject(with: data), forKey: key)
+                            }
+                            catch {
+                                synchronizer.logger.log("Failed setting json object for key `\(object.entity.name ?? "")`.`\(key)`: \(String(data: data, encoding: .utf8) ?? "FAIL")")
+                            }
+                        }
+                    } else if let string = value as? String, type == .uri {
+                        object.setValue(URL(string: string), forKey: key)
                     } else {
-                        do {
-                            object.setValue(try JSONSerialization.jsonObject(with: data), forKey: key)
-                        }
-                        catch {
-                            synchronizer.logger.log("Failed setting json object for key `\(object.entity.name ?? "")`.`\(key)`: \(String(data: data, encoding: .utf8) ?? "FAIL")")
-                        }
+                        object.setValue(value, forKey: key)
                     }
-                } else if let string = value as? String, type == .uri {
-                    object.setValue(URL(string: string), forKey: key)
-                } else {
-                    object.setValue(value, forKey: key)
                 }
             }
-        }
+            
+            synchronizer.logger.log("Object updated: \(object)")
+        }) else { return }
+        
         if let reference = record.parent {
             // This is the receiving end fix for the problem a few lines above.
             objectsToEnsureParentReferencesFor.append((container, reference))
         }
-        
-        synchronizer.logger.log("Object updated: \(object)")
     }
     
     private func valuesIfAllReferencesExist(for record: CKRecord) -> [String: Any?]? {
@@ -227,11 +231,12 @@ private class CKDownloadHandler {
         synchronizer.find(for: recordID.recordName)
     }
     
-    private func retrieveObject(for record: CKRecord) -> SDSSynchronizableContainer? {
+    private func retrieveObject(for record: CKRecord, preliminaryUpdateHandler: (SDSSynchronizableContainer?) -> Void) -> SDSSynchronizableContainer? {
         synchronizer.retrieve(
             for: record.recordID.recordName,
             entityName: record.recordType,
-            context: context
+            context: context,
+            preliminaryUpdateHandler: preliminaryUpdateHandler
         )
     }
     

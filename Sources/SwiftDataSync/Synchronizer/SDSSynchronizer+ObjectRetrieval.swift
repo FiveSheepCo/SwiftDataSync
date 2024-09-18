@@ -55,11 +55,18 @@ extension SDSSynchronizer {
         return container(id: id, object: observedUpdateContext.object(with: localID))
     }
     
-    func retrieve(for id: String, entityName: String, context: NSManagedObjectContext) -> SDSSynchronizableContainer? {
+    func retrieve(
+        for id: String,
+        entityName: String,
+        context: NSManagedObjectContext,
+        preliminaryUpdateHandler: (SDSSynchronizableContainer?) -> Void
+    ) -> SDSSynchronizableContainer? {
         if let update = find(for: id) {
+            preliminaryUpdateHandler(update)
             return update
         } else {
             let object = NSEntityDescription.insertNewObject(forEntityName: entityName, into: context)
+            preliminaryUpdateHandler(container(id: id, object: object))
             try! context.save()
             
             self.context.performAndWait {

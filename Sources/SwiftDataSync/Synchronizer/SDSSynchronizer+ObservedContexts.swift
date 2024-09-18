@@ -28,7 +28,6 @@ extension SDSSynchronizer {
         let updatedObjects = (userInfo[NSUpdatedObjectsKey] as? NSSet ?? []).compactMap(onlyIfSyncronizable)
         let deletedObjects = (userInfo[NSDeletedObjectsKey] as? NSSet ?? []).compactMap(onlyIfSyncronizable)
         
-        print("changed objects!", updatedObjects.count)
         handleChangedObjects(updatedObjects)
         handleDeletedObjects(deletedObjects)
     }
@@ -63,7 +62,7 @@ extension SDSSynchronizer {
                 // Keys that should sync are keys that have changed and are marked to sync
                 let changedKeys = Array(updated.object.changedValuesForCurrentEvent().keys)
                 
-                keysToSync  = changedKeys.filter { key -> Bool in
+                keysToSync = changedKeys.filter { key -> Bool in
                     allSyncKeys.contains(key)
                 }
                 logger.log("Setting Update Keys: \(keysToSync)")
