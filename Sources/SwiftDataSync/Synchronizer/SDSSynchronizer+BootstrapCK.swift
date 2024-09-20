@@ -90,11 +90,11 @@ extension SDSSynchronizer {
             
             try await bootstrap()
             
-            await set(state: .downloading)
-            try await download()
-            
             await set(state: .uploading)
             try await upload()
+            
+            await set(state: .downloading)
+            try await download()
             
             await set(state: .idle)
         }
