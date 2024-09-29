@@ -86,6 +86,8 @@ public class SDSSynchronizer {
         })
         self.container = container
         let context = container.newBackgroundContext()
+        context.automaticallyMergesChangesFromParent = true
+        context.mergePolicy = NSMergePolicy.mergeByPropertyObjectTrump
         self.context = context
         self.savedState = context.performAndWait({
             (try? context.fetch(SDSSynchronizerSavedState.fetchRequest()).first) ??
