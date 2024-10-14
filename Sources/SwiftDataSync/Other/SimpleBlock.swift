@@ -1,3 +1,3 @@
 import Foundation
 
-typealias SimpleBlock = () -> Void
+public typealias SimpleBlock = () -> Void
