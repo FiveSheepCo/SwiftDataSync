@@ -30,7 +30,7 @@ public struct NoticeView: View {
     let text: LocalizedStringKey
     let buttonConfiguration: (text: LocalizedStringKey, action: SimpleBlock)?
     
-    init(
+    public init(
         kind: NoticeView.Kind,
         text: LocalizedStringKey,
         buttonConfiguration: (text: LocalizedStringKey, action: SimpleBlock)? = nil
