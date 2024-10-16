@@ -49,6 +49,7 @@ public struct NoticeView: View {
             }
             VStack(alignment: .leading, spacing: 0) {
                 Text(text, bundle: .module)
+                    .lineLimit(nil)
                 if buttonConfiguration != nil {
                     Button(action: {
                         self.buttonConfiguration!.action()

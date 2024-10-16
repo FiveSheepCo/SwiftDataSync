@@ -60,22 +60,22 @@ extension SDSSynchronizer {
         entityName: String,
         context: NSManagedObjectContext,
         preliminaryUpdateHandler: (SDSSynchronizableContainer?) -> Void
-    ) -> SDSSynchronizableContainer? {
+    ) throws -> SDSSynchronizableContainer? {
         if let update = find(for: id) {
             preliminaryUpdateHandler(update)
             return update
         } else {
             let object = NSEntityDescription.insertNewObject(forEntityName: entityName, into: context)
             preliminaryUpdateHandler(container(id: id, object: object))
-            try! context.save()
+            try context.save()
             
-            self.context.performAndWait {
+            try self.context.performAndWait {
                 _ = CloudKitLocalEntity(
                     id: id,
                     localId: object.objectID.uriRepresentation().absoluteString,
                     context: self.context
                 )
-                try! self.context.save()
+                try self.context.save()
             }
             
             return container(id: id, object: object)

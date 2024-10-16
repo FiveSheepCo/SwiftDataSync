@@ -41,20 +41,20 @@ private struct _Footer: View {
     var body: some View {
         VStack(alignment: .leading) {
             switch model.state {
-            case .waitingForSetup, .waitingForContainerDetection:
-                Text("sync.state.waitingForApp", bundle: .module)
-            case .waitingForNetwork:
-                Text("sync.state.waitingForNetwork", bundle: .module)
-            case .notLoggedIntoIcloud:
-                Text("sync.state.notLoggedIntoIcloud", bundle: .module)
-            case .bootstrapping:
-                Text("sync.state.bootstrapping", bundle: .module)
-            case .uploading, .downloading:
-                Text("sync.state.synchronizing", bundle: .module)
-            case .idle:
-                Text("sync.state.lastSyncDate \(latestDateString ?? "never")", bundle: .module)
-            case .error(let error):
-                NoticeView(kind: .problem, text: "sync.state.error \(String(describing: error))")
+                case .waitingForSetup, .waitingForContainerDetection:
+                    Text("sync.state.waitingForApp", bundle: .module)
+                case .waitingForNetwork:
+                    Text("sync.state.waitingForNetwork", bundle: .module)
+                case .notLoggedIntoIcloud:
+                    Text("sync.state.notLoggedIntoIcloud", bundle: .module)
+                case .bootstrapping:
+                    Text("sync.state.bootstrapping", bundle: .module)
+                case .uploading, .downloading:
+                    Text("sync.state.synchronizing", bundle: .module)
+                case .idle:
+                    Text("sync.state.lastSyncDate \(latestDateString ?? "never")", bundle: .module)
+                case .error(let error):
+                    NoticeView(kind: .problem, text: "sync.state.error \(String(describing: error))")
             }
             Text("sync.updatesToSend \(model.updatesToSend)")
         }

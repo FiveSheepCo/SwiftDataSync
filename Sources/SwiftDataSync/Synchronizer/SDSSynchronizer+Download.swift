@@ -99,6 +99,8 @@ private class CKDownloadHandler {
     let isForSharedDatabase: Bool
     let completionHandler: (Error?) -> Void
     
+    private var didError: Bool = false
+    
     init(synchronizer: SDSSynchronizer, forSharedDatabase: Bool, completionHandler: @escaping (Error?) -> Void) {
         self.synchronizer = synchronizer
         self.context = synchronizer.observedUpdateContext
@@ -232,12 +234,21 @@ private class CKDownloadHandler {
     }
     
     private func retrieveObject(for record: CKRecord, preliminaryUpdateHandler: (SDSSynchronizableContainer?) -> Void) -> SDSSynchronizableContainer? {
-        synchronizer.retrieve(
-            for: record.recordID.recordName,
-            entityName: record.recordType,
-            context: context,
-            preliminaryUpdateHandler: preliminaryUpdateHandler
-        )
+        do {
+            return try synchronizer.retrieve(
+                for: record.recordID.recordName,
+                entityName: record.recordType,
+                context: context,
+                preliminaryUpdateHandler: preliminaryUpdateHandler
+            )
+        }
+        catch {
+            if !didError {
+                self.didError = true
+                completionHandler(error)
+            }
+            return nil
+        }
     }
     
     func deleted(recordID: CKRecord.ID, recordType:String) {
@@ -279,6 +290,8 @@ private class CKDownloadHandler {
                 self._changed(record: record)
             }
         }
+        
+        guard !didError else { return }
         
         if let changeToken = changeToken {
             if isForSharedDatabase {
@@ -338,6 +351,8 @@ private class CKDownloadHandler {
     }
     
     func fetchOverallCompletion(result: Result<Void, Error>) {
+        guard !didError else { return }
+        
         switch result {
         case .success:
             synchronizer.logger.log("Database fetch completed successfully")
