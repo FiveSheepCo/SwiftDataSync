@@ -23,7 +23,12 @@ class SDSSharableContainer: SDSSynchronizableContainer {
         return share
     }
     
-    override init(id: String, object: NSManagedObject, parentKey: String?, syncKeys: [String]) {
+    override init(
+        id: @escaping () -> String,
+        object: NSManagedObject,
+        parentKey: String? = nil,
+        syncKeys: [String] = []
+    ) {
         super.init(id: id, object: object, parentKey: parentKey, syncKeys: syncKeys)
     }
 }

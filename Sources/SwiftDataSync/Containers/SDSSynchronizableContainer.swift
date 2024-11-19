@@ -2,20 +2,23 @@ import Foundation
 import CoreData
 import CloudKit
 
+// All of this should be run on `observedUpdateContext`, but `lastObjectChange`
 class SDSSynchronizableContainer {
-    let id: String
+    lazy var id: String = idBlock()
     let object: NSManagedObject
     
     let parentKey: String?
     let syncKeys: [String]
     
+    private let idBlock: () -> String
+    
     init(
-        id: String,
+        id: @escaping () -> String,
         object: NSManagedObject,
         parentKey: String? = nil,
         syncKeys: [String] = []
     ) {
-        self.id = id
+        self.idBlock = id
         self.object = object
         self.parentKey = parentKey
         self.syncKeys = syncKeys

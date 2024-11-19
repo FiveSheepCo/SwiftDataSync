@@ -71,10 +71,9 @@ extension SDSSynchronizer {
             // Make sure there are keys that have changed
             guard !keysToSync.isEmpty else { continue }
             
-            let id = updated.id
             let entityName = updated.object.entity.name!
             
-            setUpdate(id: id, zoneId: updated.sharedZoneId, entityName: entityName, changedKeys: keysToSync)
+            setUpdate(idBlock: { updated.id }, zoneId: updated.sharedZoneId, entityName: entityName, changedKeys: keysToSync)
         }
     }
     
@@ -82,13 +81,12 @@ extension SDSSynchronizer {
         for delete in objects {
             // Delete the share if neccesary
             if delete is SDSSharableContainer {
-                let id = delete.id
                 self.context.perform {
-                    CloudKitShare.updateShare(nil, for: id, context: self.context)
+                    CloudKitShare.updateShare(nil, for: delete.id, context: self.context)
                 }
             }
             
-            setRemoval(id: delete.id, zoneId: delete.sharedZoneId)
+            setRemoval(idBlock: { delete.id }, zoneId: delete.sharedZoneId)
         }
     }
     

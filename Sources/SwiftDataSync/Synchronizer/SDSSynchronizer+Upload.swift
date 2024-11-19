@@ -7,6 +7,8 @@ extension SDSSynchronizer {
     func upload() async throws {
         try await _upload(sharedDatabase: false)
         try await _upload(sharedDatabase: true)
+        
+        save()
     }
     
     private func _upload(sharedDatabase: Bool) async throws {
@@ -49,17 +51,17 @@ extension SDSSynchronizer {
             }
             operation.modifyRecordsResultBlock = { operationResult in
                 switch operationResult {
-                case .success:
-                    self.context.performAndWait {
-                        self.deleteObjects(for: doneRecords, deletes: doneDeletes, startDate: startDate)
-                        
-                        self.logger.log("Operation completed: \(doneRecords.count) \(doneDeletes.count)")
-                    }
-                    continuation.resume()
-                case .failure(let error):
-                    // TODO: Handle limit exceeded error (requests can have 400 records, which is statically in this lib, but can also only have 2MB, which we cannot easily determine)
-                    self.logger.log("Error while uploading records: \(error)")
-                    continuation.resume(throwing: error)
+                    case .success:
+                        self.context.performAndWait {
+                            self.deleteObjects(for: doneRecords, deletes: doneDeletes, startDate: startDate)
+                            
+                            self.logger.log("Operation completed: \(doneRecords.count) \(doneDeletes.count)")
+                        }
+                        continuation.resume()
+                    case .failure(let error):
+                        // TODO: Handle limit exceeded error (requests can have 400 records, which is statically in this lib, but can also only have 2MB, which we cannot easily determine)
+                        self.logger.log("Error while uploading records: \(error)")
+                        continuation.resume(throwing: error)
                 }
             }
             database.add(operation)
@@ -85,10 +87,12 @@ extension SDSSynchronizer {
         
         let changedKeys = update.changedKeys
         logger.log("[Upload] Changed from `CloudKitUpdate`: \(changedKeys)")
+        
+        guard let container = find(for: id) else {
+            fatalError("This should never happen, it cannot be that the object doesn't exist, unless the background context is out of sync with the viewContext.")
+        }
+        
         let shouldContinue = self.observedUpdateContext!.performAndWait {
-            guard let container = find(for: id) else {
-                fatalError("This should never happen, it cannot be that the object doesn't exist, unless the background context is out of sync with the viewContext.")
-            }
             
             // Synchronize parent, but only if parent is changed
             if let parentKey = container.parentKey,
@@ -144,11 +148,13 @@ extension SDSSynchronizer {
             
             // TODO(later): make new "changedKeys" out of isDone, so that it uploads only the newly changed things
             var isDone: Bool = true
+            
+            guard let container = find(for: id) else {
+                fatalError("This should never happen, it cannot be that the object doesn't exist, unless the background context is out of sync with the viewContext.")
+            }
+            let lastChange = container.lastObjectChange
+            
             self.observedUpdateContext?.performAndWait {
-                guard let container = find(for: id) else {
-                    fatalError("This should never happen, it cannot be that the object doesn't exist, unless the background context is out of sync with the viewContext.")
-                }
-                
                 // Check parent, but only if parent is changed
                 var expectedParentId: String? = nil
                 if let parentKey = container.parentKey,
@@ -162,7 +168,7 @@ extension SDSSynchronizer {
                     return
                 }
                 
-                if let lastChange = container.lastObjectChange, lastChange > startDate {
+                if let lastChange, lastChange > startDate {
                     isDone = false
                     logger.log("Scheduling another upload as for `\(record.recordType)` has changed")
                     return
@@ -178,7 +184,5 @@ extension SDSSynchronizer {
         for delete in deletes {
             CloudKitRemoval.retrieve(for: delete.recordName, context: context).delete()
         }
-        
-        save()
     }
 }

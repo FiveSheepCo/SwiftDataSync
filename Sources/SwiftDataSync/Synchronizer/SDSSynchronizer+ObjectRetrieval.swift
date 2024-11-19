@@ -13,7 +13,7 @@ extension SDSSynchronizer {
     }
     
     private func container(
-        id: @autoclosure () -> String,
+        id: @escaping () -> String,
         object: NSManagedObject
     ) -> SDSSynchronizableContainer? {
         guard
@@ -25,14 +25,14 @@ extension SDSSynchronizer {
         
         if entity.isSharable {
             return SDSSharableContainer(
-                id: id(),
+                id: id,
                 object: object,
                 parentKey: entity.parentKey,
                 syncKeys: entity.syncedProperties
             )
         } else {
             return SDSSynchronizableContainer(
-                id: id(),
+                id: id,
                 object: object,
                 parentKey: entity.parentKey,
                 syncKeys: entity.syncedProperties
@@ -47,12 +47,14 @@ extension SDSSynchronizer {
             existingLocalEntity(for: id)
         }
         
-        guard 
-            let localEntity: CloudKitLocalEntity = result,
-            let localID = observedStore.managedObjectID(forURIRepresentation: URL(string: localEntity.localId)!)
-        else { return nil }
-        
-        return container(id: id, object: observedUpdateContext.object(with: localID))
+        return observedUpdateContext.performAndWait { () -> SDSSynchronizableContainer? in
+            guard
+                let localEntity: CloudKitLocalEntity = result,
+                let localID = observedStore.managedObjectID(forURIRepresentation: URL(string: localEntity.localId)!)
+            else { return nil }
+            
+            return container(id: { id }, object: observedUpdateContext.object(with: localID))
+        }
     }
     
     func retrieve(
@@ -66,7 +68,7 @@ extension SDSSynchronizer {
             return update
         } else {
             let object = NSEntityDescription.insertNewObject(forEntityName: entityName, into: context)
-            preliminaryUpdateHandler(container(id: id, object: object))
+            preliminaryUpdateHandler(container(id: { id }, object: object))
             try context.save()
             
             try self.context.performAndWait {
@@ -78,7 +80,7 @@ extension SDSSynchronizer {
                 try self.context.save()
             }
             
-            return container(id: id, object: object)
+            return container(id: { id }, object: object)
         }
     }
     
@@ -98,6 +100,6 @@ extension SDSSynchronizer {
             }
         }
         
-        return container(id: id(), object: object)
+        return container(id: id, object: object)
     }
 }
