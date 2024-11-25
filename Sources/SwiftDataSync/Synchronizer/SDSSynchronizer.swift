@@ -128,7 +128,7 @@ public class SDSSynchronizer {
     public func setup(
         containerName: String,
         configuration: SDSConfiguration = .init(swiftDataEntities: []),
-        modelContainer: @autoclosure () -> ModelContainer
+        modelContainer: @autoclosure () -> ModelContainer?
     ) {
         self.cloudContainer = CKContainer(identifier: containerName)
         self.cloudPrivateDatabase = cloudContainer.privateCloudDatabase
@@ -210,7 +210,7 @@ private class _ContainerFinder {
     }
     
     init(
-        closure: () -> ModelContainer,
+        closure: () -> ModelContainer?,
         completion: @escaping (NSPersistentStoreCoordinator) -> Void
     ) {
         self.containerObservation = NotificationCenter.default.addObserver(forName: .NSPersistentStoreCoordinatorStoresDidChange, object: nil, queue: .main) { [weak self] notification in
@@ -220,7 +220,7 @@ private class _ContainerFinder {
         }
         self.completion = completion
         
-        let container = closure()
+        guard let container = closure() else { return }
         let urls = container.configurations.map(\.url)
         
         assert(!urls.isEmpty, "The ModelContainer supplied to SDSSynchronizer should have at least one URL.")
