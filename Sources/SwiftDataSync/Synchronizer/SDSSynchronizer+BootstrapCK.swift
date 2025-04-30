@@ -35,16 +35,27 @@ extension SDSSynchronizer {
     private func checkLoggedIntoIcloud() async throws {
         if await !viewModel.isLoggedIntoiCloud {
             // TODO(later): Handle user change, CKAccountChanged notification
-            if let userRecordID = try? await cloudContainer.userRecordID() {
-                logger.log("Logged in to iCloud")
-                context.performAndWait {
-                    savedState.userId = userRecordID
-                }
-                await viewModel.set(loggedIntoiCloud: true)
-            } else {
-                logger.log("Not logged in to iCloud")
+            
+            guard let accountStatus = try? await cloudContainer.accountStatus() else {
+                logger.log("No Account Status")
                 throw SDSStateError(state: .notLoggedIntoIcloud)
             }
+            
+            guard accountStatus == .available else {
+                logger.log("Account Status is not `available`: \(accountStatus.rawValue, privacy: .public)")
+                throw SDSStateError(state: .notLoggedIntoIcloud)
+            }
+            
+            guard let userRecordID = try? await cloudContainer.userRecordID() else {
+                logger.log("No user record id")
+                throw SDSStateError(state: .notLoggedIntoIcloud)
+            }
+            
+            logger.log("Logged in to iCloud")
+            context.performAndWait {
+                savedState.userId = userRecordID
+            }
+            await viewModel.set(loggedIntoiCloud: true)
         }
     }
     
