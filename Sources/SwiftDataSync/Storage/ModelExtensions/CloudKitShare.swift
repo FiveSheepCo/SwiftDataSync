@@ -26,13 +26,6 @@ extension CloudKitShare {
                 update.share = share
             } else {
                 _ = CloudKitShare(id: id, share: share, context: context)
-                do {
-                    try context.save()
-                    SDSSynchronizer.shared.logger.log("Saved sync context after adding Share")
-                }
-                catch let error {
-                    SDSSynchronizer.shared.logger.log("Could not save sync context after adding Share with error: \(error)")
-                }
             }
         } else {
             update?.delete()

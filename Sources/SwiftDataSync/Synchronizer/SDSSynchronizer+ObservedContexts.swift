@@ -37,14 +37,22 @@ extension SDSSynchronizer {
         
         let insertedObjects = (userInfo[NSInsertedObjectsKey] as? NSSet ?? []).compactMap(onlyIfSyncronizable)
         
-        self.saveObserved()
-        
-        // Inserted objects are handled from the contextSaved notification
-        // Inserted objects only have a valid managed object id after being saved
-        // Changes cannot be handled here as we do not get useful information about the properties that have changed
-        handleChangedObjects(insertedObjects, inserted: true)
-        
-        self.save()
+        Task {
+            await viewModel.waitForIdle(setting: .processingSaveEvent)
+            
+            try! self.observedUpdateContext!.save()
+            
+            // Inserted objects are handled from the contextSaved notification
+            // Inserted objects only have a valid managed object id after being saved
+            // Changes cannot be handled here as we do not get useful information about the properties that have changed
+            handleChangedObjects(insertedObjects, inserted: true)
+            
+            try! self.context.save()
+            
+            await viewModel.set(state: .idle)
+            
+            self.startSync()
+        }
     }
     
     func handleChangedObjects(_ objects: [SDSSynchronizableContainer], inserted: Bool = false) {
@@ -87,23 +95,6 @@ extension SDSSynchronizer {
             }
             
             setRemoval(idBlock: { delete.id }, zoneId: delete.sharedZoneId)
-        }
-    }
-    
-    func saveObserved() {
-        guard let context = self.observedUpdateContext else { return }
-        
-        context.performAndWait {
-            if context.hasChanges {
-                do {
-                    try context.save()
-                } catch {
-                    // Replace this implementation with code to handle the error appropriately.
-                    // fatalError() causes the application to generate a crash log and terminate. You should not use this function in a shipping application, although it may be useful during development.
-                    let nserror = error as NSError
-                    fatalError("Unresolved error saving SDSSynchronizer.context \(nserror), \(nserror.userInfo)")
-                }
-            }
         }
     }
 }

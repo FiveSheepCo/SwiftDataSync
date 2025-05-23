@@ -32,9 +32,8 @@ class SDSSynchronizableContainer {
     func delete() {
         guard let context = object.managedObjectContext else { return }
         
-        context.performAndWait {
+        try context.performAndWait {
             context.delete(object)
-            try! context.save()
         }
         
         let sync = SDSSynchronizer.shared

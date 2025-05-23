@@ -59,6 +59,15 @@ public class SDSSynchronizer {
     
     let savedState: SDSSynchronizerSavedState
     
+    /// The `CloudKitLocalEntity`s for temporary objects.
+    var temporaryObjectContainers: [NSManagedObject: CloudKitLocalEntity] = [:]
+    
+    func temporaryObject(for id: String) -> NSManagedObject? {
+        temporaryObjectContainers.first { (key: NSManagedObject, value: CloudKitLocalEntity) in
+            value.id == id
+        }?.key
+    }
+    
     // MARK: - Initializer
     
     private init() {

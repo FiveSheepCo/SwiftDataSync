@@ -11,6 +11,16 @@
         }
       }
     },
+    "error.noObservedContext" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No observed context"
+          }
+        }
+      }
+    },
     "settings.sync" : {
       "localizations" : {
         "en" : {
@@ -97,6 +107,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Not Logged Into iCloud"
+          }
+        }
+      }
+    },
+    "sync.state.processing" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Processing…"
+          }
+        }
+      }
+    },
+    "sync.state.savingShare" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Saving Share..."
           }
         }
       }

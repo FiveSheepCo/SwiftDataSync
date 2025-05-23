@@ -11,7 +11,7 @@ public struct SDSSharingProgressView<Content: View>: View {
     }
     
     public var body: some View {
-        PopoverView(popoverActive: $viewModel.isSavingShare, content: content) {
+        PopoverView(popoverActive: .constant(viewModel.isSavingShare), content: content) {
             VStack(spacing: 20) {
                 Image(systemName: "square.and.arrow.up.on.square")
                     .resizable()

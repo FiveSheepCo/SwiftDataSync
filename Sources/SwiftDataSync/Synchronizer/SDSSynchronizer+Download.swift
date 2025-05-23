@@ -66,9 +66,6 @@ extension SDSSynchronizer {
                 
                 logger.log("Download completed")
                 
-                // Save the state
-                self.save()
-                
                 self.lastCompletedDownload = Date()
                 
                 continuation.resume()
@@ -98,8 +95,6 @@ private class CKDownloadHandler {
     weak var context: NSManagedObjectContext!
     let isForSharedDatabase: Bool
     let completionHandler: (Error?) -> Void
-    
-    private var didError: Bool = false
     
     init(synchronizer: SDSSynchronizer, forSharedDatabase: Bool, completionHandler: @escaping (Error?) -> Void) {
         self.synchronizer = synchronizer
@@ -132,7 +127,6 @@ private class CKDownloadHandler {
                     for: share.recordID.recordName.replacingOccurrences(of: staticShareExtension, with: ""),
                     context: context
                 )
-                self.synchronizer.save()
             }
             return
         }
@@ -207,7 +201,7 @@ private class CKDownloadHandler {
                 if let object = findObject(for: reference.recordID) {
                     values[key] = object
                 } else {
-                    print("noObject1:", reference.recordID)
+                    synchronizer.logger.log("noObject1: \(reference.recordID) for \(key)")
                     return nil
                 }
             } else if let references = value as? [CKRecord.Reference] {
@@ -216,7 +210,7 @@ private class CKDownloadHandler {
                     if let container = findObject(for: reference.recordID) {
                         objects.append(container)
                     } else {
-                        print("noObject2:", reference.recordID)
+                        synchronizer.logger.log("noObject2: \(reference.recordID)")
                         return nil
                     }
                 }
@@ -234,21 +228,12 @@ private class CKDownloadHandler {
     }
     
     private func retrieveObject(for record: CKRecord, preliminaryUpdateHandler: (SDSSynchronizableContainer?) -> Void) -> SDSSynchronizableContainer? {
-        do {
-            return try synchronizer.retrieve(
-                for: record.recordID.recordName,
-                entityName: record.recordType,
-                context: context,
-                preliminaryUpdateHandler: preliminaryUpdateHandler
-            )
-        }
-        catch {
-            if !didError {
-                self.didError = true
-                completionHandler(error)
-            }
-            return nil
-        }
+        synchronizer.retrieve(
+            for: record.recordID.recordName,
+            entityName: record.recordType,
+            context: context,
+            preliminaryUpdateHandler: preliminaryUpdateHandler
+        )
     }
     
     func deleted(recordID: CKRecord.ID, recordType:String) {
@@ -291,8 +276,6 @@ private class CKDownloadHandler {
             }
         }
         
-        guard !didError else { return }
-        
         if let changeToken = changeToken {
             if isForSharedDatabase {
                 let context = synchronizer.context
@@ -320,13 +303,14 @@ private class CKDownloadHandler {
             
             if !recordsToAddLater.isEmpty {
                 synchronizer.logger.log("RecordsToAddLater not empty!")
-                assert(!finalCompletion)
+                
+                assertionFailure("This should not happen in a shipping application. We will try to fix this up by deleting all records in question in a non-debug scenario.")
+                
+                let db = isForSharedDatabase ? synchronizer.cloudSharedDatabase : synchronizer.cloudPrivateDatabase
+                db?.add(CKModifyRecordsOperation(recordIDsToDelete: recordsToAddLater.map(\.recordID)))
             } else {
                 synchronizer.logger.log("All current records added.")
-                _save()
             }
-            
-            synchronizer.save()
         }
     }
     
@@ -351,7 +335,32 @@ private class CKDownloadHandler {
     }
     
     func fetchOverallCompletion(result: Result<Void, Error>) {
-        guard !didError else { return }
+        synchronizer.logger.log("Fetch Overall Completion")
+        
+        guard let observedContext = synchronizer.observedUpdateContext else {
+            synchronizer.logger.log("No observed context")
+            completionHandler(SDSSyncError(title: "error.noObservedContext"))
+            return
+        }
+        
+        do { try observedContext.save() }
+        catch {
+            synchronizer.logger.log("Observed Context save error: \(error)")
+            completionHandler(error)
+            return
+        }
+        
+        for (object, container) in synchronizer.temporaryObjectContainers {
+            container.localId = object.objectID.uriRepresentation().absoluteString
+        }
+        synchronizer.temporaryObjectContainers = [:]
+        
+        do { try synchronizer.context.save() }
+        catch {
+            synchronizer.logger.log("Sync Context save error: \(error)")
+            completionHandler(error)
+            return
+        }
         
         switch result {
         case .success:
@@ -360,19 +369,6 @@ private class CKDownloadHandler {
         case .failure(let error):
             synchronizer.logger.log("Database fetch completed with error: \(error)")
             completionHandler(error)
-        }
-    }
-    
-    private func _save() {
-        if context.hasChanges {
-            do {
-                try context.save()
-            } catch {
-                // Replace this implementation with code to handle the error appropriately.
-                // fatalError() causes the application to generate a crash log and terminate. You should not use this function in a shipping application, although it may be useful during development.
-                let nserror = error as NSError
-                fatalError("Unresolved error saving CKDownloadHandler.context \(nserror), \(nserror.userInfo)")
-            }
         }
     }
 }

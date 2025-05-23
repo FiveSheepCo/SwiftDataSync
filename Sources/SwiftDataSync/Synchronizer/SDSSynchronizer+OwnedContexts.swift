@@ -38,23 +38,4 @@ extension SDSSynchronizer {
             }
         }
     }
-    
-    func save() {
-        let context = self.context
-        
-        context.performAndWait {
-            if context.hasChanges {
-                do {
-                    try context.save()
-                } catch {
-                    // Replace this implementation with code to handle the error appropriately.
-                    // fatalError() causes the application to generate a crash log and terminate. You should not use this function in a shipping application, although it may be useful during development.
-                    let nserror = error as NSError
-                    fatalError("Unresolved error saving SDSSynchronizer.context \(nserror), \(nserror.userInfo)")
-                }
-                
-                self.startSync()
-            }
-        }
-    }
 }

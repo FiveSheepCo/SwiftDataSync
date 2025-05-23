@@ -55,6 +55,10 @@ private struct _Footer: View {
                     Text("sync.state.lastSyncDate \(latestDateString ?? "never")", bundle: .module)
                 case .error(let error):
                     NoticeView(kind: .problem, text: "sync.state.error \(String(describing: error))")
+                case .processingSaveEvent:
+                    Text("sync.state.processing", bundle: .module)
+                case .savingShare:
+                    Text("sync.state.savingShare", bundle: .module)
             }
             Text("sync.updatesToSend \(model.updatesToSend)")
         }

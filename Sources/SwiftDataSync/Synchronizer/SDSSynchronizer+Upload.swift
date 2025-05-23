@@ -8,7 +8,7 @@ extension SDSSynchronizer {
         try await _upload(sharedDatabase: false)
         try await _upload(sharedDatabase: true)
         
-        save()
+        try self.context.save()
     }
     
     private func _upload(sharedDatabase: Bool) async throws {

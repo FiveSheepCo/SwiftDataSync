@@ -14,7 +14,7 @@ extension CloudKitZone {
     }
     
     var calculatedId: CKRecordZone.ID {
-        .init(zoneName: name, ownerName: owner)
+        CKRecordZone.ID(zoneName: name, ownerName: owner)
     }
     
     @discardableResult

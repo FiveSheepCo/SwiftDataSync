@@ -16,6 +16,9 @@ public class SDSSynchronizationViewModel {
         case downloading
         case idle
         
+        case processingSaveEvent
+        case savingShare
+        
         case notLoggedIntoIcloud
         case error(Error)
     }
@@ -29,11 +32,16 @@ public class SDSSynchronizationViewModel {
     
     public private(set) var lastCompletionDate: Date? = nil
     
-    public internal(set) var isSavingShare: Bool = false
-    
     public internal(set) var isLoggedIntoiCloud: Bool = false
     
     public internal(set) var updatesToSend: Int = 0
+    
+    public var isSavingShare: Bool {
+        if case .savingShare = state {
+            return true
+        }
+        return false
+    }
     
     // MARK: Initializer
     
@@ -55,6 +63,21 @@ public class SDSSynchronizationViewModel {
         
         self.set(state: .bootstrapping)
         return true
+    }
+    
+    private var isSettable: Bool {
+        switch state {
+        case .idle, .error, .waitingForNetwork, .notLoggedIntoIcloud: true
+        default: false
+        }
+    }
+    
+    func waitForIdle(setting state: State) async {
+        while !isSettable {
+            try! await Task.sleep(for: .seconds(1))
+        }
+        
+        self.set(state: state)
     }
     
     func set(state: State) {

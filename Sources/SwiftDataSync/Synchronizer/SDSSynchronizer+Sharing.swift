@@ -82,23 +82,22 @@ extension SDSSynchronizer {
         }
     }
     
+    func waitForIdle() async {
+        while case .idle = await viewModel.state {
+            try! await Task.sleep(for: .seconds(1))
+        }
+    }
+    
     public func acceptShare(with metadata: CKShare.Metadata) async throws {
         let acceptSharesOperation = CKAcceptSharesOperation(shareMetadatas: [metadata])
         
-        try await withCheckedThrowingContinuation { continuation in
+        let share = try await withCheckedThrowingContinuation { continuation in
             acceptSharesOperation.perShareResultBlock = { metadata, result in
                 switch result {
                 case .success(let share):
                     self.logger.log("Share accepted: \(share)")
                     
-                    let context = self.context
-                    context.performAndWait {
-                        CloudKitZone.addZone(with: share.recordID.zoneID, context: context)
-                        self.save()
-                        
-                        self.forceDownload() // TODO(later): return new root object
-                    }
-                    continuation.resume()
+                    continuation.resume(returning: share)
                 case .failure(let error):
                     self.logger.log("Share could not be accepted: \(error.localizedDescription)")
                     continuation.resume(throwing: error)
@@ -106,6 +105,21 @@ extension SDSSynchronizer {
             }
             
             cloudContainer.add(acceptSharesOperation)
+        }
+        
+        await viewModel.waitForIdle(setting: .savingShare)
+        
+        let context = self.context
+        try context.performAndWait {
+            
+            CloudKitZone.addZone(with: share.recordID.zoneID, context: context)
+            try self.context.save()
+            
+            Task {
+                await viewModel.set(state: .idle)
+                
+                self.forceDownload() // TODO(later): return new root object
+            }
         }
     }
 }
