@@ -290,27 +290,27 @@ private class CKDownloadHandler {
             synchronizer.logger.log("ChangeToken updated")
         }
         
-        if finalCompletion {
-            // The problem this solves is described in a huge comment above.
-            for (container, reference) in objectsToEnsureParentReferencesFor {
-                if let parent = findObject(for: reference.recordID)?.object,
-                   !container.object.isDeleted,
-                    container.parent != parent {
-                    container.parent = parent
-                }
+        guard finalCompletion else { return }
+        
+        // The problem this solves is described in a huge comment above.
+        for (container, reference) in objectsToEnsureParentReferencesFor {
+            if let parent = findObject(for: reference.recordID)?.object,
+               !container.object.isDeleted,
+               container.parent != parent {
+                container.parent = parent
             }
-            objectsToEnsureParentReferencesFor = []
+        }
+        objectsToEnsureParentReferencesFor = []
+        
+        if !recordsToAddLater.isEmpty {
+            synchronizer.logger.log("RecordsToAddLater not empty!")
             
-            if !recordsToAddLater.isEmpty {
-                synchronizer.logger.log("RecordsToAddLater not empty!")
-                
-                assertionFailure("This should not happen in a shipping application. We will try to fix this up by deleting all records in question in a non-debug scenario.")
-                
-                let db = isForSharedDatabase ? synchronizer.cloudSharedDatabase : synchronizer.cloudPrivateDatabase
-                db?.add(CKModifyRecordsOperation(recordIDsToDelete: recordsToAddLater.map(\.recordID)))
-            } else {
-                synchronizer.logger.log("All current records added.")
-            }
+            assertionFailure("This should not happen in a shipping application. We will try to fix this up by deleting all records in question in a non-debug scenario.")
+            
+            let db = isForSharedDatabase ? synchronizer.cloudSharedDatabase : synchronizer.cloudPrivateDatabase
+            db?.add(CKModifyRecordsOperation(recordIDsToDelete: recordsToAddLater.map(\.recordID)))
+        } else {
+            synchronizer.logger.log("All current records added.")
         }
     }
     
@@ -346,7 +346,15 @@ private class CKDownloadHandler {
         do { try observedContext.save() }
         catch {
             synchronizer.logger.log("Observed Context save error: \(error)")
-            completionHandler(error)
+            
+            if tryFixingObservedContext(error: error) {
+                synchronizer.logger.log("Succeeded trying to fix save errors. Trying to save again.")
+                fetchOverallCompletion(result: result)
+            } else {
+                synchronizer.logger.log("Failed fixing the save errors")
+                completionHandler(error)
+            }
+            
             return
         }
         
@@ -370,5 +378,53 @@ private class CKDownloadHandler {
             synchronizer.logger.log("Database fetch completed with error: \(error)")
             completionHandler(error)
         }
+    }
+    
+    /// Tries fixing the given error and returns whether the context should try to save again or a fix was not possible.
+    private func tryFixingObservedContext(error: any Error) -> Bool {
+        guard let nsError = error as? NSError else {
+            synchronizer.logger.log("tryFixingObservedContext: Not an NSError")
+            return false
+        }
+        
+        // If there are detailed sub-errors, recursively try to fix each
+        if let subErrors = nsError.userInfo[NSDetailedErrorsKey] as? [NSError] {
+            synchronizer.logger.log("tryFixingObservedContext: Iterating over detailed errors")
+            var fixed = false
+            for subError in subErrors {
+                synchronizer.logger.log("tryFixingObservedContext: Detailed error start")
+                fixed = tryFixingObservedContext(error: subError) || fixed
+            }
+            synchronizer.logger.log("tryFixingObservedContext: Detailed errors: \(fixed)")
+            return fixed // Return whether any of the errors were fixed
+        }
+        
+        guard nsError.code == NSValidationMissingMandatoryPropertyError else {
+            synchronizer.logger.log("tryFixingObservedContext: Code not correct: \(nsError.code, privacy: .public)")
+            return false
+        }
+        
+        guard let object = nsError.userInfo[NSValidationObjectErrorKey] as? NSManagedObject else {
+            let keys = nsError.userInfo.keys.joined(separator: ", ")
+            synchronizer.logger.log("tryFixingObservedContext: No error object: \(keys, privacy: .public)")
+            return false
+        }
+        
+        guard let container = object.synchronizableContainer else {
+            synchronizer.logger.log("tryFixingObservedContext: Object is not a synchronizable object: \(object.entity.name ?? "Unknown")")
+            return false
+        }
+        
+        // Delete CloudKit entry
+        let recordId = container.recordId
+        let db = isForSharedDatabase ? synchronizer.cloudSharedDatabase : synchronizer.cloudPrivateDatabase
+        db?.add(CKModifyRecordsOperation(recordIDsToDelete: recordsToAddLater.map(\.recordID)))
+        
+        // Delete object and reference
+        container.delete()
+        
+        synchronizer.logger.log("tryFixingObservedContext: Fixed object by deleting: \(object.entity.name ?? "Unknown")")
+        
+        return true
     }
 }

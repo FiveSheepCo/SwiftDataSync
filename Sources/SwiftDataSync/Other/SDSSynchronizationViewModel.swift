@@ -81,7 +81,7 @@ public class SDSSynchronizationViewModel {
     }
     
     func set(state: State) {
-        logger.log("New State: \(String(describing: state))")
+        logger.log("New State: \(String(describing: state), privacy: .public)")
         self.state = state
         self.lastStateChange = .now
     }
