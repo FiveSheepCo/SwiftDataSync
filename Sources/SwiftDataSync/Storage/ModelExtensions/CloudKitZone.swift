@@ -17,8 +17,9 @@ extension CloudKitZone {
         CKRecordZone.ID(zoneName: name, ownerName: owner)
     }
     
+    /// Retrieves the zone if it exists, creates a new one if not.
     @discardableResult
-    static func addZone(with zoneId: CKRecordZone.ID, context: NSManagedObjectContext) -> CloudKitZone {
+    static func getZone(with zoneId: CKRecordZone.ID, context: NSManagedObjectContext) -> CloudKitZone {
         if let zone = retrieveZone(for: zoneId) {
             return zone
         }
@@ -33,11 +34,6 @@ extension CloudKitZone {
         request.predicate = NSPredicate(format: "name = %@ AND owner = %@", zoneId.zoneName, zoneId.ownerName)
         
        return try? request.execute().first
-    }
-    
-    static func updateToken(_ token: CKServerChangeToken, for zoneId: CKRecordZone.ID, context: NSManagedObjectContext) {
-        let zone = addZone(with: zoneId, context: context)
-        zone.changeToken = token
     }
     
     static func getAll() -> [CloudKitZone] {

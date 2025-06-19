@@ -18,7 +18,7 @@ extension SDSSynchronizer {
         
         self.context.performAndWait {
             for id in ids {
-                CloudKitZone.addZone(with: id, context: self.context)
+                CloudKitZone.getZone(with: id, context: self.context)
             }
         }
     }
@@ -93,6 +93,7 @@ private class CKDownloadHandler {
     
     weak var synchronizer: SDSSynchronizer!
     weak var context: NSManagedObjectContext!
+    private var tokensToUpdate: [CKRecordZone.ID?: CKServerChangeToken] = [:]
     let isForSharedDatabase: Bool
     let completionHandler: (Error?) -> Void
     
@@ -278,14 +279,9 @@ private class CKDownloadHandler {
         
         if let changeToken = changeToken {
             if isForSharedDatabase {
-                let context = synchronizer.context
-                context.performAndWait {
-                    CloudKitZone.addZone(with: zoneID, context: context).changeToken = changeToken
-                }
+                tokensToUpdate[zoneID] = changeToken
             } else {
-                context.performAndWait {
-                    synchronizer.savedState.changeToken = changeToken
-                }
+                tokensToUpdate[zoneID] = changeToken
             }
             synchronizer.logger.log("ChangeToken updated")
         }
@@ -362,6 +358,15 @@ private class CKDownloadHandler {
             container.localId = object.objectID.uriRepresentation().absoluteString
         }
         synchronizer.temporaryObjectContainers = [:]
+        
+        for (zoneID, changeToken) in tokensToUpdate {
+            if let zoneID {
+                CloudKitZone.getZone(with: zoneID, context: context).changeToken = changeToken
+            } else {
+                synchronizer.savedState.changeToken = changeToken
+            }
+        }
+        tokensToUpdate = [:]
         
         do { try synchronizer.context.save() }
         catch {

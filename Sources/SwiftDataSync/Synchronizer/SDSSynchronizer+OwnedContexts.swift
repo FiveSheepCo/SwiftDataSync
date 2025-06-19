@@ -19,7 +19,7 @@ extension SDSSynchronizer {
             }
             update.changedKeys = storageChangedKeys
             if let zoneId = zoneId {
-                update.sharedZone = CloudKitZone.addZone(with: zoneId, context: context)
+                update.sharedZone = CloudKitZone.getZone(with: zoneId, context: context)
             }
         }
     }
@@ -34,7 +34,7 @@ extension SDSSynchronizer {
             let removal = CloudKitRemoval.retrieve(for: id, context: context)
             
             if let zoneId = zoneId {
-                removal.sharedZone = CloudKitZone.addZone(with: zoneId, context: context)
+                removal.sharedZone = CloudKitZone.getZone(with: zoneId, context: context)
             }
         }
     }

@@ -112,7 +112,7 @@ extension SDSSynchronizer {
         let context = self.context
         try context.performAndWait {
             
-            CloudKitZone.addZone(with: share.recordID.zoneID, context: context)
+            CloudKitZone.getZone(with: share.recordID.zoneID, context: context)
             try self.context.save()
             
             Task {
