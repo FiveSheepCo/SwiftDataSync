@@ -281,7 +281,7 @@ private class CKDownloadHandler {
             if isForSharedDatabase {
                 tokensToUpdate[zoneID] = changeToken
             } else {
-                tokensToUpdate[zoneID] = changeToken
+                tokensToUpdate[nil] = changeToken
             }
             synchronizer.logger.log("ChangeToken updated")
         }
@@ -361,7 +361,7 @@ private class CKDownloadHandler {
         
         for (zoneID, changeToken) in tokensToUpdate {
             if let zoneID {
-                CloudKitZone.getZone(with: zoneID, context: context).changeToken = changeToken
+                CloudKitZone.getZone(with: zoneID, context: synchronizer.context).changeToken = changeToken
             } else {
                 synchronizer.savedState.changeToken = changeToken
             }
