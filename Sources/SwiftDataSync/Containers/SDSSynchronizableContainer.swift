@@ -101,7 +101,7 @@ extension SDSSynchronizableContainer {
                 fatalError("`\(self.object.entity.name ?? "")`.`\(key)` is not a valid CKRecordValue or JSON object: \(value) \((object.entity.propertiesByName[key] as? NSAttributeDescription)?.type.rawValue.rawValue)")
             }
             
-            result[key] = cloudValue
+            result[self.object.entity.propertiesByName[key]?.renamingIdentifier ?? key] = cloudValue
         }
     }
     

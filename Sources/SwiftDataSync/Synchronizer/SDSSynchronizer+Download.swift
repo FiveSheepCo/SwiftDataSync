@@ -117,7 +117,7 @@ private class CKDownloadHandler {
             self._changed(record: record)
         }
     }
-    
+
     private func _changed(record: CKRecord) {
         // Catch CKShare
         if let share = record as? CKShare {
@@ -131,20 +131,22 @@ private class CKDownloadHandler {
             }
             return
         }
-        
+
         // Make sure dependent objects exist, and prefill all values if they do
         guard let kVPs = self.valuesIfAllReferencesExist(for: record) else {
             self.recordsToAddLater.append(record)
             return
         }
-        
+
         guard let container = retrieveObject(for: record, preliminaryUpdateHandler: { container in
             guard let container else { return }
-            
+
             let object = container.object
-            for (key, value) in kVPs {
-                if key != SDSSynchronizer.Constants.parentWorkaroundKey {
-                    
+            for (rawKey, value) in kVPs {
+                guard rawKey != SDSSynchronizer.Constants.parentWorkaroundKey else { return }
+
+                    let key = findCorrespondingKey(entity: object.entity, rawKey: rawKey)
+
                     // This workaround is needed for some records where there can be a merge conflict
                     // when the parent object references the child because it uses an ordered set.
                     // When 2 devices add an item at the same time this can create an item with a missing parent.
@@ -152,14 +154,14 @@ private class CKDownloadHandler {
                     // TODO(later): This is only done for parent references right now, should propably be done for others too?
                     if let value = (value as? NSOrderedSet)?.array as? [NSManagedObject],
                        let before = (object.value(forKey: key) as? NSOrderedSet)?.array as? [NSManagedObject] {
-                        
+
                         for child in before
                             where !value.contains(child) && child.synchronizableContainer?.parent == object
                         {
                             objectsToEnsureParentReferencesFor.append((container, CKRecord.Reference(record: record, action: .none)))
                         }
                     }
-                    
+
                     let type = object.entity.attributesByName[key]?.type
                     if let value = value as? SDSSynchronizableContainer {
                         object.setValue(value.object, forKey: key)
@@ -180,18 +182,30 @@ private class CKDownloadHandler {
                     } else {
                         object.setValue(value, forKey: key)
                     }
-                }
             }
-            
+
             synchronizer.logger.log("Object updated: \(object)")
         }) else { return }
-        
+
         if let reference = record.parent {
             // This is the receiving end fix for the problem a few lines above.
             objectsToEnsureParentReferencesFor.append((container, reference))
         }
     }
-    
+
+    private func findCorrespondingKey(entity: NSEntityDescription, rawKey: String) -> String {
+        if entity.propertiesByName[rawKey] != nil {
+            return rawKey
+        }
+
+        for property in entity.properties where property.renamingIdentifier == rawKey {
+            return property.name
+        }
+
+        assertionFailure()
+        return rawKey
+    }
+
     private func valuesIfAllReferencesExist(for record: CKRecord) -> [String: Any?]? {
         var values = [String: Any?]()
         
