@@ -407,8 +407,22 @@ private class CKDownloadHandler {
         }
         
         // If there are detailed sub-errors, recursively try to fix each
-        if let subErrors = nsError.userInfo[NSDetailedErrorsKey] as? [NSError] {
-            synchronizer.logger.log("tryFixingObservedContext: Iterating over detailed errors")
+        if let subErrorsAny = nsError.userInfo[NSDetailedErrorsKey] {
+            guard let subErrorsArray = subErrorsAny as? [Any] else {
+                synchronizer.logger.log("tryFixingObservedContext: NSDetailedErrors is no array: \("\(subErrorsAny)", privacy: .public)")
+                return false
+            }
+            
+            var subErrors: [NSError] = []
+            for possible in subErrorsArray {
+                guard let nsError = possible as? NSError else {
+                    synchronizer.logger.log("tryFixingObservedContext: NSDetailedError single value is no NSError: \("\(possible)", privacy: .public)")
+                    continue
+                }
+                subErrors.append(nsError)
+            }
+            
+            synchronizer.logger.log("tryFixingObservedContext: Iterating over detailed errors: \(subErrors.count, privacy: .public)")
             var fixed = false
             for subError in subErrors {
                 synchronizer.logger.log("tryFixingObservedContext: Detailed error start")
