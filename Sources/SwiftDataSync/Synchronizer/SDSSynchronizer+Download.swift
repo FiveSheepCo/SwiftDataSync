@@ -60,7 +60,7 @@ extension SDSSynchronizer {
                 
                 if let error = error {
                     continuation.resume(throwing: error)
-                    logger.log("Download completion Error: \(error)")
+                    logger.log("Download completion Error: \(error, privacy: .public)")
                     return
                 }
                 
@@ -401,6 +401,7 @@ private class CKDownloadHandler {
     
     /// Tries fixing the given error and returns whether the context should try to save again or a fix was not possible.
     private func tryFixingObservedContext(error: any Error) -> Bool {
+        synchronizer.logger.log("tryFixingObservedContext starting: \(error.localizedDescription, privacy: .public)")
         guard let nsError = error as? NSError else {
             synchronizer.logger.log("tryFixingObservedContext: Not an NSError")
             return false
