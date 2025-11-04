@@ -28,14 +28,16 @@ extension SDSSynchronizer {
                 id: id,
                 object: object,
                 parentKey: entity.parentKey,
-                syncKeys: entity.syncedProperties
+                syncKeys: entity.syncedProperties,
+                assetKeys: entity.assetProperties
             )
         } else {
             return SDSSynchronizableContainer(
                 id: id,
                 object: object,
                 parentKey: entity.parentKey,
-                syncKeys: entity.syncedProperties
+                syncKeys: entity.syncedProperties,
+                assetKeys: entity.assetProperties
             )
         }
     }

@@ -14,7 +14,7 @@ public struct SDSConfiguration {
             case noSync
             
             /// Indicates synchronization with specified properties.
-            case sync(PropertiesSync, parentKey: String? = nil, isSharable: Bool = false)
+            case sync(PropertiesSync, assetProperties: [String] = [], parentKey: String? = nil, isSharable: Bool = false)
             
             /// Description of properties synchronization settings.
             public enum PropertiesSync {
@@ -71,7 +71,7 @@ public struct SDSConfiguration {
         case noSync
         
         /// Indicates synchronization with specified properties.
-        case sync(PropertiesSync, parentKey: String? = nil, isSharable: Bool = false)
+        case sync(PropertiesSync, assetProperties: [String] = [], parentKey: String? = nil, isSharable: Bool = false)
     }
     
     /// Dictionary containing entity descriptions keyed by entity names.
@@ -86,9 +86,10 @@ public struct SDSConfiguration {
             entityDescriptions[String(describing: entity.entity)] = switch entity.description {
             case .noSync:
                 .noSync
-            case .sync(let propertiesSync, let parentKey, let isSharable):
+            case .sync(let propertiesSync, let assetProperties, let parentKey, let isSharable):
                 .sync(
                     propertiesSync.raw,
+                    assetProperties: assetProperties,
                     parentKey: parentKey,
                     isSharable: isSharable
                 )

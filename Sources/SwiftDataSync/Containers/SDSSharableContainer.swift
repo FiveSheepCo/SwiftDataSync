@@ -27,8 +27,9 @@ class SDSSharableContainer: SDSSynchronizableContainer {
         id: @escaping () -> String,
         object: NSManagedObject,
         parentKey: String? = nil,
-        syncKeys: [String] = []
+        syncKeys: [String] = [],
+        assetKeys: [String]
     ) {
-        super.init(id: id, object: object, parentKey: parentKey, syncKeys: syncKeys)
+        super.init(id: id, object: object, parentKey: parentKey, syncKeys: syncKeys, assetKeys: assetKeys)
     }
 }

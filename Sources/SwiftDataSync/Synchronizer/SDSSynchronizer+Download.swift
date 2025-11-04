@@ -165,6 +165,9 @@ private class CKDownloadHandler {
                     let type = object.entity.attributesByName[key]?.type
                     if let value = value as? SDSSynchronizableContainer {
                         object.setValue(value.object, forKey: key)
+                    } else if let asset = value as? CKAsset {
+                        let data = asset.fileURL.map({ try! Data(contentsOf: $0) })
+                        object.setValue(data, forKey: key)
                     } else if let data = value as? Data, type != .binaryData {
                         if let transformerName = object.entity.attributesByName[key]?.valueTransformerName {
                             let transformer = ValueTransformer(forName: .init(transformerName))!
@@ -460,5 +463,14 @@ private class CKDownloadHandler {
         synchronizer.logger.log("tryFixingObservedContext: Fixed object by deleting: \(object.entity.name ?? "Unknown")")
         
         return true
+    }
+}
+
+extension CKAsset {
+    convenience init(data: Data) throws {
+        let tempURL = URL.cachesDirectory.appending(component: UUID().uuidString, directoryHint: .notDirectory)
+        try data.write(to: tempURL)
+        
+        self.init(fileURL: tempURL)
     }
 }

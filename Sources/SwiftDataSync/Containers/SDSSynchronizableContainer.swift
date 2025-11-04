@@ -9,6 +9,7 @@ class SDSSynchronizableContainer {
     
     let parentKey: String?
     let syncKeys: [String]
+    let assetKeys: [String]
     
     private let idBlock: () -> String
     
@@ -16,12 +17,14 @@ class SDSSynchronizableContainer {
         id: @escaping () -> String,
         object: NSManagedObject,
         parentKey: String? = nil,
-        syncKeys: [String] = []
+        syncKeys: [String] = [],
+        assetKeys: [String]
     ) {
         self.idBlock = id
         self.object = object
         self.parentKey = parentKey
         self.syncKeys = syncKeys
+        self.assetKeys = assetKeys
     }
     
     var parent: NSManagedObject? {
@@ -88,7 +91,9 @@ extension SDSSynchronizableContainer {
             {
                 let transformer = ValueTransformer(forName: .init(transformerName))!
                 cloudValue = transformer.transformedValue(value) as? any CKRecordValue
-            }  else if let recordValue = value as? CKRecordValue {
+            } else if let data = value as? Data, self.assetKeys.contains(key) {
+                cloudValue = try! CKAsset(data: data)
+            } else if let recordValue = value as? CKRecordValue {
                 cloudValue = recordValue
             } else if
                 JSONSerialization.isValidJSONObject(value),

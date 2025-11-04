@@ -21,7 +21,7 @@ extension NSPersistentStoreCoordinator {
             switch externalDescriptions[relationship.entity.name ?? ""] {
             case .none: break
             case .noSync: continue // Entities that are not synced should not have their relationships synced either.
-            case .sync(let properties, let parentKey, _):
+            case .sync(let properties, _, let parentKey, _):
                 (shouldDefinetelySync, shouldDefinetelyNotSync) = relationship.syncProperties(properties: properties, parentKey: parentKey)
             }
             
@@ -33,7 +33,7 @@ extension NSPersistentStoreCoordinator {
                 switch externalDescriptions[inverse.entity.name ?? ""] {
                 case .none: break
                 case .noSync: continue // Entities that are not synced should not have their relationships synced either.
-                case .sync(let properties, let parentKey, _):
+                case .sync(let properties, _, let parentKey, _):
                     (inverseShouldDefinetelySync, inverseShouldDefinetelyNotSync) = relationship.syncProperties(properties: properties, parentKey: parentKey)
                 }
                 
@@ -91,7 +91,7 @@ extension NSPersistentStoreCoordinator {
         
         for (entityName, entityDescription) in entities {
             let description = externalDescriptions[entityDescription.name ?? ""] ?? .sync(.all, parentKey: nil)
-            guard case .sync(let properties, let parentKey, let isSharable) = description else { continue }
+            guard case .sync(let properties, let assetProperties, let parentKey, let isSharable) = description else { continue }
             
             configurationEntities[entityName] =
                 SDSInternalConfiguration.Entity(
@@ -101,15 +101,13 @@ extension NSPersistentStoreCoordinator {
                         }
                         
                         let name = property.name
-//                        if name == "download" {
-//                            print("x:", (property as? NSCompositeAttributeDescription)?.elements.map(\.name), (property as? NSCompositeAttributeDescription)?.elements.first?.type.rawValue.rawValue, (property as? NSCompositeAttributeDescription)?.elements.first?.entity.name)
-//                        }
                         
                         return switch properties {
                         case .with(let with): with.contains(name)
                         case .without(let without): !without.contains(name)
                         }
                     }).map(\.name),
+                    assetProperties: assetProperties,
                     parentKey: parentKey,
                     isSharable: isSharable
                 )
