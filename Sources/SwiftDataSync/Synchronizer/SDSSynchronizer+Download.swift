@@ -14,7 +14,8 @@ extension SDSSynchronizer {
     }
     
     private func refreshSharedZoneIDs() async throws {
-        let ids = try await cloudSharedDatabase.allRecordZones().map(\.zoneID)
+        // CloudKit shared zones always have the zoneName of the private zone that originally shared it. That said, all shared zones should always have the name of the default zone.
+        let ids = try await cloudSharedDatabase.allRecordZones().map(\.zoneID).filter({ $0.zoneName == defaultZoneID.zoneName })
         
         self.context.performAndWait {
             for id in ids {
@@ -44,7 +45,7 @@ extension SDSSynchronizer {
             context.performAndWait {
                 let options = CKFetchRecordZoneChangesOperation.ZoneConfiguration(previousServerChangeToken: savedState.changeToken)
                 
-                configurations = [Constants.zoneId: options]
+                configurations = [defaultZoneID: options]
             }
         }
         

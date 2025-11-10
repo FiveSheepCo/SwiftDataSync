@@ -50,7 +50,7 @@ extension SDSSynchronizer {
         
         let id = sharable.recordId
         let record = CKRecord(recordType: sharable.object.entity.name!, recordID: id)
-        let shareId = CKRecord.ID(recordName: "\(id.recordName)\(staticShareExtension)", zoneID: SDSSynchronizer.Constants.zoneId)
+        let shareId = CKRecord.ID(recordName: "\(id.recordName)\(staticShareExtension)", zoneID: SDSSynchronizer.shared.defaultZoneID)
         let share = CKShare(rootRecord: record, shareID: shareId)
         share.publicPermission = .readWrite
         share[CKShare.SystemFieldKey.title] = title
@@ -89,6 +89,10 @@ extension SDSSynchronizer {
     }
     
     public func acceptShare(with metadata: CKShare.Metadata) async throws {
+        guard metadata.share.recordID.zoneID.zoneName == defaultZoneID.zoneName else {
+            fatalError() // This should not be possible
+        }
+        
         let acceptSharesOperation = CKAcceptSharesOperation(shareMetadatas: [metadata])
         
         let share = try await withCheckedThrowingContinuation { continuation in

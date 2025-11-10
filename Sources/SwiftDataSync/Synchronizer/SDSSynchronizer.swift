@@ -12,16 +12,9 @@ public class SDSSynchronizer {
     public static var appGroupToStoreSyncData: String?
     
     enum Constants {
-        static let zoneName = "CoreData"
         static let subscriptionName = "DatabaseSubscription"
         
         static let parentWorkaroundKey = "parentWorkaround"
-        
-        static let zoneId = CKRecordZone.ID(zoneName: zoneName, ownerName: CKCurrentUserDefaultName)
-    }
-    
-    static func recordId(id: String) -> CKRecord.ID {
-        return .init(recordName: id, zoneID: Constants.zoneId)
     }
     
     let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "SDSSynchronizer")
@@ -38,6 +31,7 @@ public class SDSSynchronizer {
     var observedUpdateContext: NSManagedObjectContext?
     var configuration: SDSInternalConfiguration?
     
+    var defaultZoneID: CKRecordZone.ID!
     var cloudContainer: CKContainer!
     var cloudPrivateDatabase: CKDatabase!
     var cloudSharedDatabase: CKDatabase!
@@ -117,8 +111,11 @@ public class SDSSynchronizer {
     public func setup(
         containerName: String,
         configuration: SDSConfiguration = .init(rawEntities: [:]),
-        coordinator: NSPersistentStoreCoordinator
+        coordinator: NSPersistentStoreCoordinator,
+        defaultZoneID: String = "CoreData"
     ) {
+        self.defaultZoneID = CKRecordZone.ID(zoneName: defaultZoneID)
+        
         self.cloudContainer = CKContainer(identifier: containerName)
         self.cloudPrivateDatabase = cloudContainer.privateCloudDatabase
         self.cloudSharedDatabase = cloudContainer.sharedCloudDatabase
@@ -137,8 +134,11 @@ public class SDSSynchronizer {
     public func setup(
         containerName: String,
         configuration: SDSConfiguration = .init(swiftDataEntities: []),
-        modelContainer: @autoclosure () -> ModelContainer?
+        modelContainer: @autoclosure () -> ModelContainer?,
+        defaultZoneID: String = "CoreData"
     ) {
+        self.defaultZoneID = CKRecordZone.ID(zoneName: defaultZoneID)
+        
         self.cloudContainer = CKContainer(identifier: containerName)
         self.cloudPrivateDatabase = cloudContainer.privateCloudDatabase
         self.cloudSharedDatabase = cloudContainer.sharedCloudDatabase

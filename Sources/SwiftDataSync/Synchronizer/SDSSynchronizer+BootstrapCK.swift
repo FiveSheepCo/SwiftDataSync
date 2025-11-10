@@ -171,7 +171,7 @@ extension SDSSynchronizer {
         let zones = try await self.cloudPrivateDatabase.allRecordZones()
         
         guard !zones.contains(where: { zone -> Bool in
-            zone.zoneID.zoneName == Constants.zoneName
+            zone.zoneID.zoneName == defaultZoneID.zoneName
         }) else {
             logger.log("Existing zone found")
             return
@@ -179,7 +179,7 @@ extension SDSSynchronizer {
         
         logger.log("Zone not found, creating...")
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let zone = CKRecordZone(zoneName: Constants.zoneName)
+            let zone = CKRecordZone(zoneName: defaultZoneID.zoneName)
             let modifyZonesOperation = CKModifyRecordZonesOperation(recordZonesToSave: [zone], recordZoneIDsToDelete: nil)
             var doneAlready = false
             modifyZonesOperation.perRecordZoneSaveBlock = { _, result in
