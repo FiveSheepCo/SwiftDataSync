@@ -147,6 +147,8 @@ private class CKDownloadHandler {
                 guard rawKey != SDSSynchronizer.Constants.parentWorkaroundKey else { return }
                 
                 let key = findCorrespondingKey(entity: object.entity, rawKey: rawKey)
+                // This is needed to exclude keys that are excluded but were synced before. Otherwise they will be synced again.
+                guard container.syncKeys.contains(key) else { continue }
                 
                 // This workaround is needed for some records where there can be a merge conflict
                 // when the parent object references the child because it uses an ordered set.
