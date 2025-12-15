@@ -145,47 +145,48 @@ private class CKDownloadHandler {
             let object = container.object
             for (rawKey, value) in kVPs {
                 guard rawKey != SDSSynchronizer.Constants.parentWorkaroundKey else { return }
-
-                    let key = findCorrespondingKey(entity: object.entity, rawKey: rawKey)
-
-                    // This workaround is needed for some records where there can be a merge conflict
-                    // when the parent object references the child because it uses an ordered set.
-                    // When 2 devices add an item at the same time this can create an item with a missing parent.
-                    // This is the sending end fix.
-                    // TODO(later): This is only done for parent references right now, should propably be done for others too?
-                    if let value = (value as? NSOrderedSet)?.array as? [NSManagedObject],
-                       let before = (object.value(forKey: key) as? NSOrderedSet)?.array as? [NSManagedObject] {
-
-                        for child in before
-                            where !value.contains(child) && child.synchronizableContainer?.parent == object
-                        {
-                            objectsToEnsureParentReferencesFor.append((container, CKRecord.Reference(record: record, action: .none)))
-                        }
+                
+                let key = findCorrespondingKey(entity: object.entity, rawKey: rawKey)
+                
+                // This workaround is needed for some records where there can be a merge conflict
+                // when the parent object references the child because it uses an ordered set.
+                // When 2 devices add an item at the same time this can create an item with a missing parent.
+                // This is the sending end fix.
+                // TODO(later): This is only done for parent references right now, should propably be done for others too?
+                if
+                    let value = (value as? NSOrderedSet)?.array as? [NSManagedObject],
+                    let before = (object.value(forKey: key) as? NSOrderedSet)?.array as? [NSManagedObject]
+                {
+                    for child in before
+                    where !value.contains(child) && child.synchronizableContainer?.parent == object
+                    {
+                        objectsToEnsureParentReferencesFor.append((container, CKRecord.Reference(record: record, action: .none)))
                     }
-
-                    let type = object.entity.attributesByName[key]?.type
-                    if let value = value as? SDSSynchronizableContainer {
-                        object.setValue(value.object, forKey: key)
-                    } else if let asset = value as? CKAsset {
-                        let data = asset.fileURL.map({ try! Data(contentsOf: $0) })
-                        object.setValue(data, forKey: key)
-                    } else if let data = value as? Data, type != .binaryData {
-                        if let transformerName = object.entity.attributesByName[key]?.valueTransformerName {
-                            let transformer = ValueTransformer(forName: .init(transformerName))!
-                            object.setValue(transformer.reverseTransformedValue(data), forKey: key)
-                        } else {
-                            do {
-                                object.setValue(try JSONSerialization.jsonObject(with: data), forKey: key)
-                            }
-                            catch {
-                                synchronizer.logger.log("Failed setting json object for key `\(object.entity.name ?? "")`.`\(key)`: \(String(data: data, encoding: .utf8) ?? "FAIL")")
-                            }
-                        }
-                    } else if let string = value as? String, type == .uri {
-                        object.setValue(URL(string: string), forKey: key)
+                }
+                
+                let type = object.entity.attributesByName[key]?.type
+                if let value = value as? SDSSynchronizableContainer {
+                    object.setValue(value.object, forKey: key)
+                } else if let asset = value as? CKAsset {
+                    let data = asset.fileURL.map({ try! Data(contentsOf: $0) })
+                    object.setValue(data, forKey: key)
+                } else if let data = value as? Data, type != .binaryData {
+                    if let transformerName = object.entity.attributesByName[key]?.valueTransformerName {
+                        let transformer = ValueTransformer(forName: .init(transformerName))!
+                        object.setValue(transformer.reverseTransformedValue(data), forKey: key)
                     } else {
-                        object.setValue(value, forKey: key)
+                        do {
+                            object.setValue(try JSONSerialization.jsonObject(with: data), forKey: key)
+                        }
+                        catch {
+                            synchronizer.logger.log("Failed setting json object for key `\(object.entity.name ?? "")`.`\(key)`: \(String(data: data, encoding: .utf8) ?? "FAIL")")
+                        }
                     }
+                } else if let string = value as? String, type == .uri {
+                    object.setValue(URL(string: string), forKey: key)
+                } else {
+                    object.setValue(value, forKey: key)
+                }
             }
 
             synchronizer.logger.log("Object updated: \(object)")
