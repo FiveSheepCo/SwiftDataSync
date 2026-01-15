@@ -35,7 +35,7 @@ class SDSSynchronizableContainer {
     func delete() {
         guard let context = object.managedObjectContext else { return }
         
-        try context.performAndWait {
+        context.performAndWait {
             context.delete(object)
         }
         
@@ -96,14 +96,14 @@ extension SDSSynchronizableContainer {
             } else if let recordValue = value as? CKRecordValue {
                 cloudValue = recordValue
             } else if
-                JSONSerialization.isValidJSONObject(value),
-                let data = jsonData(for: value)
+                JSONSerialization.isValidJSONObject(value as Any),
+                let data = jsonData(for: value as Any)
             {
                 cloudValue = data as any CKRecordValue
             } else if let url = value as? URL {
                 cloudValue = url.absoluteString as any CKRecordValue
             } else {
-                fatalError("`\(self.object.entity.name ?? "")`.`\(key)` is not a valid CKRecordValue or JSON object: \(value) \((object.entity.propertiesByName[key] as? NSAttributeDescription)?.type.rawValue.rawValue)")
+                fatalError("`\(self.object.entity.name ?? "")`.`\(key)` is not a valid CKRecordValue or JSON object: \(String(describing: value)) \(String(describing: (object.entity.propertiesByName[key] as? NSAttributeDescription)?.type.rawValue.rawValue))")
             }
             
             result[self.object.entity.propertiesByName[key]?.renamingIdentifier ?? key] = cloudValue
