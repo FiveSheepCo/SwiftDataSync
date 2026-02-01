@@ -67,8 +67,9 @@ extension SDSSynchronizer {
                 case .success(let record):
                     if let share = record as? CKShare {
                         logger.log("Saved Share successfully")
+                        let context = self.context
                         self.context.perform {
-                            CloudKitShare.updateShare(share, for: id.recordName, context: self.context)
+                            CloudKitShare.updateShare(share, for: id.recordName, context: context)
                             continuation.resume(returning: share)
                         }
                     }
@@ -117,7 +118,7 @@ extension SDSSynchronizer {
         try context.performAndWait {
             
             CloudKitZone.getZone(with: share.recordID.zoneID, context: context)
-            try self.context.save()
+            try context.save()
             
             Task {
                 await viewModel.set(state: .idle)

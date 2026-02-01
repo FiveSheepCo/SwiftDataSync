@@ -134,10 +134,11 @@ extension SDSSynchronizer {
             } else {
                 minInterval = minRoutineDownloadDeltaInterval
             }
-            self.routineSyncTimer = Timer.scheduledTimer(withTimeInterval: minInterval, repeats: false) { _ in
-                self.routineSyncTimer = nil
-                self.startSync()
-            }
+            
+            try? await Task.sleep(for: .milliseconds(minInterval * 1000))
+            
+            self.routineSyncTimer = nil
+            self.startSync()
         }
     }
     
