@@ -167,7 +167,8 @@ private class CKDownloadHandler {
                     }
                 }
                 
-                let type = object.entity.attributesByName[key]?.type
+                let attribute = object.entity.attributesByName[key]
+                let type = attribute?.type
                 if let value = value as? SDSSynchronizableContainer {
                     object.setValue(value.object, forKey: key)
                 } else if let asset = value as? CKAsset {
@@ -188,6 +189,15 @@ private class CKDownloadHandler {
                 } else if let string = value as? String, type == .uri {
                     object.setValue(URL(string: string), forKey: key)
                 } else {
+                    // Also apply some sanity checks
+                    if let attribute, type == .boolean {
+                        let possibleValues: [Int?] = attribute.isOptional ? [nil, 0, 1] : [0, 1]
+                        if !possibleValues.contains(value as? Int) {
+                            object.setValue(attribute.defaultValue, forKey: key)
+                            continue
+                        }
+                    }
+                    
                     object.setValue(value, forKey: key)
                 }
             }
