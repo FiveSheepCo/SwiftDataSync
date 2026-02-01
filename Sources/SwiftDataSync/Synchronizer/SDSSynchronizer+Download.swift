@@ -17,9 +17,10 @@ extension SDSSynchronizer {
         // CloudKit shared zones always have the zoneName of the private zone that originally shared it. That said, all shared zones should always have the name of the default zone.
         let ids = try await cloudSharedDatabase.allRecordZones().map(\.zoneID).filter({ $0.zoneName == defaultZoneID.zoneName })
         
+        let context = self.context
         self.context.performAndWait {
             for id in ids {
-                CloudKitZone.getZone(with: id, context: self.context)
+                CloudKitZone.getZone(with: id, context: context)
             }
         }
     }
@@ -409,10 +410,7 @@ private class CKDownloadHandler {
     /// Tries fixing the given error and returns whether the context should try to save again or a fix was not possible.
     private func tryFixingObservedContext(error: any Error) -> Bool {
         synchronizer.logger.log("tryFixingObservedContext starting: \(error.localizedDescription, privacy: .public)")
-        guard let nsError = error as? NSError else {
-            synchronizer.logger.log("tryFixingObservedContext: Not an NSError")
-            return false
-        }
+        let nsError = error as NSError
         
         // If there are detailed sub-errors, recursively try to fix each
         if let subErrorsAny = nsError.userInfo[NSDetailedErrorsKey] {
@@ -457,7 +455,6 @@ private class CKDownloadHandler {
         }
         
         // Delete CloudKit entry
-        let recordId = container.recordId
         let db = isForSharedDatabase ? synchronizer.cloudSharedDatabase : synchronizer.cloudPrivateDatabase
         db?.add(CKModifyRecordsOperation(recordIDsToDelete: recordsToAddLater.map(\.recordID)))
         
