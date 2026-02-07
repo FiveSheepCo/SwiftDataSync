@@ -52,9 +52,7 @@ extension SDSSynchronizer {
             }
             
             logger.log("Logged in to iCloud")
-            context.performAndWait {
-                savedState.userId = userRecordID
-            }
+            setState(\.userId, value: userRecordID)
             await viewModel.set(loggedIntoiCloud: true)
         }
     }
@@ -117,6 +115,7 @@ extension SDSSynchronizer {
     }
     
     internal func updateUpdatesToSend() async {
+        let context = self.context
         let updatesToSend = context.performAndWait {
             try! context.count(for: CloudKitUpdate.fetchRequest()) + context.count(for: CloudKitRemoval.fetchRequest())
         }
@@ -145,24 +144,24 @@ extension SDSSynchronizer {
     /// Checks whether the synchronizer is bootstrapped. Should only be called by `synchronize()`.
     private func bootstrap() async throws {
         // Private DB Zone
-        if !savedState.didCreateZone {
+        if !accessState(\.didCreateZone) {
             logger.log("Zone not created")
             try await createZone()
-            savedState.didCreateZone = true
+            setState(\.didCreateZone, value: true)
         }
         
         // Private DB Subscription
-        if !savedState.didCreatePrivateSubscription {
+        if !accessState(\.didCreatePrivateSubscription) {
             logger.log("Private subscription not created")
             try await createSubscription()
-            savedState.didCreatePrivateSubscription = true
+            setState(\.didCreatePrivateSubscription, value: true)
         }
         
         // Shared DB Subscription
-        if !savedState.didCreateSharedSubscription {
+        if !accessState(\.didCreateSharedSubscription) {
             logger.log("Shared subscription not created")
             try await createSubscription(sharedDatabase: true)
-            savedState.didCreateSharedSubscription = true
+            setState(\.didCreateSharedSubscription, value: true)
         }
     }
     

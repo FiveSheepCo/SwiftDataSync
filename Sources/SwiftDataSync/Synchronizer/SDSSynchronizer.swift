@@ -7,6 +7,18 @@ import Network
 
 private let notificationCenter = NotificationCenter.default
 
+private extension NSManagedObjectContext {
+    var savedState: SDSSynchronizerSavedState {
+        if let state = try? fetch(SDSSynchronizerSavedState.fetchRequest()).first {
+            return state
+        }
+        
+        let state = SDSSynchronizerSavedState(entity: SDSSynchronizerSavedState.entity(), insertInto: self)
+        try! self.save()
+        return state
+    }
+}
+
 public class SDSSynchronizer {
     public static let shared = SDSSynchronizer()
     public static var appGroupToStoreSyncData: String?
@@ -51,8 +63,6 @@ public class SDSSynchronizer {
     
     let networkMonitor = NWPathMonitor()
     
-    let savedState: SDSSynchronizerSavedState
-    
     /// The `CloudKitLocalEntity`s for temporary objects.
     var temporaryObjectContainers: [NSManagedObject: CloudKitLocalEntity] = [:]
     
@@ -92,10 +102,6 @@ public class SDSSynchronizer {
         context.automaticallyMergesChangesFromParent = true
         context.mergePolicy = NSMergePolicy.mergeByPropertyObjectTrump
         self.context = context
-        self.savedState = context.performAndWait({
-            (try? context.fetch(SDSSynchronizerSavedState.fetchRequest()).first) ??
-            SDSSynchronizerSavedState(entity: SDSSynchronizerSavedState.entity(), insertInto: context)
-        })
         
         self.networkMonitor.pathUpdateHandler = networkPathWasUpdated
         self.networkMonitor.start(queue: .main)
@@ -194,6 +200,18 @@ public class SDSSynchronizer {
             if case .waitingForNetwork = await viewModel.state {
                 await self.synchronize()
             }
+        }
+    }
+    
+    func accessState<T>(_ block: (SDSSynchronizerSavedState) -> T) -> T {
+        context.performAndWait {
+             block(context.savedState)
+        }
+    }
+    
+    func setState<T>(_ path: ReferenceWritableKeyPath<SDSSynchronizerSavedState, T>, value: T) {
+        accessState { state in
+            state[keyPath: path] = value
         }
     }
 }

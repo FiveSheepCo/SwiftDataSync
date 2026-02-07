@@ -15,12 +15,9 @@ extension SDSSynchronizer {
         await updateUpdatesToSend()
         
         let startDate = Date.now
-        let (records, deletes) = context.performAndWait { [self] in
-            let updates = synchronizableUpdates(sharedDatabase: sharedDatabase)
-            let deletes = synchronizableDeletes(sharedDatabase: sharedDatabase, maximum: CKModifyRecordsOperation.maximumRecords)
-            
-            return (updates, deletes)
-        } // TODO(later): These records should ideally be top-down. Referenced records should be uploaded before referrers
+        let records = synchronizableUpdates(sharedDatabase: sharedDatabase)
+        let deletes = synchronizableDeletes(sharedDatabase: sharedDatabase, maximum: CKModifyRecordsOperation.maximumRecords)
+        // TODO(later): These records should ideally be top-down. Referenced records should be uploaded before referrers
         
         guard records.count + deletes.count > 0 else {
             self.lastCompletedUpload = Date()
@@ -52,11 +49,9 @@ extension SDSSynchronizer {
             operation.modifyRecordsResultBlock = { operationResult in
                 switch operationResult {
                     case .success:
-                        self.context.performAndWait {
-                            self.deleteObjects(for: doneRecords, deletes: doneDeletes, startDate: startDate)
-                            
-                            self.logger.log("Operation completed: \(doneRecords.count) \(doneDeletes.count)")
-                        }
+                        self.deleteObjects(for: doneRecords, deletes: doneDeletes, startDate: startDate)
+                        
+                        self.logger.log("Operation completed: \(doneRecords.count) \(doneDeletes.count)")
                         continuation.resume()
                     case .failure(let error):
                         // TODO: Handle limit exceeded error (requests can have 400 records, which is statically in this lib, but can also only have 2MB, which we cannot easily determine)
@@ -72,12 +67,14 @@ extension SDSSynchronizer {
     }
     
     private func synchronizableUpdates(sharedDatabase: Bool) -> [CKRecord] {
-        let updates = CloudKitUpdate.retrieve()
-        let records = updates.filter({ object -> Bool in
-            (object.sharedZone != nil) == sharedDatabase
-        }).compactMap(record(for:))
-        
-        return records
+        context.performAndWait {
+            let updates = CloudKitUpdate.retrieve()
+            let records = updates.filter({ object -> Bool in
+                (object.sharedZone != nil) == sharedDatabase
+            }).compactMap(record(for:))
+            
+            return records
+        }
     }
     
     private func record(for update: CloudKitUpdate) -> CKRecord? {
@@ -141,48 +138,56 @@ extension SDSSynchronizer {
     }
     
     private func deleteObjects(for updates: [CKRecord], deletes: [CKRecord.ID], startDate: Date) {
-        for record in updates {
-            let update = CloudKitUpdate.retrieve(for: record.recordID.recordName, entityName: record.recordType, context: context)
-            let id = update.id
-            let changedKeys = update.changedKeys
-            
-            // TODO(later): make new "changedKeys" out of isDone, so that it uploads only the newly changed things
-            var isDone: Bool = true
-            
-            guard let container = find(for: id) else {
-                fatalError("This should never happen, it cannot be that the object doesn't exist, unless the background context is out of sync with the viewContext.")
-            }
-            let lastChange = container.lastObjectChange
-            
-            self.observedUpdateContext?.performAndWait {
-                // Check parent, but only if parent is changed
-                var expectedParentId: String? = nil
-                if let parentKey = container.parentKey,
-                   changedKeys.contains(parentKey),
-                   let parent = container.parent {
-                    expectedParentId = parent.synchronizableContainer?.recordId.recordName
-                }
-                guard record.parent?.recordID.recordName == expectedParentId else {
-                    logger.log("Scheduling another upload as parentId \(String(describing: expectedParentId)) does not match \(record.parent)")
-                    isDone = false
-                    return
-                }
-                
-                if let lastChange, lastChange > startDate {
-                    isDone = false
-                    logger.log("Scheduling another upload as for `\(record.recordType)` has changed")
-                    return
-                }
-            }
-            
-            if isDone {
-                logger.log("Update for `\(update.id)` deleted")
-                update.delete()
-            }
+        guard let observedUpdateContext else {
+            assertionFailure()
+            return
         }
         
-        for delete in deletes {
-            CloudKitRemoval.retrieve(for: delete.recordName, context: context).delete()
+        let context = self.context
+        context.performAndWait {
+            for record in updates {
+                let update = CloudKitUpdate.retrieve(for: record.recordID.recordName, entityName: record.recordType, context: context)
+                let id = update.id
+                let changedKeys = update.changedKeys
+                
+                // TODO(later): make new "changedKeys" out of isDone, so that it uploads only the newly changed things
+                var isDone: Bool = true
+                
+                guard let container = find(for: id) else {
+                    fatalError("This should never happen, it cannot be that the object doesn't exist, unless the background context is out of sync with the viewContext.")
+                }
+                let lastChange = container.lastObjectChange
+                
+                observedUpdateContext.performAndWait {
+                    // Check parent, but only if parent is changed
+                    var expectedParentId: String? = nil
+                    if let parentKey = container.parentKey,
+                       changedKeys.contains(parentKey),
+                       let parent = container.parent {
+                        expectedParentId = parent.synchronizableContainer?.recordId.recordName
+                    }
+                    guard record.parent?.recordID.recordName == expectedParentId else {
+                        logger.log("Scheduling another upload as parentId \(String(describing: expectedParentId)) does not match \(record.parent)")
+                        isDone = false
+                        return
+                    }
+                    
+                    if let lastChange, lastChange > startDate {
+                        isDone = false
+                        logger.log("Scheduling another upload as for `\(record.recordType)` has changed")
+                        return
+                    }
+                }
+                
+                if isDone {
+                    logger.log("Update for `\(update.id)` deleted")
+                    update.delete()
+                }
+            }
+            
+            for delete in deletes {
+                CloudKitRemoval.retrieve(for: delete.recordName, context: context).delete()
+            }
         }
     }
 }

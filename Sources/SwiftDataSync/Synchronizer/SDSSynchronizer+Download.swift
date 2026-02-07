@@ -43,11 +43,10 @@ extension SDSSynchronizer {
                 return
             }
         } else {
-            context.performAndWait {
-                let options = CKFetchRecordZoneChangesOperation.ZoneConfiguration(previousServerChangeToken: savedState.changeToken)
-                
-                configurations = [defaultZoneID: options]
-            }
+            let token = accessState(\.changeToken)
+            let options = CKFetchRecordZoneChangesOperation.ZoneConfiguration(previousServerChangeToken: token)
+            
+            configurations = [defaultZoneID: options]
         }
         
         let operation = CKFetchRecordZoneChangesOperation(
@@ -395,7 +394,7 @@ private class CKDownloadHandler {
             if let zoneID {
                 CloudKitZone.getZone(with: zoneID, context: synchronizer.context).changeToken = changeToken
             } else {
-                synchronizer.savedState.changeToken = changeToken
+                synchronizer.setState(\.changeToken, value: changeToken)
             }
         }
         tokensToUpdate = [:]

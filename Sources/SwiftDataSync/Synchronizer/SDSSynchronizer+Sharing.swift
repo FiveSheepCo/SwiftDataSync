@@ -116,16 +116,13 @@ extension SDSSynchronizer {
         
         let context = self.context
         try context.performAndWait {
-            
             CloudKitZone.getZone(with: share.recordID.zoneID, context: context)
             try context.save()
-            
-            Task {
-                await viewModel.set(state: .idle)
-                
-                self.forceDownload() // TODO(later): return new root object
-            }
         }
+        
+        await viewModel.set(state: .idle)
+        
+        self.forceDownload() // TODO(later): return new root object
     }
 }
 
