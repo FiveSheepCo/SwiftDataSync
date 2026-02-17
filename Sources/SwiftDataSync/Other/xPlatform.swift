@@ -5,7 +5,7 @@ import AppKit
 import UIKit
 #endif
 
-class xPlatform {
+final class xPlatform {
     static func registerForNotifications() async {
         #if os(macOS)
         await NSApplication.shared.registerForRemoteNotifications()

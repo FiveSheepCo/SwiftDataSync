@@ -2,7 +2,7 @@ import Foundation
 import CloudKit
 import CoreData
 
-class SDSSharableContainer: SDSSynchronizableContainer {
+final class SDSSharableContainer: SDSSynchronizableContainer {
     
     var shareState: SDSShareState {
         if let share = share {

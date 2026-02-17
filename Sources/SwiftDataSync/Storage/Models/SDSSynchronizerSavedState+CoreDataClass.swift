@@ -3,7 +3,7 @@ import CoreData
 import CloudKit
 
 @objc(SDSSynchronizerSavedState)
-class SDSSynchronizerSavedState: NSManagedObject {
+final class SDSSynchronizerSavedState: NSManagedObject {
     
     @NSCodableManagedStorage(keyPath: \SDSSynchronizerSavedState.rawChangeToken)
     var changeToken: CKServerChangeToken? = nil

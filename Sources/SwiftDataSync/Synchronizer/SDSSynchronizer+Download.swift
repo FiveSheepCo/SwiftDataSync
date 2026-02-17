@@ -87,7 +87,7 @@ extension SDSSynchronizer {
     }
 }
 
-private class CKDownloadHandler {
+private final class CKDownloadHandler {
     
     var recordsToAddLater: [CKRecord] = []
     var objectsToEnsureParentReferencesFor: [(container: SDSSynchronizableContainer, reference: CKRecord.Reference)] = []

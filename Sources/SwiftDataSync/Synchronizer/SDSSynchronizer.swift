@@ -19,7 +19,7 @@ private extension NSManagedObjectContext {
     }
 }
 
-public class SDSSynchronizer {
+public final class SDSSynchronizer {
     public static let shared = SDSSynchronizer()
     public static var appGroupToStoreSyncData: String?
     
@@ -218,7 +218,7 @@ public class SDSSynchronizer {
 
 
 
-private class _ContainerFinder {
+private final class _ContainerFinder {
     private var containerObservation: NSObjectProtocol?
     private var completion: ((NSPersistentStoreCoordinator) -> Void)?
     

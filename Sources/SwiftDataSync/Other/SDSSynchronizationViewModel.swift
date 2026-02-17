@@ -3,7 +3,7 @@ import OSLog
 
 /// A model which contains the current sync state.
 @Observable @MainActor
-public class SDSSynchronizationViewModel {
+public final class SDSSynchronizationViewModel {
     /// The shared instance of the view model.
     public static let shared = SDSSynchronizationViewModel()
     
