@@ -127,14 +127,16 @@ extension SDSSynchronizer {
     }
     
     private func synchronizableDeletes(sharedDatabase: Bool, maximum: Int) -> [CKRecord.ID] {
-        let deletes = CloudKitRemoval.retrieve(maximum: maximum)
-        let recordIds = deletes.filter({ object -> Bool in
-            (object.sharedZone != nil) == sharedDatabase
-        }).map { removal in
-            removal.recordId
+        context.performAndWait {
+            let deletes = CloudKitRemoval.retrieve(maximum: maximum)
+            let recordIds = deletes.filter({ object -> Bool in
+                (object.sharedZone != nil) == sharedDatabase
+            }).map { removal in
+                removal.recordId
+            }
+            
+            return recordIds
         }
-        
-        return recordIds
     }
     
     private func deleteObjects(for updates: [CKRecord], deletes: [CKRecord.ID], startDate: Date) {
