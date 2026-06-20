@@ -4,13 +4,21 @@ import CloudKit
 
 /// A section you can incorperate into your settings to show the state of sync and have a force sync button.
 @MainActor
-public struct SDSSettingsSection: View {
+public struct SDSSettingsSection<T: View>: View {
     var model = SDSSynchronizationViewModel.shared
+    var customErrorFooter: ((String) -> T)?
     
-    public init() {}
+    public init() where T == EmptyView {}
+    
+    public init(customErrorFooter: @escaping (String) -> T) {
+        self.customErrorFooter = customErrorFooter
+    }
     
     public var body: some View {
-        Section(header: Text("settings.sync", bundle: .module), footer: _Footer()) {
+        Section(
+            header: Text("settings.sync", bundle: .module),
+            footer: _Footer(customErrorFooter: customErrorFooter)
+        ) {
             Button {
                 model.forceSync()
             } label: {
@@ -23,8 +31,9 @@ public struct SDSSettingsSection: View {
 }
 
 @MainActor
-private struct _Footer: View {
+private struct _Footer<T: View>: View {
     var model = SDSSynchronizationViewModel.shared
+    var customErrorFooter: ((String) -> T)?
     
     var latestDateString: String? {
         guard let date = model.lastCompletionDate else {
@@ -54,7 +63,11 @@ private struct _Footer: View {
                 case .idle:
                     Text("sync.state.lastSyncDate \(latestDateString ?? "never")", bundle: .module)
                 case .error(let error):
-                    NoticeView(kind: .problem, text: "sync.state.error \(String(describing: error))")
+                    if let customErrorFooter {
+                        customErrorFooter(error.localizedDescription)
+                    } else {
+                        NoticeView(kind: .problem, text: "sync.state.error \(String(describing: error))")
+                    }
                 case .processingSaveEvent:
                     Text("sync.state.processing", bundle: .module)
                 case .savingShare:
