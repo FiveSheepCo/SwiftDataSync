@@ -64,7 +64,7 @@ private struct _Footer<T: View>: View {
                     Text("sync.state.lastSyncDate \(latestDateString ?? "never")", bundle: .module)
                 case .error(let error):
                     if let customErrorFooter {
-                        customErrorFooter(error.localizedDescription)
+                        customErrorFooter(String(describing: error))
                     } else {
                         NoticeView(kind: .problem, text: "sync.state.error \(String(describing: error))")
                     }
