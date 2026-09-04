@@ -5,7 +5,7 @@ import CoreData
 extension CloudKitUpdate {
     
     var recordId: CKRecord.ID {
-        .init(recordName: id, zoneID: sharedZone?.calculatedId ?? SDSSynchronizer.shared.defaultZoneID)
+        .init(recordName: id, zoneID: sharedZone?.calculatedId ?? SDSSynchronizer.shared.privateZoneID(for: recordType))
     }
     
     var changedKeys: [String] {

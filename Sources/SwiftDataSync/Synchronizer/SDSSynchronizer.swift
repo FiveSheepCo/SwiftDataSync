@@ -44,6 +44,30 @@ public final class SDSSynchronizer {
     var configuration: SDSInternalConfiguration?
     
     var defaultZoneID: CKRecordZone.ID!
+    var didPrepareAdditionalPrivateZones = false
+
+    func privateZoneID(for entityName: String) -> CKRecordZone.ID {
+        configuration?.privateRecordZones[entityName].map { CKRecordZone.ID(zoneName: $0) } ?? defaultZoneID
+    }
+
+    private var privateZoneDefaults: UserDefaults {
+        Self.appGroupToStoreSyncData.flatMap(UserDefaults.init(suiteName:)) ?? .standard
+    }
+
+    private func privateZoneTokenKey(_ zoneID: CKRecordZone.ID) -> String {
+        "SwiftDataSync.privateZoneToken.\(cloudContainer.containerIdentifier ?? "").\(zoneID.zoneName)"
+    }
+
+    func privateZoneToken(_ zoneID: CKRecordZone.ID) -> CKServerChangeToken? {
+        guard let data = privateZoneDefaults.data(forKey: privateZoneTokenKey(zoneID)) else { return nil }
+        return try? NSKeyedUnarchiver.unarchivedObject(ofClass: CKServerChangeToken.self, from: data)
+    }
+
+    func setPrivateZoneToken(_ token: CKServerChangeToken, zoneID: CKRecordZone.ID) throws {
+        let data = try NSKeyedArchiver.archivedData(withRootObject: token, requiringSecureCoding: true)
+        privateZoneDefaults.set(data, forKey: privateZoneTokenKey(zoneID))
+    }
+
     var cloudContainer: CKContainer!
     var cloudPrivateDatabase: CKDatabase!
     var cloudSharedDatabase: CKDatabase!

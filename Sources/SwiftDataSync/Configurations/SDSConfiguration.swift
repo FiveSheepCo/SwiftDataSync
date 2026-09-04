@@ -3,6 +3,14 @@ import SwiftData
 
 /// Configuration struct for defining synchronization settings for SwiftData and CoreData entities.
 public struct SDSConfiguration {
+    public var didDownloadEntities: (@Sendable (Set<String>) -> Void)?
+
+    /// Optional private zones for append-only entities that older clients must never download.
+    /// These entities must use synced tombstones instead of hard deletions.
+    public var privateRecordZones: [String: String] = [:]
+    /// Stable string identifiers for immutable assets and independently migrated records.
+    public var recordIdentityProperties: [String: String] = [:]
+
     
     /// Configuration for a SwiftData entity.
     public struct SwiftDataEntity {

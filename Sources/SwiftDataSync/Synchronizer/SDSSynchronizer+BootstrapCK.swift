@@ -150,6 +150,17 @@ extension SDSSynchronizer {
             setState(\.didCreateZone, value: true)
         }
         
+        if !didPrepareAdditionalPrivateZones {
+            let names = Set(configuration?.privateRecordZones.values.map { $0 } ?? [])
+            if !names.isEmpty {
+                let existing = Set(try await cloudPrivateDatabase.allRecordZones().map { $0.zoneID.zoneName })
+                for name in names.subtracting(existing) {
+                    _ = try await cloudPrivateDatabase.save(CKRecordZone(zoneName: name))
+                }
+            }
+            didPrepareAdditionalPrivateZones = true
+        }
+
         // Private DB Subscription
         if !accessState(\.didCreatePrivateSubscription) {
             logger.log("Private subscription not created")

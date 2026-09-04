@@ -47,6 +47,10 @@ extension SDSSynchronizer {
             let options = CKFetchRecordZoneChangesOperation.ZoneConfiguration(previousServerChangeToken: token)
             
             configurations = [defaultZoneID: options]
+            for name in Set(configuration?.privateRecordZones.values.map { $0 } ?? []) {
+                let zoneID = CKRecordZone.ID(zoneName: name)
+                configurations[zoneID] = .init(previousServerChangeToken: privateZoneToken(zoneID))
+            }
         }
         
         let operation = CKFetchRecordZoneChangesOperation(
@@ -90,6 +94,7 @@ extension SDSSynchronizer {
 private final class CKDownloadHandler {
     
     var recordsToAddLater: [CKRecord] = []
+    var downloadedEntityNames = Set<String>()
     var objectsToEnsureParentReferencesFor: [(container: SDSSynchronizableContainer, reference: CKRecord.Reference)] = []
     
     weak var synchronizer: SDSSynchronizer!
@@ -132,6 +137,8 @@ private final class CKDownloadHandler {
             }
             return
         }
+
+        downloadedEntityNames.insert(record.recordType)
 
         // Make sure dependent objects exist, and prefill all values if they do
         guard let kVPs = self.valuesIfAllReferencesExist(for: record) else {
@@ -309,7 +316,7 @@ private final class CKDownloadHandler {
         }
         
         if let changeToken = changeToken {
-            if isForSharedDatabase {
+            if isForSharedDatabase || zoneID != synchronizer.defaultZoneID {
                 tokensToUpdate[zoneID] = changeToken
             } else {
                 tokensToUpdate[nil] = changeToken
@@ -392,7 +399,12 @@ private final class CKDownloadHandler {
         
         for (zoneID, changeToken) in tokensToUpdate {
             if let zoneID {
-                CloudKitZone.getZone(with: zoneID, context: synchronizer.context).changeToken = changeToken
+                if isForSharedDatabase {
+                    CloudKitZone.getZone(with: zoneID, context: synchronizer.context).changeToken = changeToken
+                } else {
+                    do { try synchronizer.setPrivateZoneToken(changeToken, zoneID: zoneID) }
+                    catch { completionHandler(error); return }
+                }
             } else {
                 synchronizer.setState(\.changeToken, value: changeToken)
             }
@@ -409,6 +421,7 @@ private final class CKDownloadHandler {
         switch result {
         case .success:
             synchronizer.logger.log("Database fetch completed successfully")
+            synchronizer.configuration?.didDownloadEntities?(downloadedEntityNames)
             completionHandler(nil)
         case .failure(let error):
             synchronizer.logger.log("Database fetch completed with error: \(error)")

@@ -1,6 +1,11 @@
 import Foundation
 
 struct SDSInternalConfiguration {
+    var didDownloadEntities: (@Sendable (Set<String>) -> Void)?
+
+    var privateRecordZones: [String: String] = [:]
+    var recordIdentityProperties: [String: String] = [:]
+
     struct Entity {
         let syncedProperties: [String]
         let assetProperties: [String]

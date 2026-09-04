@@ -127,6 +127,6 @@ extension SDSSynchronizableContainer {
     }
     
     var zoneId: CKRecordZone.ID {
-        sharedZoneId ?? SDSSynchronizer.shared.defaultZoneID
+        sharedZoneId ?? SDSSynchronizer.shared.privateZoneID(for: object.entity.name ?? "")
     }
 }

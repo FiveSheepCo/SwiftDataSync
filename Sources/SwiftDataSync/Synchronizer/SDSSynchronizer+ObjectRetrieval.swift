@@ -86,6 +86,10 @@ extension SDSSynchronizer {
     }
     
     func container(for object: NSManagedObject) -> SDSSynchronizableContainer? {
+        let entityName = object.entity.name ?? ""
+        let stableID = configuration?.recordIdentityProperties[entityName]
+            .flatMap { object.value(forKey: $0) as? String }
+            .map { "\(entityName)-\($0)" }
         let objectId = object.objectID.isTemporaryID ? nil : object.objectID.uriRepresentation().absoluteString
         let id: () -> String = {
             let context = self.context
@@ -100,7 +104,7 @@ extension SDSSynchronizer {
                     let id = (
                         (try? request.execute().first) ??
                         CloudKitLocalEntity(
-                            id: UUID().uuidString,
+                            id: stableID ?? UUID().uuidString,
                             localId: objectId,
                             context: context
                         )
@@ -112,7 +116,7 @@ extension SDSSynchronizer {
                     }
                     
                     let new = CloudKitLocalEntity(
-                        id: UUID().uuidString,
+                        id: stableID ?? UUID().uuidString,
                         localId: "",
                         context: context
                     )

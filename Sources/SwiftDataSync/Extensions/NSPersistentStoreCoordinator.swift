@@ -113,7 +113,11 @@ extension NSPersistentStoreCoordinator {
                 )
         }
         
-        return .init(entities: configurationEntities)
+        var configuration = SDSInternalConfiguration(entities: configurationEntities)
+        configuration.didDownloadEntities = externalConfiguration.didDownloadEntities
+        configuration.privateRecordZones = externalConfiguration.privateRecordZones
+        configuration.recordIdentityProperties = externalConfiguration.recordIdentityProperties
+        return configuration
     }
 }
 
