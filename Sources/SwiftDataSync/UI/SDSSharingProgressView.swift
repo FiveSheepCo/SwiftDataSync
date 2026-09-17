@@ -15,7 +15,7 @@ public struct SDSSharingProgressView<Content: View>: View {
             VStack(spacing: 20) {
                 Image(systemName: "square.and.arrow.up.on.square")
                     .resizable()
-                    .aspectRatio(contentMode: .fit)
+                    .scaledToFit()
                     .frame(width: 100)
                 Text("sharing.uploadingPopover.text", bundle: .module)
                     .font(.headline)
