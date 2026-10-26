@@ -151,13 +151,18 @@ extension SDSSynchronizer {
         operation.savePolicy = .changedKeys
         
         return try await withCheckedThrowingContinuation { continuation in
-            operation.perRecordSaveBlock = { [weak self] recordIDs, result in
-                guard let self else { return }
+            // Both the root record and the share report a result, but the continuation must only resume once.
+            // The operation's callbacks run serially, so this doesn't need a lock.
+            nonisolated(unsafe) var didResume = false
+            
+            operation.perRecordSaveBlock = { [weak self] recordID, result in
+                guard let self, !didResume else { return }
                 
                 switch result {
                 case .success(let record):
                     if let share = record as? CKShare {
                         logger.log("Saved Share successfully")
+                        didResume = true
                         let context = self.context
                         self.context.perform {
                             CloudKitShare.updateShare(share, for: id.recordName, context: context)
@@ -166,6 +171,18 @@ extension SDSSynchronizer {
                     }
                 case .failure(let error):
                     logger.log("Save error: \(error.localizedDescription)")
+                    didResume = true
+                    continuation.resume(throwing: error)
+                }
+            }
+            
+            operation.modifyRecordsResultBlock = { result in
+                guard !didResume else { return }
+                didResume = true
+                switch result {
+                case .success:
+                    continuation.resume(throwing: SDSSyncError(title: "share.error.notSaved"))
+                case .failure(let error):
                     continuation.resume(throwing: error)
                 }
             }
