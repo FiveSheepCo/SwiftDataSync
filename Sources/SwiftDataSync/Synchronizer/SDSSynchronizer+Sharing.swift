@@ -409,7 +409,11 @@ extension SDSSynchronizer {
     }
 }
 
-private struct PersistentIdentifierRepresentation: Codable {
+struct PersistentIdentifierRepresentation: Codable {
+    init(_ identifier: PersistentIdentifier) throws {
+        self = try JSONDecoder().decode(Self.self, from: JSONEncoder().encode(identifier))
+    }
+    
     struct Implementation: Codable {
         let primaryKey: String
         let entityName: String
