@@ -360,6 +360,13 @@ private final class CKDownloadHandler {
             return
         }
         
+        // A pending change of a record that was deleted elsewhere can never be uploaded, and without its object
+        // the upload would hit the `fatalError` in `record(for:)`
+        let syncContext = synchronizer.context
+        syncContext.performAndWait {
+            CloudKitUpdate.find(for: recordID.recordName)?.delete()
+        }
+        
         if let object = findObject(for: recordID) {
             object.delete()
         }
