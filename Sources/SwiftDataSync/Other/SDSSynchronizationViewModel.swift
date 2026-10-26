@@ -36,6 +36,9 @@ public final class SDSSynchronizationViewModel {
     
     public internal(set) var updatesToSend: Int = 0
     
+    @ObservationIgnored
+    private var syncWasRequestedWhileSavingShare = false
+    
     public var isSavingShare: Bool {
         if case .savingShare = state {
             return true
@@ -58,11 +61,24 @@ public final class SDSSynchronizationViewModel {
     func attemptSyncStart() -> Bool {
         switch state {
         case .idle, .error, .waitingForNetwork, .notLoggedIntoIcloud: break
+        case .savingShare:
+            // Nothing else starts it once the share is saved
+            syncWasRequestedWhileSavingShare = true
+            return false
         default: return false
         }
         
         self.set(state: .bootstrapping)
         return true
+    }
+    
+    /// Restores `state` after saving a share. Returns whether a synchronization was requested in the meantime.
+    func endSavingShare(restoring state: State) -> Bool {
+        let syncWasRequested = syncWasRequestedWhileSavingShare
+        syncWasRequestedWhileSavingShare = false
+        
+        self.set(state: state)
+        return syncWasRequested
     }
     
     private var isSettable: Bool {
@@ -72,12 +88,16 @@ public final class SDSSynchronizationViewModel {
         }
     }
     
-    func waitForIdle(setting state: State) async {
+    /// Waits until no synchronization is running, then sets `state`. Returns the state it replaced.
+    @discardableResult
+    func waitForIdle(setting state: State) async -> State {
         while !isSettable {
             try! await Task.sleep(for: .seconds(1))
         }
         
+        let previousState = self.state
         self.set(state: state)
+        return previousState
     }
     
     func set(state: State) {

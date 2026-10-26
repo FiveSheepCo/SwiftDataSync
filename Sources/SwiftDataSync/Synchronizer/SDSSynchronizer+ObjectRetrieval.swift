@@ -91,14 +91,8 @@ extension SDSSynchronizer {
             let context = self.context
             return context.performAndWait {
                 if let objectId {
-                    let request = CloudKitLocalEntity.fetchRequest()
-                    
-                    request.sortDescriptors = []
-                    request.fetchLimit = 1
-                    request.predicate = NSPredicate(format: "localId = %@", objectId)
-                    
                     let id = (
-                        (try? request.execute().first) ??
+                        CloudKitLocalEntity.entry(forLocalId: objectId, in: context) ??
                         CloudKitLocalEntity(
                             id: UUID().uuidString,
                             localId: objectId,

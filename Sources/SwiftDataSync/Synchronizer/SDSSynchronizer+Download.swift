@@ -3,25 +3,115 @@ import CoreData
 import CloudKit
 import OSLog
 
+/// How long the zone of an accepted share is kept although the shared database doesn't list it.
+private let acceptedShareZoneListingDelay: TimeInterval = 5 * 60
+
 extension SDSSynchronizer {
     
-    func download() async throws {
+    /// - Parameter refreshingSharedZones: Whether the shared zones have to be refreshed, which `synchronize()` usually did before uploading already.
+    func download(refreshingSharedZones: Bool = true) async throws {
         try await _download()
         
-        try await refreshSharedZoneIDs()
+        if refreshingSharedZones {
+            try await refreshSharedZoneIDs()
+        }
         
         try await self._download(sharedDatabase: true)
     }
     
-    private func refreshSharedZoneIDs() async throws {
+    /// Registers newly shared zones, and cleans up after zones that are no longer shared with the current user.
+    ///
+    /// Called before uploading, as pending changes for a zone that is gone can never be uploaded and would fail the upload.
+    func refreshSharedZoneIDs() async throws {
         // CloudKit shared zones always have the zoneName of the private zone that originally shared it. That said, all shared zones should always have the name of the default zone.
         let ids = try await cloudSharedDatabase.allRecordZones().map(\.zoneID).filter({ $0.zoneName == defaultZoneID.zoneName })
         
+        // Zones of just accepted shares are kept even if the shared database doesn't list them yet
+        acceptedShareZones = acceptedShareZones.filter { zoneId, acceptanceDate in
+            !ids.contains(zoneId) && -acceptanceDate.timeIntervalSinceNow < acceptedShareZoneListingDelay
+        }
+        let existingZoneIds = Set(ids).union(acceptedShareZones.keys)
+        
         let context = self.context
-        self.context.performAndWait {
+        let rootIdsInRemovedZones = try context.performAndWait {
             for id in ids {
                 CloudKitZone.getZone(with: id, context: context)
             }
+            
+            // Zones that are no longer in the shared database were left, or their owner stopped sharing them
+            let removedZones = CloudKitZone.getAll().filter { !existingZoneIds.contains($0.calculatedId) }
+            let removedZoneIds = Set(removedZones.map(\.calculatedId))
+            
+            // Their pending changes can never be uploaded
+            if !removedZones.isEmpty {
+                for entityName in ["CloudKitUpdate", "CloudKitRemoval"] {
+                    let request = NSFetchRequest<NSManagedObject>(entityName: entityName)
+                    request.predicate = NSPredicate(format: "sharedZone IN %@", removedZones)
+                    ((try? context.fetch(request)) ?? []).forEach(context.delete)
+                }
+            }
+            try context.save()
+            
+            return ((try? context.fetch(CloudKitShare.fetchRequest())) ?? [])
+                .filter { entry in entry.share.map { removedZoneIds.contains($0.recordID.zoneID) } ?? false }
+                .map(\.id)
+        }
+        let revokedRootIds = try await rootIdsInRemovedZones + revokedSharesInRemainingZones(sharedZoneIds: ids)
+        
+        for id in revokedRootIds {
+            if let container = find(for: id) {
+                logger.log("Removing local copy of revoked share \(id)")
+                do {
+                    try removeLocalCopy(of: container)
+                } catch {
+                    // The share and zone are kept, so the removal is retried with the next refresh
+                    logger.log("Failed to remove local copy of revoked share \(id): \(error.localizedDescription)")
+                }
+            } else {
+                try context.performAndWait {
+                    CloudKitShare.updateShare(nil, for: id, context: context)
+                    try context.save()
+                }
+            }
+        }
+        
+        // Zones are only forgotten once none of their shares are left, so failed removals are retried
+        try context.performAndWait {
+            let remainingShareZoneIds = Set(((try? context.fetch(CloudKitShare.fetchRequest())) ?? []).compactMap { $0.share?.recordID.zoneID })
+            for zone in CloudKitZone.getAll() where !existingZoneIds.contains(zone.calculatedId) && !remainingShareZoneIds.contains(zone.calculatedId) {
+                context.delete(zone)
+            }
+            try context.save()
+        }
+    }
+    
+    /// Root ids of shares of other users that are gone or no longer accessible, although their zone still exists.
+    ///
+    /// All shares of an owner are in the same zone, so the zone outlives a share when its owner stops sharing one of several roots.
+    /// Their pending changes could never be uploaded, so this is checked before uploading.
+    private func revokedSharesInRemainingZones(sharedZoneIds: [CKRecordZone.ID]) async throws -> [String] {
+        let context = self.context
+        let shares: [(rootId: String, recordID: CKRecord.ID)] = context.performAndWait {
+            ((try? context.fetch(CloudKitShare.fetchRequest())) ?? []).compactMap { entry in
+                guard
+                    let share = entry.share,
+                    share.isSharedByOtherUser,
+                    sharedZoneIds.contains(share.recordID.zoneID)
+                else { return nil }
+                return (entry.id, share.recordID)
+            }
+        }
+        guard !shares.isEmpty else { return [] }
+        
+        let results = try await cloudSharedDatabase.records(for: shares.map(\.recordID), desiredKeys: [])
+        return shares.compactMap { share in
+            // The share was deleted, or the current user was removed from it
+            guard
+                case .failure(let error) = results[share.recordID],
+                let code = (error as? CKError)?.code,
+                code == .unknownItem || code == .permissionFailure
+            else { return nil }
+            return share.rootId
         }
     }
     
@@ -275,6 +365,27 @@ private final class CKDownloadHandler {
     }
     
     func _deleted(recordID: CKRecord.ID, recordType:String) {
+        if recordType == CKRecord.SystemType.share {
+            // A share of the current user was stopped, e.g. on another device. Shares of other users are checked before uploading.
+            if !isForSharedDatabase, recordID.recordName.hasSuffix(staticShareExtension) {
+                let rootId = String(recordID.recordName.dropLast(staticShareExtension.count))
+                let syncContext = synchronizer.context
+                syncContext.performAndWait {
+                    CloudKitShare.updateShare(nil, for: rootId, context: syncContext)
+                }
+            }
+            return
+        }
+        
+        // Pending changes of a record that was deleted elsewhere can never be uploaded. Without its object,
+        // an update would hit the `fatalError` in `record(for:)`, and a removal would delete a record that is gone.
+        let syncContext = synchronizer.context
+        syncContext.performAndWait {
+            for entityName in ["CloudKitUpdate", "CloudKitRemoval"] {
+                syncContext.metadataEntries(of: entityName, withIds: [recordID.recordName]).forEach(syncContext.delete)
+            }
+        }
+        
         if let object = findObject(for: recordID) {
             object.delete()
         }

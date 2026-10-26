@@ -86,6 +86,10 @@ extension SDSSynchronizer {
     }
     
     func synchronize() async {
+        // E.g. after a failed adoption, the error state would allow a forced or push-triggered synchronization,
+        // whose download would add the existing records as duplicates
+        guard isObservingStore else { return }
+        
         do {
             try await checkErrorWaitTimeIsCompleted()
             
@@ -104,11 +108,21 @@ extension SDSSynchronizer {
             
             try await bootstrap()
             
+            // Pending changes for shares that are gone would fail the upload, so they are cleaned up first.
+            // This is best effort: a failure here shouldn't keep the private database from uploading. The download retries it.
+            var didRefreshSharedZones = false
+            do {
+                try await refreshSharedZoneIDs()
+                didRefreshSharedZones = true
+            } catch {
+                logger.log("Failed to refresh shared zones before uploading: \(error.localizedDescription)")
+            }
+            
             await set(state: .uploading)
             try await upload()
             
             await set(state: .downloading)
-            try await download()
+            try await download(refreshingSharedZones: !didRefreshSharedZones)
             
             await set(state: .idle)
         }

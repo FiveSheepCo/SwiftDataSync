@@ -26,6 +26,8 @@ public struct PublishablePublisher<Value>: Combine.Publisher {
 public struct NSCodableManagedStorage<Value, Enclosing>: Publishable where Value: NSObject, Value: NSCoding {
     private let keyPath: ReferenceWritableKeyPath<Enclosing, Data?>
     private var wasFetched: Bool = false
+    /// The data `value` was decoded from, to notice when the object is refreshed with data saved elsewhere.
+    private var fetchedData: Data?
     private var value: Value?
     
     public init(wrappedValue: Value?, keyPath: ReferenceWritableKeyPath<Enclosing, Data?>) {
@@ -52,11 +54,12 @@ public struct NSCodableManagedStorage<Value, Enclosing>: Publishable where Value
         get {
             let enclosing = object as! Enclosing
             let keyPath = object[keyPath: storageKeyPath].keyPath
+            let data = enclosing[keyPath: keyPath]
             
-            if !object[keyPath: storageKeyPath].wasFetched,
-               let data = enclosing[keyPath: keyPath],
-               let value = try? NSKeyedUnarchiver.unarchivedObject(ofClass: Value.self, from: data) {
-                object[keyPath: storageKeyPath].value = value
+            // The data changes when the object is refreshed, e.g. after another context or process saved it
+            if !object[keyPath: storageKeyPath].wasFetched || data != object[keyPath: storageKeyPath].fetchedData {
+                object[keyPath: storageKeyPath].value = data.flatMap { try? NSKeyedUnarchiver.unarchivedObject(ofClass: Value.self, from: $0) }
+                object[keyPath: storageKeyPath].fetchedData = data
             }
             object[keyPath: storageKeyPath].wasFetched = true
             return object[keyPath: storageKeyPath].value
@@ -77,6 +80,8 @@ public struct NSCodableManagedStorage<Value, Enclosing>: Publishable where Value
             } else {
                 enclosing[keyPath: keyPath] = nil
             }
+            object[keyPath: storageKeyPath].fetchedData = enclosing[keyPath: keyPath]
+            object[keyPath: storageKeyPath].wasFetched = true
         }
     }
 }

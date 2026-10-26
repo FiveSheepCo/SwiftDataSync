@@ -48,6 +48,8 @@ extension SDSSynchronizer {
                 operation.perRecordDeleteBlock = { recordId, result in
                     switch result {
                     case .success: doneDeletes.append(recordId)
+                    // The record is already gone, e.g. because it was deleted on another device too
+                    case .failure(let error as CKError) where error.code == .unknownItem: doneDeletes.append(recordId)
                     case .failure(let error): self.logger.log("Error while deleting single record: \(error, privacy: .public)")
                     }
                 }
@@ -59,6 +61,16 @@ extension SDSSynchronizer {
                             self.logger.log("Operation completed: \(doneRecords.count) \(doneDeletes.count)")
                             continuation.resume()
                         case .failure(let error):
+                            // Deleting a record that is already gone fails the whole atomic operation, so those removals
+                            // are discarded and the rest is uploaded again. Changes that did succeed in a non-atomic operation are kept.
+                            let alreadyDeleted = self.alreadyDeletedRecordIDs(in: error, deletes: deletes)
+                            if !alreadyDeleted.isEmpty {
+                                self.logger.log("Discarding removals of \(alreadyDeleted.count) records that are already deleted")
+                                self.deleteObjects(for: doneRecords, deletes: Array(Set(doneDeletes + alreadyDeleted)), startDate: startDate)
+                                continuation.resume()
+                                return
+                            }
+                            
                             self.logger.log("Error while uploading records: \(error)")
                             continuation.resume(throwing: error)
                     }
@@ -75,6 +87,15 @@ extension SDSSynchronizer {
         }
         
         try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords)
+    }
+    
+    /// The removals among `deletes` that failed because their record doesn't exist anymore.
+    private func alreadyDeletedRecordIDs(in error: Error, deletes: [CKRecord.ID]) -> [CKRecord.ID] {
+        guard let error = error as? CKError, error.code == .partialFailure else { return [] }
+        
+        return deletes.filter { recordId in
+            (error.partialErrorsByItemID?[recordId] as? CKError)?.code == .unknownItem
+        }
     }
     
     private func synchronizableUpdates(sharedDatabase: Bool, maximum: Int) -> [CKRecord] {

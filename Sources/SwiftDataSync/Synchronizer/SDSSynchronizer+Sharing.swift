@@ -6,53 +6,309 @@ let staticShareExtension = "-Share"
 
 extension SDSSynchronizer {
     
-    public func share(
-        title: String,
-        imageData: Data?,
-        model: any PersistentModel
-    ) async throws -> URL {
-        let rep = try JSONDecoder().decode(PersistentIdentifierRepresentation.self, from: JSONEncoder().encode(model.persistentModelID))
-        
-        guard
-            let id = observedUpdateContext?.persistentStoreCoordinator?.managedObjectID(forURIRepresentation: URL(string: rep.implementation.uriRepresentation)!),
-            let object = observedUpdateContext?.object(with: id)
-        else {
-            throw SDSSyncError(title: "share.error.couldNotFindObject")
-        }
-        
-        return try await share(title: title, imageData: imageData, object: object)
+    /// The CloudKit container that is synced, for example to present a `UICloudSharingController`.
+    public var cloudKitContainer: CKContainer {
+        cloudContainer
     }
     
+    /// Shares the model, or returns the URL of its existing share.
+    ///
+    /// Anyone with the URL can join a new share with `publicPermission`. Pass `.none` to only allow participants added to the share.
     public func share(
         title: String,
         imageData: Data?,
-        object: NSManagedObject
+        model: any PersistentModel,
+        publicPermission: CKShare.ParticipantPermission = .readWrite
+    ) async throws -> URL {
+        try await share(title: title, imageData: imageData, modelID: model.persistentModelID, publicPermission: publicPermission)
+    }
+    
+    /// Shares the model with the given identifier, or returns the URL of its existing share.
+    ///
+    /// Anyone with the URL can join a new share with `publicPermission`. Pass `.none` to only allow participants added to the share.
+    /// Unlike models, identifiers are `Sendable`, so this can be called from any isolation.
+    public func share(
+        title: String,
+        imageData: Data?,
+        modelID: PersistentIdentifier,
+        publicPermission: CKShare.ParticipantPermission = .readWrite
+    ) async throws -> URL {
+        try await share(title: title, imageData: imageData, object: managedObject(for: modelID), publicPermission: publicPermission)
+    }
+    
+    /// Shares the object, or returns the URL of its existing share.
+    ///
+    /// Anyone with the URL can join a new share with `publicPermission`. Pass `.none` to only allow participants added to the share.
+    public func share(
+        title: String,
+        imageData: Data?,
+        object: NSManagedObject,
+        publicPermission: CKShare.ParticipantPermission = .readWrite
     ) async throws -> URL {
         guard let container = container(for: object) as? SDSSharableContainer else {
             throw SDSSyncError(title: "share.error.objectIsNotSharable")
         }
         
-        let share = try await save(
-            sharable: container,
-            title: title,
-            imageData: imageData
-        )
+        let share = try await whileSyncIsIdle {
+            if let existing = storedShare(for: container.id) {
+                return existing
+            }
+            return try await save(sharable: container, title: title, imageData: imageData, publicPermission: publicPermission)
+        }
         
-        return share.url!
+        guard let url = share.url else {
+            throw SDSSyncError(title: "share.error.noURL")
+        }
+        return url
+    }
+    
+    /// Whether the model is shared, and by whom.
+    public func shareState(for model: any PersistentModel) -> SDSShareState {
+        guard let share = existingShare(for: model) else { return .none }
+        return share.isSharedByOtherUser ? .sharedByOther : .shared
+    }
+    
+    /// The model's share, if it is shared.
+    ///
+    /// This doesn't wait for a running synchronization, so it can be called on the main thread, e.g. while rendering a view.
+    public func existingShare(for model: any PersistentModel) -> CKShare? {
+        guard let localId = try? objectID(for: model.persistentModelID).uriRepresentation().absoluteString else { return nil }
+        
+        return readMetadata { context in
+            // Models that were never synchronized have no record, so they can't be shared
+            guard let id = CloudKitLocalEntity.entry(forLocalId: localId, in: context)?.id else { return nil }
+            return CloudKitShare.share(for: id, in: context)
+        }
+    }
+    
+    /// The stored share for a record id.
+    func storedShare(for id: String) -> CKShare? {
+        readMetadata { context in
+            CloudKitShare.share(for: id, in: context)
+        }
+    }
+    
+    /// Reads synchronization metadata. On the main thread, it is read through the view context instead of the synchronization context,
+    /// so the main thread doesn't wait for a running synchronization.
+    private func readMetadata<T>(_ read: (NSManagedObjectContext) -> T) -> T {
+        if Thread.isMainThread {
+            return read(container.viewContext)
+        }
+        
+        let context = self.context
+        return context.performAndWait {
+            read(context)
+        }
+    }
+    
+    /// Stores a share that was changed outside of the synchronizer, for example by a `UICloudSharingController`.
+    public func didSaveShare(_ share: CKShare, for model: any PersistentModel) async throws {
+        try await didSaveShare(share, forModelID: model.persistentModelID)
+    }
+    
+    /// Stores a share that was changed outside of the synchronizer, for the model with the given identifier.
+    ///
+    /// Unlike models, identifiers are `Sendable`, so this can be called from any isolation.
+    public func didSaveShare(_ share: CKShare, forModelID modelID: PersistentIdentifier) async throws {
+        let id = try sharableContainer(for: modelID).id
+        try await whileSyncIsIdle {
+            let context = self.context
+            try context.performAndWait {
+                CloudKitShare.updateShare(share, for: id, context: context)
+                try context.save()
+            }
+        }
+    }
+    
+    /// Handles a share that ended outside of the synchronizer, for example in a `UICloudSharingController`.
+    ///
+    /// If the current user owned the share, the model stays. If someone else shared it with the current user,
+    /// they left the share, so the local copy of the model is removed without deleting it in iCloud.
+    public func didStopSharing(for model: any PersistentModel) async throws {
+        try await didStopSharing(forModelID: model.persistentModelID)
+    }
+    
+    /// Handles a share that ended outside of the synchronizer, for the model with the given identifier.
+    ///
+    /// Unlike models, identifiers are `Sendable`, so this can be called from any isolation.
+    public func didStopSharing(forModelID modelID: PersistentIdentifier) async throws {
+        let container = try sharableContainer(for: modelID)
+        let id = container.id
+        
+        try await whileSyncIsIdle {
+            let share = storedShare(for: id)
+            // Removing the owner's copy would lose it on this device
+            if let share, share.isSharedByOtherUser {
+                try removeLocalCopy(of: container)
+            } else {
+                let context = self.context
+                try context.performAndWait {
+                    CloudKitShare.updateShare(nil, for: id, context: context)
+                    try context.save()
+                }
+            }
+        }
+    }
+    
+    /// Runs `work` while no synchronization is running, in this process or another one using the same synchronization data.
+    ///
+    /// A running download keeps unsaved placeholders in the synchronization contexts, which must not be saved or rolled back
+    /// by anything else. Persisted placeholders crash every later lookup of their records.
+    /// Another process's upload could also still read metadata that `work` removes.
+    ///
+    /// The previous state is restored afterwards, so e.g. an error's retry delay or a missing iCloud account isn't forgotten.
+    /// A synchronization requested in the meantime is started afterwards.
+    private func whileSyncIsIdle<T>(_ work: () async throws -> T) async throws -> T {
+        let previousState = await viewModel.waitForIdle(setting: .savingShare)
+        
+        let result: Result<T, Error>
+        do {
+            // Another process renews the lease while it synchronizes, so this waits until it is done
+            while !syncLease.acquire() {
+                try await Task.sleep(for: .seconds(1))
+            }
+            defer { syncLease.release() }
+            
+            result = .success(try await work())
+        } catch {
+            result = .failure(error)
+        }
+        
+        if await viewModel.endSavingShare(restoring: previousState) {
+            startSync()
+        }
+        return try result.get()
+    }
+    
+    /// Removes a shared root object and the synced objects below it locally, without uploading the deletion.
+    ///
+    /// Their pending uploads are discarded first, as they can no longer be uploaded and would fail the upload.
+    /// The share is only forgotten once the objects are deleted, so a failed removal can be retried.
+    func removeLocalCopy(of root: SDSSynchronizableContainer) throws {
+        guard let observedUpdateContext else { return }
+        
+        let objects = observedUpdateContext.performAndWait {
+            // A root whose row is already gone would raise an exception when its fault fires
+            guard (try? observedUpdateContext.existingObject(with: root.object.objectID)) != nil else { return [NSManagedObject]() }
+            return hierarchy(of: root.object)
+        }
+        let rootId = root.id
+        // The root's own metadata is included, as it can be left when its row is already gone
+        let ids = Array(Set(objects.compactMap { container(for: $0)?.id } + [rootId]))
+        
+        let context = self.context
+        try context.performAndWait {
+            for entityName in ["CloudKitUpdate", "CloudKitRemoval"] {
+                context.metadataEntries(of: entityName, withIds: ids).forEach(context.delete)
+            }
+            try context.save()
+        }
+        
+        // Deletions in the observed update context are not uploaded.
+        try observedUpdateContext.performAndWait {
+            objects.forEach(observedUpdateContext.delete)
+            do {
+                try observedUpdateContext.save()
+            } catch {
+                observedUpdateContext.rollback()
+                throw error
+            }
+        }
+        
+        try context.performAndWait {
+            context.metadataEntries(of: "CloudKitLocalEntity", withIds: ids).forEach(context.delete)
+            CloudKitShare.updateShare(nil, for: rootId, context: context)
+            try context.save()
+        }
+    }
+    
+    /// The object and all synced objects below it in the parent hierarchy. Has to be called on the object's context.
+    private func hierarchy(of root: NSManagedObject) -> [NSManagedObject] {
+        var objects = [root]
+        var queue = [root]
+        var visited: Set<NSManagedObjectID> = [root.objectID]
+        
+        while !queue.isEmpty {
+            let object = queue.removeFirst()
+            for name in object.entity.relationshipsByName.keys {
+                let related: [NSManagedObject] = switch object.value(forKey: name) {
+                case let single as NSManagedObject: [single]
+                case let ordered as NSOrderedSet: ordered.array.compactMap { $0 as? NSManagedObject }
+                case let unordered as NSSet: unordered.allObjects.compactMap { $0 as? NSManagedObject }
+                default: []
+                }
+                
+                for child in related where !visited.contains(child.objectID) && hierarchyRoot(of: child) == root {
+                    visited.insert(child.objectID)
+                    objects.append(child)
+                    queue.append(child)
+                }
+            }
+        }
+        
+        return objects
+    }
+    
+    /// The topmost synced ancestor of an object. Has to be called on the object's context.
+    private func hierarchyRoot(of object: NSManagedObject) -> NSManagedObject {
+        var current = object
+        var visited: Set<NSManagedObjectID> = []
+        while
+            visited.insert(current.objectID).inserted,
+            let parentKey = configuration?.entities[current.entity.name ?? ""]?.parentKey,
+            let parent = current.value(forKey: parentKey) as? NSManagedObject
+        {
+            current = parent
+        }
+        return current
+    }
+    
+    private func managedObject(for modelID: PersistentIdentifier) throws -> NSManagedObject {
+        guard let observedUpdateContext else {
+            throw SDSSyncError(title: "share.error.couldNotFindObject")
+        }
+        let id = try objectID(for: modelID)
+        
+        // Only the object's ID and entity are used outside of the context's queue, which is safe.
+        return observedUpdateContext.performAndWait {
+            observedUpdateContext.object(with: id)
+        }
+    }
+    
+    /// The ID of the model's object in the observed store, which is found without any context.
+    private func objectID(for modelID: PersistentIdentifier) throws -> NSManagedObjectID {
+        let rep = try JSONDecoder().decode(PersistentIdentifierRepresentation.self, from: JSONEncoder().encode(modelID))
+        
+        guard
+            let url = URL(string: rep.implementation.uriRepresentation),
+            let id = observedStore?.managedObjectID(forURIRepresentation: url)
+        else {
+            throw SDSSyncError(title: "share.error.couldNotFindObject")
+        }
+        return id
+    }
+    
+    private func sharableContainer(for modelID: PersistentIdentifier) throws -> SDSSharableContainer {
+        guard let container = container(for: try managedObject(for: modelID)) as? SDSSharableContainer else {
+            throw SDSSyncError(title: "share.error.objectIsNotSharable")
+        }
+        return container
     }
     
     func save(
         sharable: SDSSharableContainer,
         title: String,
-        imageData: Data?
+        imageData: Data?,
+        publicPermission: CKShare.ParticipantPermission
     ) async throws -> CKShare {
         logger.log("Saving Share")
         
-        let id = sharable.recordId
+        // The record ID depends on the object's parents, which have to be read on its context's queue
+        let id = sharable.object.managedObjectContext?.performAndWait { sharable.recordId } ?? sharable.recordId
         let record = CKRecord(recordType: sharable.object.entity.name!, recordID: id)
         let shareId = CKRecord.ID(recordName: "\(id.recordName)\(staticShareExtension)", zoneID: SDSSynchronizer.shared.defaultZoneID)
         let share = CKShare(rootRecord: record, shareID: shareId)
-        share.publicPermission = .readWrite
+        share.publicPermission = publicPermission
         share[CKShare.SystemFieldKey.title] = title
         share[CKShare.SystemFieldKey.thumbnailImageData] = imageData
         
@@ -60,21 +316,44 @@ extension SDSSynchronizer {
         operation.savePolicy = .changedKeys
         
         return try await withCheckedThrowingContinuation { continuation in
-            operation.perRecordSaveBlock = { [weak self] recordIDs, result in
-                guard let self else { return }
+            // Both the root record and the share report a result, but the continuation must only resume once.
+            // The operation's callbacks run serially, so this doesn't need a lock.
+            nonisolated(unsafe) var didResume = false
+            
+            operation.perRecordSaveBlock = { [weak self] recordID, result in
+                guard let self, !didResume else { return }
                 
                 switch result {
                 case .success(let record):
                     if let share = record as? CKShare {
                         logger.log("Saved Share successfully")
+                        didResume = true
                         let context = self.context
+                        let logger = self.logger
                         self.context.perform {
                             CloudKitShare.updateShare(share, for: id.recordName, context: context)
+                            do {
+                                try context.save()
+                            } catch {
+                                logger.log("Failed to store saved share: \(error.localizedDescription)")
+                            }
                             continuation.resume(returning: share)
                         }
                     }
                 case .failure(let error):
                     logger.log("Save error: \(error.localizedDescription)")
+                    didResume = true
+                    continuation.resume(throwing: error)
+                }
+            }
+            
+            operation.modifyRecordsResultBlock = { result in
+                guard !didResume else { return }
+                didResume = true
+                switch result {
+                case .success:
+                    continuation.resume(throwing: SDSSyncError(title: "share.error.notSaved"))
+                case .failure(let error):
                     continuation.resume(throwing: error)
                 }
             }
@@ -91,7 +370,8 @@ extension SDSSynchronizer {
     
     public func acceptShare(with metadata: CKShare.Metadata) async throws {
         guard metadata.share.recordID.zoneID.zoneName == defaultZoneID.zoneName else {
-            fatalError() // This should not be possible
+            // E.g. a share from an app that uses another default zone in the same container, which can't be synchronized
+            throw SDSSyncError(title: "share.error.unsupportedZone")
         }
         
         let acceptSharesOperation = CKAcceptSharesOperation(shareMetadatas: [metadata])
@@ -112,21 +392,28 @@ extension SDSSynchronizer {
             cloudContainer.add(acceptSharesOperation)
         }
         
-        await viewModel.waitForIdle(setting: .savingShare)
-        
-        let context = self.context
-        try context.performAndWait {
-            CloudKitZone.getZone(with: share.recordID.zoneID, context: context)
-            try context.save()
+        try await whileSyncIsIdle {
+            let context = self.context
+            try context.performAndWait {
+                // The zone can already be known, e.g. when the share was left and accepted again, or the owner shares more.
+                // Its change token would skip records that didn't change since, so the zone is downloaded completely.
+                CloudKitZone.getZone(with: share.recordID.zoneID, context: context).changeToken = nil
+                try context.save()
+            }
+            
+            // The shared database might not list the zone right away, which must not get it cleaned up
+            acceptedShareZones[share.recordID.zoneID] = .now
         }
-        
-        await viewModel.set(state: .idle)
         
         self.forceDownload() // TODO(later): return new root object
     }
 }
 
-private struct PersistentIdentifierRepresentation: Codable {
+struct PersistentIdentifierRepresentation: Codable {
+    init(_ identifier: PersistentIdentifier) throws {
+        self = try JSONDecoder().decode(Self.self, from: JSONEncoder().encode(identifier))
+    }
+    
     struct Implementation: Codable {
         let primaryKey: String
         let entityName: String
