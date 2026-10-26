@@ -6,23 +6,21 @@ let staticShareExtension = "-Share"
 
 extension SDSSynchronizer {
     
+    /// The CloudKit container that is synced, for example to present a `UICloudSharingController`.
+    public var cloudKitContainer: CKContainer {
+        cloudContainer
+    }
+    
+    /// Shares the model, or returns the URL of its existing share.
     public func share(
         title: String,
         imageData: Data?,
         model: any PersistentModel
     ) async throws -> URL {
-        let rep = try JSONDecoder().decode(PersistentIdentifierRepresentation.self, from: JSONEncoder().encode(model.persistentModelID))
-        
-        guard
-            let id = observedUpdateContext?.persistentStoreCoordinator?.managedObjectID(forURIRepresentation: URL(string: rep.implementation.uriRepresentation)!),
-            let object = observedUpdateContext?.object(with: id)
-        else {
-            throw SDSSyncError(title: "share.error.couldNotFindObject")
-        }
-        
-        return try await share(title: title, imageData: imageData, object: object)
+        try await share(title: title, imageData: imageData, object: managedObject(for: model))
     }
     
+    /// Shares the object, or returns the URL of its existing share.
     public func share(
         title: String,
         imageData: Data?,
@@ -32,13 +30,91 @@ extension SDSSynchronizer {
             throw SDSSyncError(title: "share.error.objectIsNotSharable")
         }
         
-        let share = try await save(
-            sharable: container,
-            title: title,
-            imageData: imageData
-        )
+        let share: CKShare
+        if let existing = container.share {
+            share = existing
+        } else {
+            share = try await save(sharable: container, title: title, imageData: imageData)
+        }
         
-        return share.url!
+        guard let url = share.url else {
+            throw SDSSyncError(title: "share.error.noURL")
+        }
+        return url
+    }
+    
+    /// Whether the model is shared, and by whom.
+    public func shareState(for model: any PersistentModel) -> SDSShareState {
+        (try? sharableContainer(for: model))?.shareState ?? .none
+    }
+    
+    /// The model's share, if it is shared.
+    public func existingShare(for model: any PersistentModel) -> CKShare? {
+        (try? sharableContainer(for: model))?.share
+    }
+    
+    /// Stores a share that was changed outside of the synchronizer, for example by a `UICloudSharingController`.
+    public func didSaveShare(_ share: CKShare, for model: any PersistentModel) throws {
+        let id = try sharableContainer(for: model).id
+        let context = self.context
+        try context.performAndWait {
+            CloudKitShare.updateShare(share, for: id, context: context)
+            try context.save()
+        }
+    }
+    
+    /// Handles a share that ended outside of the synchronizer, for example in a `UICloudSharingController`.
+    ///
+    /// If the current user owned the share, the model stays. If someone else shared it with the current user,
+    /// they left the share, so the local copy of the model is removed without deleting it in iCloud.
+    public func didStopSharing(for model: any PersistentModel) throws {
+        let container = try sharableContainer(for: model)
+        let wasSharedByOther = container.shareState == .sharedByOther
+        let id = container.id
+        
+        let context = self.context
+        try context.performAndWait {
+            CloudKitShare.updateShare(nil, for: id, context: context)
+            try context.save()
+        }
+        
+        if wasSharedByOther {
+            removeLocalCopy(of: container)
+        }
+    }
+    
+    /// Removes a shared object and its children locally, without uploading the deletion.
+    func removeLocalCopy(of container: SDSSynchronizableContainer) {
+        // Deletions in the observed update context are not uploaded.
+        container.delete()
+        observedUpdateContext?.performAndWait {
+            do {
+                try observedUpdateContext?.save()
+            } catch {
+                logger.log("Failed to remove local copy of shared object: \(error.localizedDescription)")
+            }
+        }
+    }
+    
+    private func managedObject(for model: any PersistentModel) throws -> NSManagedObject {
+        let rep = try JSONDecoder().decode(PersistentIdentifierRepresentation.self, from: JSONEncoder().encode(model.persistentModelID))
+        
+        guard
+            let url = URL(string: rep.implementation.uriRepresentation),
+            let id = observedUpdateContext?.persistentStoreCoordinator?.managedObjectID(forURIRepresentation: url),
+            let object = observedUpdateContext?.object(with: id)
+        else {
+            throw SDSSyncError(title: "share.error.couldNotFindObject")
+        }
+        
+        return object
+    }
+    
+    private func sharableContainer(for model: any PersistentModel) throws -> SDSSharableContainer {
+        guard let container = container(for: try managedObject(for: model)) as? SDSSharableContainer else {
+            throw SDSSyncError(title: "share.error.objectIsNotSharable")
+        }
+        return container
     }
     
     func save(

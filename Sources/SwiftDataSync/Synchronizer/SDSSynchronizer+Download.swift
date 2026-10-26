@@ -18,9 +18,33 @@ extension SDSSynchronizer {
         let ids = try await cloudSharedDatabase.allRecordZones().map(\.zoneID).filter({ $0.zoneName == defaultZoneID.zoneName })
         
         let context = self.context
-        self.context.performAndWait {
+        let revokedShareRootIds = self.context.performAndWait {
             for id in ids {
                 CloudKitZone.getZone(with: id, context: context)
+            }
+            
+            // Zones that are no longer in the shared database were left, or their owner stopped sharing them.
+            let removedZones = CloudKitZone.getAll().filter { !ids.contains($0.calculatedId) }
+            guard !removedZones.isEmpty else { return [String]() }
+            
+            let removedZoneIds = Set(removedZones.map(\.calculatedId))
+            let request = CloudKitShare.fetchRequest()
+            let revokedShares = ((try? context.fetch(request)) ?? []).filter { entry in
+                entry.share.map { removedZoneIds.contains($0.recordID.zoneID) } ?? false
+            }
+            let rootIds = revokedShares.map(\.id)
+            
+            revokedShares.forEach(context.delete)
+            removedZones.forEach(context.delete)
+            try? context.save()
+            
+            return rootIds
+        }
+        
+        for id in revokedShareRootIds {
+            if let container = find(for: id) {
+                logger.log("Removing local copy of revoked share \(id)")
+                removeLocalCopy(of: container)
             }
         }
     }
