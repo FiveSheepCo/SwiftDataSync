@@ -12,15 +12,7 @@ final class SDSSharableContainer: SDSSynchronizableContainer {
     }
     
     var share: CKShare? {
-        var share: CKShare? = nil
-        if Thread.isMainThread {
-            share = CloudKitShare.retrieveShare(for: id)
-        } else {
-            SDSSynchronizer.shared.context.performAndWait {
-                share = CloudKitShare.retrieveShare(for: id)
-            }
-        }
-        return share
+        SDSSynchronizer.shared.storedShare(for: id)
     }
     
     override init(

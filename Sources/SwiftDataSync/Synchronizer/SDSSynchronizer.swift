@@ -65,6 +65,9 @@ public final class SDSSynchronizer {
     let syncLease: SDSSyncLease
     var syncLeaseRetry: Task<Void, Never>?
     
+    /// Zones of recently accepted shares with the date they were accepted, as the shared database might not list them right away.
+    var acceptedShareZones: [CKRecordZone.ID: Date] = [:]
+    
     let networkMonitor = NWPathMonitor()
     
     /// The `CloudKitLocalEntity`s for temporary objects.

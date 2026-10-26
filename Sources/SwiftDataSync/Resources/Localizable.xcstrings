@@ -51,12 +51,42 @@
         }
       }
     },
+    "share.error.noURL" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The share has no link"
+          }
+        }
+      }
+    },
+    "share.error.notSaved" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The share could not be saved"
+          }
+        }
+      }
+    },
     "share.error.objectIsNotSharable" : {
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Object is not sharable"
+          }
+        }
+      }
+    },
+    "share.error.unsupportedZone" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This share can't be opened by this app"
           }
         }
       }

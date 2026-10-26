@@ -14,12 +14,7 @@ extension CloudKitShare {
     }
     
     static func updateShare(_ share: CKShare?, for id: String, context: NSManagedObjectContext) {
-        let request: NSFetchRequest<CloudKitShare> = self.fetchRequest()
-        request.fetchLimit = 1
-        request.sortDescriptors = []
-        request.predicate = NSPredicate(format: "id = %@", id)
-        
-        let update = try? request.execute().first
+        let update = entry(for: id, in: context)
         
         if let share = share {
             if let update = update {
@@ -32,27 +27,20 @@ extension CloudKitShare {
         }
     }
     
-    static func retrieveShare(for id: String) -> CKShare? {
-        let request: NSFetchRequest<CloudKitShare> = self.fetchRequest()
-        request.fetchLimit = 1
-        request.sortDescriptors = []
-        request.predicate = NSPredicate(format: "id = %@", id)
-        
-        if Thread.isMainThread {
-            return try? SDSSynchronizer.shared.container.viewContext.fetch(request).first?.share
-        }
-        if let update = try? request.execute().first {
-            return update.share
-        }
-        return nil
-    }
-    
     /// The share for an id, fetched in `context`. Has to be called on `context`.
     static func share(for id: String, in context: NSManagedObjectContext) -> CKShare? {
+        guard let entry = entry(for: id, in: context) else { return nil }
+        
+        // Another context or process could have changed the share since it was fetched last
+        context.refresh(entry, mergeChanges: true)
+        return entry.share
+    }
+    
+    private static func entry(for id: String, in context: NSManagedObjectContext) -> CloudKitShare? {
         let request: NSFetchRequest<CloudKitShare> = self.fetchRequest()
         request.fetchLimit = 1
         request.sortDescriptors = []
         request.predicate = NSPredicate(format: "id = %@", id)
-        return (try? context.fetch(request))?.first?.share
+        return try? context.fetch(request).first
     }
 }
