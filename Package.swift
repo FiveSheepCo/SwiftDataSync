@@ -20,6 +20,10 @@ let package = Package(
         .target(
             name: "SwiftDataSync",
             resources: [.process("Resources")]
+        ),
+        .testTarget(
+            name: "SwiftDataSyncTests",
+            dependencies: ["SwiftDataSync"]
         )
     ]
 )
