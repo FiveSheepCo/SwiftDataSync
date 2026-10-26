@@ -115,7 +115,7 @@ extension SDSSynchronizer {
             
             for share in adoption.shares {
                 CloudKitShare.updateShare(share.share, for: share.rootRecordName, context: context)
-                if share.share.recordID.zoneID.ownerName != CKCurrentUserDefaultName {
+                if share.share.isSharedByOtherUser {
                     CloudKitZone.getZone(with: share.share.recordID.zoneID, context: context)
                 }
             }
@@ -182,28 +182,15 @@ extension SDSSynchronizer {
             }
             
             let share: CKShare? = context.performAndWait {
-                guard root.isSharable else { return nil }
+                guard
+                    root.isSharable,
+                    let recordName = adoptedRecordNames[root.uri] ?? CloudKitLocalEntity.entry(forLocalId: root.uri, in: context)?.id
+                else { return nil }
 
-                let recordName = adoptedRecordNames[root.uri] ?? {
-                    let request = CloudKitLocalEntity.fetchRequest()
-                    request.sortDescriptors = []
-                    request.fetchLimit = 1
-                    request.predicate = NSPredicate(format: "localId = %@", root.uri)
-                    return (try? context.fetch(request).first)?.id
-                }()
-                guard let recordName else { return nil }
-
-                if let share = adoptedShares[recordName] {
-                    return share
-                }
-                // `CloudKitShare.retrieveShare` reads from the view context on the main thread, which `setup` is usually called on
-                let request = CloudKitShare.fetchRequest()
-                request.sortDescriptors = []
-                request.fetchLimit = 1
-                request.predicate = NSPredicate(format: "id = %@", recordName)
-                return (try? context.fetch(request).first)?.share
+                return adoptedShares[recordName] ?? CloudKitShare.share(for: recordName, in: context)
             }
-            let sharedZoneID = share.flatMap { $0.currentUserParticipant == $0.owner ? nil : $0.recordID.zoneID }
+            // Decided like `sharedZoneId` does, which sends later changes to that zone
+            let sharedZoneID = share.flatMap { $0.isSharedByOtherUser ? $0.recordID.zoneID : nil }
             guard sharedZoneID == record.sharedZoneID else {
                 throw SDSSyncError(title: "adoption.error.sharedZoneMismatch")
             }

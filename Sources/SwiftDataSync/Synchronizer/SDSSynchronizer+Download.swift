@@ -94,11 +94,11 @@ extension SDSSynchronizer {
         let shares: [(rootId: String, recordID: CKRecord.ID)] = context.performAndWait {
             ((try? context.fetch(CloudKitShare.fetchRequest())) ?? []).compactMap { entry in
                 guard
-                    let recordID = entry.share?.recordID,
-                    recordID.zoneID.ownerName != CKCurrentUserDefaultName,
-                    sharedZoneIds.contains(recordID.zoneID)
+                    let share = entry.share,
+                    share.isSharedByOtherUser,
+                    sharedZoneIds.contains(share.recordID.zoneID)
                 else { return nil }
-                return (entry.id, recordID)
+                return (entry.id, share.recordID)
             }
         }
         guard !shares.isEmpty else { return [] }

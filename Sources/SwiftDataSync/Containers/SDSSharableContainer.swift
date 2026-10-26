@@ -6,7 +6,7 @@ final class SDSSharableContainer: SDSSynchronizableContainer {
     
     var shareState: SDSShareState {
         if let share = share {
-            return (share.currentUserParticipant == share.owner) ? .shared : .sharedByOther
+            return share.isSharedByOtherUser ? .sharedByOther : .shared
         }
         return .none
     }

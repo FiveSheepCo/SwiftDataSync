@@ -65,7 +65,7 @@ extension SDSSynchronizer {
     /// Whether the model is shared, and by whom.
     public func shareState(for model: any PersistentModel) -> SDSShareState {
         guard let share = existingShare(for: model) else { return .none }
-        return share.currentUserParticipant == share.owner ? .shared : .sharedByOther
+        return share.isSharedByOtherUser ? .sharedByOther : .shared
     }
     
     /// The model's share, if it is shared.
@@ -137,8 +137,8 @@ extension SDSSynchronizer {
         
         try await whileSyncIsIdle {
             let share = storedShare(for: id)
-            // Shares of other users are in their zones. Both are checked, as removing the owner's copy would lose it on this device.
-            if let share, share.recordID.zoneID.ownerName != CKCurrentUserDefaultName, share.currentUserParticipant != share.owner {
+            // Removing the owner's copy would lose it on this device
+            if let share, share.isSharedByOtherUser {
                 try removeLocalCopy(of: container)
             } else {
                 let context = self.context

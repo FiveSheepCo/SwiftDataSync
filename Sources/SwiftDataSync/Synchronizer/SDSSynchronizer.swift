@@ -42,6 +42,8 @@ public final class SDSSynchronizer {
     var observedStore: NSPersistentStoreCoordinator?
     var observedUpdateContext: NSManagedObjectContext?
     var configuration: SDSInternalConfiguration?
+    /// Whether local changes of the observed store are tracked, which isn't the case if setting up failed.
+    private(set) var isObservingStore = false
     
     var defaultZoneID: CKRecordZone.ID!
     var cloudContainer: CKContainer!
@@ -219,6 +221,7 @@ public final class SDSSynchronizer {
         }
         
         setupNotifications()
+        isObservingStore = true
         
         Task {
             await viewModel.set(state: .idle)
