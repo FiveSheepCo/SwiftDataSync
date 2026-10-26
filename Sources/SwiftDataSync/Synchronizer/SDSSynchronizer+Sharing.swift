@@ -42,7 +42,7 @@ extension SDSSynchronizer {
         }
         
         let share: CKShare
-        if let existing = container.share {
+        if let existing = storedShare(for: container.id) {
             share = existing
         } else {
             share = try await save(sharable: container, title: title, imageData: imageData)
@@ -56,12 +56,22 @@ extension SDSSynchronizer {
     
     /// Whether the model is shared, and by whom.
     public func shareState(for model: any PersistentModel) -> SDSShareState {
-        (try? sharableContainer(for: model))?.shareState ?? .none
+        guard let share = existingShare(for: model) else { return .none }
+        return share.currentUserParticipant == share.owner ? .shared : .sharedByOther
     }
     
     /// The model's share, if it is shared.
     public func existingShare(for model: any PersistentModel) -> CKShare? {
-        (try? sharableContainer(for: model))?.share
+        guard let id = try? sharableContainer(for: model).id else { return nil }
+        return storedShare(for: id)
+    }
+    
+    /// Reads a share through the context it is written in, as other contexts aren't updated when it changes.
+    private func storedShare(for id: String) -> CKShare? {
+        let context = self.context
+        return context.performAndWait {
+            CloudKitShare.share(for: id, in: context)
+        }
     }
     
     /// Stores a share that was changed outside of the synchronizer, for example by a `UICloudSharingController`.
@@ -80,31 +90,98 @@ extension SDSSynchronizer {
     /// they left the share, so the local copy of the model is removed without deleting it in iCloud.
     public func didStopSharing(for model: any PersistentModel) throws {
         let container = try sharableContainer(for: model)
-        let wasSharedByOther = container.shareState == .sharedByOther
         let id = container.id
+        let share = storedShare(for: id)
         
-        let context = self.context
-        try context.performAndWait {
-            CloudKitShare.updateShare(nil, for: id, context: context)
-            try context.save()
-        }
-        
-        if wasSharedByOther {
-            removeLocalCopy(of: container)
+        if let share, share.currentUserParticipant != share.owner {
+            try removeLocalCopy(of: container)
+        } else {
+            let context = self.context
+            try context.performAndWait {
+                CloudKitShare.updateShare(nil, for: id, context: context)
+                try context.save()
+            }
         }
     }
     
-    /// Removes a shared object and its children locally, without uploading the deletion.
-    func removeLocalCopy(of container: SDSSynchronizableContainer) {
+    /// Removes a shared root object and the synced objects below it locally, without uploading the deletion.
+    ///
+    /// Their pending uploads are discarded first, as they can no longer be uploaded and would fail the upload.
+    /// The share is only forgotten once the objects are deleted, so a failed removal can be retried.
+    func removeLocalCopy(of root: SDSSynchronizableContainer) throws {
+        guard let observedUpdateContext else { return }
+        
+        let objects = observedUpdateContext.performAndWait {
+            hierarchy(of: root.object)
+        }
+        let ids = objects.compactMap { container(for: $0)?.id }
+        let rootId = root.id
+        
+        let context = self.context
+        try context.performAndWait {
+            for entityName in ["CloudKitUpdate", "CloudKitRemoval"] {
+                context.metadataEntries(of: entityName, withIds: ids).forEach(context.delete)
+            }
+            try context.save()
+        }
+        
         // Deletions in the observed update context are not uploaded.
-        container.delete()
-        observedUpdateContext?.performAndWait {
+        try observedUpdateContext.performAndWait {
+            objects.forEach(observedUpdateContext.delete)
             do {
-                try observedUpdateContext?.save()
+                try observedUpdateContext.save()
             } catch {
-                logger.log("Failed to remove local copy of shared object: \(error.localizedDescription)")
+                observedUpdateContext.rollback()
+                throw error
             }
         }
+        
+        try context.performAndWait {
+            context.metadataEntries(of: "CloudKitLocalEntity", withIds: ids).forEach(context.delete)
+            CloudKitShare.updateShare(nil, for: rootId, context: context)
+            try context.save()
+        }
+    }
+    
+    /// The object and all synced objects below it in the parent hierarchy. Has to be called on the object's context.
+    private func hierarchy(of root: NSManagedObject) -> [NSManagedObject] {
+        var objects = [root]
+        var queue = [root]
+        var visited: Set<NSManagedObjectID> = [root.objectID]
+        
+        while !queue.isEmpty {
+            let object = queue.removeFirst()
+            for name in object.entity.relationshipsByName.keys {
+                let related: [NSManagedObject] = switch object.value(forKey: name) {
+                case let single as NSManagedObject: [single]
+                case let ordered as NSOrderedSet: ordered.array.compactMap { $0 as? NSManagedObject }
+                case let unordered as NSSet: unordered.allObjects.compactMap { $0 as? NSManagedObject }
+                default: []
+                }
+                
+                for child in related where !visited.contains(child.objectID) && hierarchyRoot(of: child) == root {
+                    visited.insert(child.objectID)
+                    objects.append(child)
+                    queue.append(child)
+                }
+            }
+        }
+        
+        return objects
+    }
+    
+    /// The topmost synced ancestor of an object. Has to be called on the object's context.
+    private func hierarchyRoot(of object: NSManagedObject) -> NSManagedObject {
+        var current = object
+        var visited: Set<NSManagedObjectID> = []
+        while
+            visited.insert(current.objectID).inserted,
+            let parentKey = configuration?.entities[current.entity.name ?? ""]?.parentKey,
+            let parent = current.value(forKey: parentKey) as? NSManagedObject
+        {
+            current = parent
+        }
+        return current
     }
     
     private func managedObject(for model: any PersistentModel) throws -> NSManagedObject {
@@ -115,14 +192,17 @@ extension SDSSynchronizer {
         let rep = try JSONDecoder().decode(PersistentIdentifierRepresentation.self, from: JSONEncoder().encode(modelID))
         
         guard
+            let observedUpdateContext,
             let url = URL(string: rep.implementation.uriRepresentation),
-            let id = observedUpdateContext?.persistentStoreCoordinator?.managedObjectID(forURIRepresentation: url),
-            let object = observedUpdateContext?.object(with: id)
+            let id = observedUpdateContext.persistentStoreCoordinator?.managedObjectID(forURIRepresentation: url)
         else {
             throw SDSSyncError(title: "share.error.couldNotFindObject")
         }
         
-        return object
+        // Only the object's ID and entity are used outside of the context's queue, which is safe.
+        return observedUpdateContext.performAndWait {
+            observedUpdateContext.object(with: id)
+        }
     }
     
     private func sharableContainer(for model: any PersistentModel) throws -> SDSSharableContainer {
@@ -164,8 +244,14 @@ extension SDSSynchronizer {
                         logger.log("Saved Share successfully")
                         didResume = true
                         let context = self.context
+                        let logger = self.logger
                         self.context.perform {
                             CloudKitShare.updateShare(share, for: id.recordName, context: context)
+                            do {
+                                try context.save()
+                            } catch {
+                                logger.log("Failed to store saved share: \(error.localizedDescription)")
+                            }
                             continuation.resume(returning: share)
                         }
                     }

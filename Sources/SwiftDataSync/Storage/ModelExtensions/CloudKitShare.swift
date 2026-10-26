@@ -46,4 +46,13 @@ extension CloudKitShare {
         }
         return nil
     }
+    
+    /// The share for an id, fetched in `context`. Has to be called on `context`.
+    static func share(for id: String, in context: NSManagedObjectContext) -> CKShare? {
+        let request: NSFetchRequest<CloudKitShare> = self.fetchRequest()
+        request.fetchLimit = 1
+        request.sortDescriptors = []
+        request.predicate = NSPredicate(format: "id = %@", id)
+        return (try? context.fetch(request))?.first?.share
+    }
 }
