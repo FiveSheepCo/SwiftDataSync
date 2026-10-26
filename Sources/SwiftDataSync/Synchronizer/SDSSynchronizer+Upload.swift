@@ -11,14 +11,17 @@ extension SDSSynchronizer {
         try self.context.save()
     }
     
-    private func _upload(sharedDatabase: Bool) async throws {
+    private func _upload(sharedDatabase: Bool, maximumRecords: Int = CKModifyRecordsOperation.maximumRecords) async throws {
+        // Another process could have taken over while this one was suspended
+        guard syncLease.renew() else { throw SDSSyncLease.UnavailableError() }
+        
         await updateUpdatesToSend()
         
         let startDate = Date.now
-        // Deletes are retrieved first so that every one of them is known when filtering out the updates
-        let deletes = synchronizableDeletes(sharedDatabase: sharedDatabase, maximum: CKModifyRecordsOperation.maximumRecords)
-        let records = synchronizableUpdates(sharedDatabase: sharedDatabase)
-        // TODO(later): These records should ideally be top-down. Referenced records should be uploaded before referrers
+        // Deletes are retrieved first so that every one of them is known when filtering out the updates.
+        // The maximum applies to saved and deleted records combined.
+        let deletes = synchronizableDeletes(sharedDatabase: sharedDatabase, maximum: maximumRecords)
+        let records = synchronizableUpdates(sharedDatabase: sharedDatabase, maximum: maximumRecords - deletes.count)
         
         guard records.count + deletes.count > 0 else {
             self.lastCompletedUpload = Date()
@@ -28,56 +31,71 @@ extension SDSSynchronizer {
         
         let database = (sharedDatabase ? cloudSharedDatabase : cloudPrivateDatabase)!
         
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            
-            let operation = CKModifyRecordsOperation(recordsToSave: records, recordIDsToDelete: deletes)
-            operation.savePolicy = .changedKeys
-            
-            var doneRecords: [CKRecord] = []
-            var doneDeletes: [CKRecord.ID] = []
-            operation.perRecordSaveBlock = { _, result in
-                switch result {
-                case .success(let record): doneRecords.append(record)
-                case .failure(let error): self.logger.log("Error while uploading single record: \(error, privacy: .public)") // TODO: This should propably hold the auto upload for 15 minutes or something and show the error for the user to display
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                
+                let operation = CKModifyRecordsOperation(recordsToSave: records, recordIDsToDelete: deletes)
+                operation.savePolicy = .changedKeys
+                
+                var doneRecords: [CKRecord] = []
+                var doneDeletes: [CKRecord.ID] = []
+                operation.perRecordSaveBlock = { _, result in
+                    switch result {
+                    case .success(let record): doneRecords.append(record)
+                    case .failure(let error): self.logger.log("Error while uploading single record: \(error, privacy: .public)") // TODO: This should propably hold the auto upload for 15 minutes or something and show the error for the user to display
+                    }
                 }
-            }
-            operation.perRecordDeleteBlock = { recordId, result in
-                switch result {
-                case .success: doneDeletes.append(recordId)
-                case .failure(let error): self.logger.log("Error while deleting single record: \(error, privacy: .public)")
+                operation.perRecordDeleteBlock = { recordId, result in
+                    switch result {
+                    case .success: doneDeletes.append(recordId)
+                    case .failure(let error): self.logger.log("Error while deleting single record: \(error, privacy: .public)")
+                    }
                 }
-            }
-            operation.modifyRecordsResultBlock = { operationResult in
-                switch operationResult {
-                    case .success:
-                        self.deleteObjects(for: doneRecords, deletes: doneDeletes, startDate: startDate)
-                        
-                        self.logger.log("Operation completed: \(doneRecords.count) \(doneDeletes.count)")
-                        continuation.resume()
-                    case .failure(let error):
-                        // TODO: Handle limit exceeded error (requests can have 400 records, which is statically in this lib, but can also only have 2MB, which we cannot easily determine)
-                        self.logger.log("Error while uploading records: \(error)")
-                        continuation.resume(throwing: error)
+                operation.modifyRecordsResultBlock = { operationResult in
+                    switch operationResult {
+                        case .success:
+                            self.deleteObjects(for: doneRecords, deletes: doneDeletes, startDate: startDate)
+                            
+                            self.logger.log("Operation completed: \(doneRecords.count) \(doneDeletes.count)")
+                            continuation.resume()
+                        case .failure(let error):
+                            self.logger.log("Error while uploading records: \(error)")
+                            continuation.resume(throwing: error)
+                    }
                 }
+                database.add(operation)
+                logger.log("Operation added to \(sharedDatabase ? "shared" : "private") database")
             }
-            database.add(operation)
-            logger.log("Operation added to \(sharedDatabase ? "shared" : "private") database")
+        }
+        catch let error as CKError where error.code == .limitExceeded && maximumRecords > 1 {
+            // Operations are also limited in size, which cannot easily be determined beforehand
+            logger.log("Operation too large, retrying with at most \(maximumRecords / 2) records")
+            try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords / 2)
+            return
         }
         
-        try await _upload(sharedDatabase: sharedDatabase)
+        try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords)
     }
     
-    private func synchronizableUpdates(sharedDatabase: Bool) -> [CKRecord] {
+    private func synchronizableUpdates(sharedDatabase: Bool, maximum: Int) -> [CKRecord] {
         context.performAndWait {
             discardUpdatesOfRemovedRecords()
             
-            let updates = CloudKitUpdate.retrieve()
-            let records = updates.filter({ object -> Bool in
+            // Referenced records are uploaded in earlier operations than the records referencing them,
+            // so that a download in between never receives a record whose references do not exist yet
+            let updates = CloudKitUpdate.retrieveAll().filter({ object -> Bool in
                 (object.sharedZone != nil) == sharedDatabase
-            }).compactMap(record(for:))
+            }).sorted(by: { lhs, rhs in
+                referenceDepth(of: lhs) < referenceDepth(of: rhs)
+            }).prefix(maximum)
+            let records = updates.compactMap(record(for:))
             
             return records
         }
+    }
+    
+    private func referenceDepth(of update: CloudKitUpdate) -> Int {
+        configuration?.entities[update.recordType]?.referenceDepth ?? 0
     }
     
     /// CloudKit rejects saving and deleting the same record in a single operation.

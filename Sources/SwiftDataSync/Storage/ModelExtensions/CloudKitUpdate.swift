@@ -13,9 +13,8 @@ extension CloudKitUpdate {
         set { rawChangedKeys = newValue.joined(separator: ",") ; lastChangeDate = .now }
     }
     
-    static func retrieve(maximum: Int = CKModifyRecordsOperation.maximumRecords) -> [CloudKitUpdate] {
+    static func retrieveAll() -> [CloudKitUpdate] {
         let request: NSFetchRequest<CloudKitUpdate> = self.fetchRequest()
-        request.fetchLimit = maximum
         request.sortDescriptors = []
         return (try? request.execute()) ?? []
     }
@@ -26,7 +25,12 @@ extension CloudKitUpdate {
         request.fetchLimit = 1
         request.predicate = NSPredicate(format: "id = %@", id)
         
-        return try? request.execute().first
+        let update = try? request.execute().first
+        if let update {
+            // Another process could have changed the update since it was fetched last
+            update.managedObjectContext?.refresh(update, mergeChanges: true)
+        }
+        return update
     }
     
     static func retrieve(for id: String, entityName: String, context: NSManagedObjectContext) -> CloudKitUpdate {

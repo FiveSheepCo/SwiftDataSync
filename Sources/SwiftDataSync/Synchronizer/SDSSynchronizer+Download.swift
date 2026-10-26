@@ -294,7 +294,8 @@ private final class CKDownloadHandler {
         for zoneID: CKRecordZone.ID,
         changeToken: CKServerChangeToken?,
         userToken: Data?,
-        finalCompletion: Bool = false
+        finalCompletion: Bool = false,
+        fetchFailed: Bool = false
     ) {
         var lastNumberOfRecords: Int = 0
         while lastNumberOfRecords != recordsToAddLater.count {
@@ -308,7 +309,38 @@ private final class CKDownloadHandler {
             }
         }
         
-        if let changeToken = changeToken {
+        if finalCompletion {
+            // The problem this solves is described in a huge comment above.
+            for (container, reference) in objectsToEnsureParentReferencesFor {
+                if let parent = findObject(for: reference.recordID)?.object,
+                   !container.object.isDeleted,
+                   container.parent != parent {
+                    container.parent = parent
+                }
+            }
+            objectsToEnsureParentReferencesFor = []
+            
+            let unresolvedRecords = recordsToAddLater.filter { isRecord($0, in: zoneID) }
+            recordsToAddLater.removeAll { isRecord($0, in: zoneID) }
+            
+            if unresolvedRecords.isEmpty {
+                synchronizer.logger.log("All current records added.")
+            } else if fetchFailed {
+                // The change token was not advanced past these records, so the next download fetches them again
+                synchronizer.logger.log("Fetch failed with \(unresolvedRecords.count) unresolved records, retrying them with the next download")
+            } else {
+                synchronizer.logger.log("RecordsToAddLater not empty: \(unresolvedRecords.map(\.recordID))")
+                
+                assertionFailure("This should not happen in a shipping application. We will try to fix this up by deleting all records in question in a non-debug scenario.")
+                
+                let db = isForSharedDatabase ? synchronizer.cloudSharedDatabase : synchronizer.cloudPrivateDatabase
+                db?.add(CKModifyRecordsOperation(recordIDsToDelete: unresolvedRecords.map(\.recordID)))
+            }
+        }
+        
+        // Records that still wait for their references were received before this token.
+        // If the token was saved and the fetch failed before the references arrived, they would never be fetched again.
+        if let changeToken = changeToken, !recordsToAddLater.contains(where: { isRecord($0, in: zoneID) }) {
             if isForSharedDatabase {
                 tokensToUpdate[zoneID] = changeToken
             } else {
@@ -316,29 +348,11 @@ private final class CKDownloadHandler {
             }
             synchronizer.logger.log("ChangeToken updated")
         }
-        
-        guard finalCompletion else { return }
-        
-        // The problem this solves is described in a huge comment above.
-        for (container, reference) in objectsToEnsureParentReferencesFor {
-            if let parent = findObject(for: reference.recordID)?.object,
-               !container.object.isDeleted,
-               container.parent != parent {
-                container.parent = parent
-            }
-        }
-        objectsToEnsureParentReferencesFor = []
-        
-        if !recordsToAddLater.isEmpty {
-            synchronizer.logger.log("RecordsToAddLater not empty!")
-            
-            assertionFailure("This should not happen in a shipping application. We will try to fix this up by deleting all records in question in a non-debug scenario.")
-            
-            let db = isForSharedDatabase ? synchronizer.cloudSharedDatabase : synchronizer.cloudPrivateDatabase
-            db?.add(CKModifyRecordsOperation(recordIDsToDelete: recordsToAddLater.map(\.recordID)))
-        } else {
-            synchronizer.logger.log("All current records added.")
-        }
+    }
+    
+    private func isRecord(_ record: CKRecord, in zoneID: CKRecordZone.ID) -> Bool {
+        // The private database only uses a single zone
+        !isForSharedDatabase || record.recordID.zoneID == zoneID
     }
     
     func fetchCompletion(
@@ -356,7 +370,7 @@ private final class CKDownloadHandler {
             synchronizer.logger.log("Zone \(zoneID.zoneName) fetch error: \(error)")
             
             context.performAndWait {
-                self._tokensUpdate(for: zoneID, changeToken: nil, userToken: nil, finalCompletion: true)
+                self._tokensUpdate(for: zoneID, changeToken: nil, userToken: nil, finalCompletion: true, fetchFailed: true)
             }
         }
     }
@@ -367,6 +381,26 @@ private final class CKDownloadHandler {
         guard let observedContext = synchronizer.observedUpdateContext else {
             synchronizer.logger.log("No observed context")
             completionHandler(SDSSyncError(title: "error.noObservedContext"))
+            return
+        }
+        
+        // Another process could have taken over while this one was suspended and downloaded the same records.
+        // Saving them as well would duplicate them, so they are discarded and downloaded again later if needed.
+        guard synchronizer.syncLease.renew() else {
+            synchronizer.logger.log("Sync lease lost, discarding download")
+            
+            observedContext.performAndWait {
+                observedContext.rollback()
+            }
+            synchronizer.context.performAndWait {
+                for container in synchronizer.temporaryObjectContainers.values {
+                    container.delete()
+                }
+            }
+            synchronizer.temporaryObjectContainers = [:]
+            tokensToUpdate = [:]
+            
+            completionHandler(SDSSyncLease.UnavailableError())
             return
         }
         
@@ -465,7 +499,7 @@ private final class CKDownloadHandler {
         
         // Delete CloudKit entry
         let db = isForSharedDatabase ? synchronizer.cloudSharedDatabase : synchronizer.cloudPrivateDatabase
-        db?.add(CKModifyRecordsOperation(recordIDsToDelete: recordsToAddLater.map(\.recordID)))
+        db?.add(CKModifyRecordsOperation(recordIDsToDelete: [container.recordId]))
         
         // Delete object and reference
         container.delete()

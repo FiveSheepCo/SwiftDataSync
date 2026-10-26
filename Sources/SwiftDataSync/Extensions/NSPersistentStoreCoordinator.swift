@@ -87,6 +87,26 @@ extension NSPersistentStoreCoordinator {
             externalDescriptions: externalDescriptions
         )
         
+        var referencedEntities: [String: Set<String>] = [:]
+        for relationship in relationshipsToSync {
+            guard
+                let entityName = relationship.entity.name,
+                let destinationName = relationship.destinationEntity?.name,
+                entityName != destinationName
+            else { continue }
+            
+            referencedEntities[entityName, default: []].insert(destinationName)
+        }
+        
+        func referenceDepth(of entityName: String, visited: Set<String> = []) -> Int {
+            // Cycles cannot be ordered, so they are cut off here
+            guard !visited.contains(entityName) else { return 0 }
+            
+            return (referencedEntities[entityName] ?? []).map { destinationName in
+                referenceDepth(of: destinationName, visited: visited.union([entityName])) + 1
+            }.max() ?? 0
+        }
+        
         var configurationEntities: [String: SDSInternalConfiguration.Entity] = [:]
         
         for (entityName, entityDescription) in entities {
@@ -109,7 +129,8 @@ extension NSPersistentStoreCoordinator {
                     }).map(\.name),
                     assetProperties: assetProperties,
                     parentKey: parentKey,
-                    isSharable: isSharable
+                    isSharable: isSharable,
+                    referenceDepth: referenceDepth(of: entityName)
                 )
         }
         

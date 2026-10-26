@@ -61,6 +61,10 @@ public final class SDSSynchronizer {
     
     var routineSyncTimer: Timer?
     
+    /// Makes sure only one process using the same synchronization data synchronizes at a time.
+    let syncLease: SDSSyncLease
+    var syncLeaseRetry: Task<Void, Never>?
+    
     let networkMonitor = NWPathMonitor()
     
     /// The `CloudKitLocalEntity`s for temporary objects.
@@ -101,7 +105,13 @@ public final class SDSSynchronizer {
         let context = container.newBackgroundContext()
         context.automaticallyMergesChangesFromParent = true
         context.mergePolicy = NSMergePolicy.mergeByPropertyObjectTrump
+        // Other processes can change the synchronization data, so cached values cannot be trusted
+        context.stalenessInterval = 0
         self.context = context
+        
+        self.syncLease = SDSSyncLease(
+            url: container.persistentStoreDescriptions.first?.url?.deletingLastPathComponent().appendingPathComponent("CloudKitSync.lease")
+        )
         
         self.networkMonitor.pathUpdateHandler = networkPathWasUpdated
         self.networkMonitor.start(queue: .main)
@@ -179,6 +189,8 @@ public final class SDSSynchronizer {
         observedUpdateContext.persistentStoreCoordinator = storeToObserve
         observedUpdateContext.mergePolicy = NSMergePolicy.mergeByPropertyObjectTrump
         observedUpdateContext.automaticallyMergesChangesFromParent = true
+        // Other processes can change the observed store, so cached values cannot be trusted
+        observedUpdateContext.stalenessInterval = 0
         self.observedUpdateContext = observedUpdateContext
         
         setupNotifications()

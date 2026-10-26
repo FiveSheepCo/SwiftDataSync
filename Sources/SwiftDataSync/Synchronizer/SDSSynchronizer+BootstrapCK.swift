@@ -91,6 +91,11 @@ extension SDSSynchronizer {
             
             guard await viewModel.attemptSyncStart() else { return }
             
+            guard syncLease.acquire() else { throw SDSSyncLease.UnavailableError() }
+            defer { syncLease.release() }
+            
+            refreshSharedData()
+            
             await updateUpdatesToSend()
             
             try checkNetwork()
@@ -107,11 +112,44 @@ extension SDSSynchronizer {
             
             await set(state: .idle)
         }
+        catch is SDSSyncLease.UnavailableError {
+            // The other process uploads the pending changes of this one too, but changes made after its upload still need to be synchronized
+            logger.log("Another process is synchronizing, retrying later")
+            await set(state: .idle)
+            retryAfterSyncLease()
+        }
         catch {
             await set(state: (error as? SDSStateError)?.state ?? .error(error))
         }
         
         await self.setRoutineTimer()
+    }
+    
+    /// Makes changes of other processes using the same synchronization data visible to this process.
+    private func refreshSharedData() {
+        let context = self.context
+        context.performAndWait {
+            context.refreshAllObjects()
+        }
+        
+        if let observedUpdateContext {
+            observedUpdateContext.performAndWait {
+                observedUpdateContext.refreshAllObjects()
+            }
+        }
+    }
+    
+    private func retryAfterSyncLease() {
+        Task { @MainActor in
+            guard self.syncLeaseRetry == nil else { return }
+            
+            self.syncLeaseRetry = Task {
+                try? await Task.sleep(for: .seconds(SDSSyncLease.duration / 3))
+                
+                self.syncLeaseRetry = nil
+                self.startSync()
+            }
+        }
     }
     
     internal func updateUpdatesToSend() async {
