@@ -76,7 +76,14 @@ extension SDSSynchronizer {
     
     /// Stores a share that was changed outside of the synchronizer, for example by a `UICloudSharingController`.
     public func didSaveShare(_ share: CKShare, for model: any PersistentModel) async throws {
-        let id = try sharableContainer(for: model).id
+        try await didSaveShare(share, forModelID: model.persistentModelID)
+    }
+    
+    /// Stores a share that was changed outside of the synchronizer, for the model with the given identifier.
+    ///
+    /// Unlike models, identifiers are `Sendable`, so this can be called from any isolation.
+    public func didSaveShare(_ share: CKShare, forModelID modelID: PersistentIdentifier) async throws {
+        let id = try sharableContainer(for: modelID).id
         try await whileSyncIsIdle {
             let context = self.context
             try context.performAndWait {
@@ -91,7 +98,14 @@ extension SDSSynchronizer {
     /// If the current user owned the share, the model stays. If someone else shared it with the current user,
     /// they left the share, so the local copy of the model is removed without deleting it in iCloud.
     public func didStopSharing(for model: any PersistentModel) async throws {
-        let container = try sharableContainer(for: model)
+        try await didStopSharing(forModelID: model.persistentModelID)
+    }
+    
+    /// Handles a share that ended outside of the synchronizer, for the model with the given identifier.
+    ///
+    /// Unlike models, identifiers are `Sendable`, so this can be called from any isolation.
+    public func didStopSharing(forModelID modelID: PersistentIdentifier) async throws {
+        let container = try sharableContainer(for: modelID)
         let id = container.id
         
         try await whileSyncIsIdle {
@@ -228,7 +242,11 @@ extension SDSSynchronizer {
     }
     
     private func sharableContainer(for model: any PersistentModel) throws -> SDSSharableContainer {
-        guard let container = container(for: try managedObject(for: model)) as? SDSSharableContainer else {
+        try sharableContainer(for: model.persistentModelID)
+    }
+    
+    private func sharableContainer(for modelID: PersistentIdentifier) throws -> SDSSharableContainer {
+        guard let container = container(for: try managedObject(for: modelID)) as? SDSSharableContainer else {
             throw SDSSyncError(title: "share.error.objectIsNotSharable")
         }
         return container
