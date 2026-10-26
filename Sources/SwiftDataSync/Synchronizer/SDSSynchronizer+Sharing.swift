@@ -126,14 +126,16 @@ extension SDSSynchronizer {
     ///
     /// A running download keeps unsaved placeholders in the synchronization contexts, which must not be saved or rolled back
     /// by anything else. Persisted placeholders crash every later lookup of their records.
+    ///
+    /// The previous state is restored afterwards, so e.g. an error's retry delay or a missing iCloud account isn't forgotten.
     private func whileSyncIsIdle<T>(_ work: () async throws -> T) async throws -> T {
-        await viewModel.waitForIdle(setting: .savingShare)
+        let previousState = await viewModel.waitForIdle(setting: .savingShare)
         do {
             let result = try await work()
-            await viewModel.set(state: .idle)
+            await viewModel.set(state: previousState)
             return result
         } catch {
-            await viewModel.set(state: .idle)
+            await viewModel.set(state: previousState)
             throw error
         }
     }
