@@ -68,7 +68,7 @@ extension SDSSynchronizer {
         return share.isSharedByOtherUser ? .sharedByOther : .shared
     }
     
-    /// The model's share, if it is shared.
+    /// The model's share, if it is shared. Models that weren't saved yet are never shared.
     ///
     /// This doesn't wait for a running synchronization, so it can be called on the main thread, e.g. while rendering a view.
     public func existingShare(for model: any PersistentModel) -> CKShare? {
@@ -276,12 +276,12 @@ extension SDSSynchronizer {
     }
     
     /// The ID of the model's object in the observed store, which is found without any context.
+    ///
+    /// Models that weren't saved yet have no object in the store, so they throw like models that can't be found.
     private func objectID(for modelID: PersistentIdentifier) throws -> NSManagedObjectID {
-        let rep = try JSONDecoder().decode(PersistentIdentifierRepresentation.self, from: JSONEncoder().encode(modelID))
-        
         guard
-            let url = URL(string: rep.implementation.uriRepresentation),
-            let id = observedStore?.managedObjectID(forURIRepresentation: url)
+            let observedStore,
+            let id = try PersistentIdentifierRepresentation(modelID).implementation.objectID(in: observedStore)
         else {
             throw SDSSyncError(title: "share.error.couldNotFindObject")
         }
@@ -420,6 +420,20 @@ struct PersistentIdentifierRepresentation: Codable {
         let uriRepresentation: String
         let isTemporary: Bool
         let storeIdentifier: String?
+        
+        /// The ID of the saved object in the store, or `nil` if the store doesn't contain it.
+        ///
+        /// Models that weren't saved yet have a temporary SwiftData URI, e.g. `x-swiftdata://Shop/<UUID>`, for which Core Data
+        /// raises an Objective-C exception instead of returning `nil`. Swift can't catch it, so such URIs must never reach Core Data.
+        func objectID(in coordinator: NSPersistentStoreCoordinator) -> NSManagedObjectID? {
+            guard
+                !isTemporary,
+                let url = URL(string: uriRepresentation),
+                url.scheme == "x-coredata"
+            else { return nil }
+            
+            return coordinator.managedObjectID(forURIRepresentation: url)
+        }
     }
     
     let implementation: Implementation

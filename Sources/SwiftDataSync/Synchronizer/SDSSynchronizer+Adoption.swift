@@ -161,8 +161,7 @@ extension SDSSynchronizer {
         for (record, implementation) in mappings {
             let root: (uri: String, isSharable: Bool)? = observedUpdateContext.performAndWait {
                 guard
-                    let url = URL(string: implementation.uriRepresentation),
-                    let objectID = observedStore.managedObjectID(forURIRepresentation: url),
+                    let objectID = implementation.objectID(in: observedStore),
                     var object = try? observedUpdateContext.existingObject(with: objectID),
                     var entity = configuration.entities[object.entity.name ?? ""]
                 else { return nil }
