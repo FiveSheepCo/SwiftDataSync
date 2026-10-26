@@ -15,8 +15,9 @@ extension SDSSynchronizer {
         await updateUpdatesToSend()
         
         let startDate = Date.now
-        let records = synchronizableUpdates(sharedDatabase: sharedDatabase)
+        // Deletes are retrieved first so that every one of them is known when filtering out the updates
         let deletes = synchronizableDeletes(sharedDatabase: sharedDatabase, maximum: CKModifyRecordsOperation.maximumRecords)
+        let records = synchronizableUpdates(sharedDatabase: sharedDatabase)
         // TODO(later): These records should ideally be top-down. Referenced records should be uploaded before referrers
         
         guard records.count + deletes.count > 0 else {
@@ -68,12 +69,34 @@ extension SDSSynchronizer {
     
     private func synchronizableUpdates(sharedDatabase: Bool) -> [CKRecord] {
         context.performAndWait {
+            discardUpdatesOfRemovedRecords()
+            
             let updates = CloudKitUpdate.retrieve()
             let records = updates.filter({ object -> Bool in
                 (object.sharedZone != nil) == sharedDatabase
             }).compactMap(record(for:))
             
             return records
+        }
+    }
+    
+    /// CloudKit rejects saving and deleting the same record in a single operation.
+    /// An update can still end up next to a removal, e.g. when an inserted object is deleted before its insertion was handled,
+    /// so the removal wins, just like `setRemoval` deletes the pending update.
+    /// Has to be called on `context`.
+    private func discardUpdatesOfRemovedRecords() {
+        let removalRequest: NSFetchRequest<CloudKitRemoval> = CloudKitRemoval.fetchRequest()
+        removalRequest.sortDescriptors = []
+        let removedIds = ((try? removalRequest.execute()) ?? []).map(\.id)
+        guard !removedIds.isEmpty else { return }
+        
+        let updateRequest: NSFetchRequest<CloudKitUpdate> = CloudKitUpdate.fetchRequest()
+        updateRequest.sortDescriptors = []
+        updateRequest.predicate = NSPredicate(format: "id IN %@", removedIds)
+        
+        for update in (try? updateRequest.execute()) ?? [] {
+            logger.log("[Upload] Discarding update for `\(update.id)` as it is also removed")
+            update.delete()
         }
     }
     
