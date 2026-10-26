@@ -104,8 +104,13 @@ extension SDSSynchronizer {
             
             try await bootstrap()
             
-            // Pending changes for shared zones that are gone would fail the upload, so they are cleaned up first
-            try await refreshSharedZoneIDs()
+            // Pending changes for shares that are gone would fail the upload, so they are cleaned up first.
+            // This is best effort: a failure here shouldn't keep the private database from uploading.
+            do {
+                try await refreshSharedZoneIDs()
+            } catch {
+                logger.log("Failed to refresh shared zones before uploading: \(error.localizedDescription)")
+            }
             
             await set(state: .uploading)
             try await upload()

@@ -21,7 +21,7 @@ extension SDSSynchronizer {
         let ids = try await cloudSharedDatabase.allRecordZones().map(\.zoneID).filter({ $0.zoneName == defaultZoneID.zoneName })
         
         let context = self.context
-        let revokedRootIds = try context.performAndWait {
+        let rootIdsInRemovedZones = try context.performAndWait {
             for id in ids {
                 CloudKitZone.getZone(with: id, context: context)
             }
@@ -44,6 +44,7 @@ extension SDSSynchronizer {
                 .filter { entry in entry.share.map { removedZoneIds.contains($0.recordID.zoneID) } ?? false }
                 .map(\.id)
         }
+        let revokedRootIds = try await rootIdsInRemovedZones + revokedSharesInRemainingZones(sharedZoneIds: ids)
         
         for id in revokedRootIds {
             if let container = find(for: id) {
@@ -69,6 +70,31 @@ extension SDSSynchronizer {
                 context.delete(zone)
             }
             try context.save()
+        }
+    }
+    
+    /// Root ids of shares of other users whose share record is gone, although its zone still exists.
+    ///
+    /// All shares of an owner are in the same zone, so the zone outlives a share when its owner stops sharing one of several roots.
+    /// Their pending changes could never be uploaded, so this is checked before uploading.
+    private func revokedSharesInRemainingZones(sharedZoneIds: [CKRecordZone.ID]) async throws -> [String] {
+        let context = self.context
+        let shares: [(rootId: String, recordID: CKRecord.ID)] = context.performAndWait {
+            ((try? context.fetch(CloudKitShare.fetchRequest())) ?? []).compactMap { entry in
+                guard
+                    let recordID = entry.share?.recordID,
+                    recordID.zoneID.ownerName != CKCurrentUserDefaultName,
+                    sharedZoneIds.contains(recordID.zoneID)
+                else { return nil }
+                return (entry.id, recordID)
+            }
+        }
+        guard !shares.isEmpty else { return [] }
+        
+        let results = try await cloudSharedDatabase.records(for: shares.map(\.recordID), desiredKeys: [])
+        return shares.compactMap { share in
+            guard case .failure(let error) = results[share.recordID], (error as? CKError)?.code == .unknownItem else { return nil }
+            return share.rootId
         }
     }
     
@@ -322,6 +348,18 @@ private final class CKDownloadHandler {
     }
     
     func _deleted(recordID: CKRecord.ID, recordType:String) {
+        if recordType == CKRecord.SystemType.share {
+            // A share of the current user was stopped, e.g. on another device. Shares of other users are checked before uploading.
+            if !isForSharedDatabase, recordID.recordName.hasSuffix(staticShareExtension) {
+                let rootId = String(recordID.recordName.dropLast(staticShareExtension.count))
+                let syncContext = synchronizer.context
+                syncContext.performAndWait {
+                    CloudKitShare.updateShare(nil, for: rootId, context: syncContext)
+                }
+            }
+            return
+        }
+        
         if let object = findObject(for: recordID) {
             object.delete()
         }
