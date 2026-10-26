@@ -13,39 +13,62 @@ extension SDSSynchronizer {
         try await self._download(sharedDatabase: true)
     }
     
-    private func refreshSharedZoneIDs() async throws {
+    /// Registers newly shared zones, and cleans up after zones that are no longer shared with the current user.
+    ///
+    /// Called before uploading as well, as pending changes for a zone that is gone can never be uploaded and would fail the upload.
+    func refreshSharedZoneIDs() async throws {
         // CloudKit shared zones always have the zoneName of the private zone that originally shared it. That said, all shared zones should always have the name of the default zone.
         let ids = try await cloudSharedDatabase.allRecordZones().map(\.zoneID).filter({ $0.zoneName == defaultZoneID.zoneName })
         
         let context = self.context
-        let revokedShareRootIds = self.context.performAndWait {
+        let revokedRootIds = try context.performAndWait {
             for id in ids {
                 CloudKitZone.getZone(with: id, context: context)
             }
             
-            // Zones that are no longer in the shared database were left, or their owner stopped sharing them.
+            // Zones that are no longer in the shared database were left, or their owner stopped sharing them
             let removedZones = CloudKitZone.getAll().filter { !ids.contains($0.calculatedId) }
-            guard !removedZones.isEmpty else { return [String]() }
-            
             let removedZoneIds = Set(removedZones.map(\.calculatedId))
-            let request = CloudKitShare.fetchRequest()
-            let revokedShares = ((try? context.fetch(request)) ?? []).filter { entry in
-                entry.share.map { removedZoneIds.contains($0.recordID.zoneID) } ?? false
+            
+            // Their pending changes can never be uploaded
+            if !removedZones.isEmpty {
+                for entityName in ["CloudKitUpdate", "CloudKitRemoval"] {
+                    let request = NSFetchRequest<NSManagedObject>(entityName: entityName)
+                    request.predicate = NSPredicate(format: "sharedZone IN %@", removedZones)
+                    ((try? context.fetch(request)) ?? []).forEach(context.delete)
+                }
             }
-            let rootIds = revokedShares.map(\.id)
+            try context.save()
             
-            revokedShares.forEach(context.delete)
-            removedZones.forEach(context.delete)
-            try? context.save()
-            
-            return rootIds
+            return ((try? context.fetch(CloudKitShare.fetchRequest())) ?? [])
+                .filter { entry in entry.share.map { removedZoneIds.contains($0.recordID.zoneID) } ?? false }
+                .map(\.id)
         }
         
-        for id in revokedShareRootIds {
+        for id in revokedRootIds {
             if let container = find(for: id) {
                 logger.log("Removing local copy of revoked share \(id)")
-                removeLocalCopy(of: container)
+                do {
+                    try removeLocalCopy(of: container)
+                } catch {
+                    // The share and zone are kept, so the removal is retried with the next refresh
+                    logger.log("Failed to remove local copy of revoked share \(id): \(error.localizedDescription)")
+                }
+            } else {
+                try context.performAndWait {
+                    CloudKitShare.updateShare(nil, for: id, context: context)
+                    try context.save()
+                }
             }
+        }
+        
+        // Zones are only forgotten once none of their shares are left, so failed removals are retried
+        try context.performAndWait {
+            let remainingShareZoneIds = Set(((try? context.fetch(CloudKitShare.fetchRequest())) ?? []).compactMap { $0.share?.recordID.zoneID })
+            for zone in CloudKitZone.getAll() where !ids.contains(zone.calculatedId) && !remainingShareZoneIds.contains(zone.calculatedId) {
+                context.delete(zone)
+            }
+            try context.save()
         }
     }
     

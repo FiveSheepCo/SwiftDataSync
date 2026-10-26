@@ -104,6 +104,9 @@ extension SDSSynchronizer {
             
             try await bootstrap()
             
+            // Pending changes for shared zones that are gone would fail the upload, so they are cleaned up first
+            try await refreshSharedZoneIDs()
+            
             await set(state: .uploading)
             try await upload()
             
