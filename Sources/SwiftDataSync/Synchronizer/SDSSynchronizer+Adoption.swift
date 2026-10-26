@@ -49,14 +49,31 @@ public struct SDSAdoption: Sendable {
         }
     }
     
+    /// Change tokens of the previous sync engine, so the first download continues where it stopped.
+    ///
+    /// Without them, the first download fetches every record again, but not the deletions that happened since,
+    /// so records deleted elsewhere would stay locally.
+    public struct ChangeTokens: @unchecked Sendable {
+        // `CKServerChangeToken` isn't marked `Sendable`, but it's immutable.
+        public var privateZone: CKServerChangeToken?
+        public var sharedZones: [CKRecordZone.ID: CKServerChangeToken]
+        
+        public init(privateZone: CKServerChangeToken? = nil, sharedZones: [CKRecordZone.ID: CKServerChangeToken] = [:]) {
+            self.privateZone = privateZone
+            self.sharedZones = sharedZones
+        }
+    }
+    
     public var records: [Record]
     public var removals: [Removal]
     public var shares: [Share]
+    public var changeTokens: ChangeTokens
     
-    public init(records: [Record] = [], removals: [Removal] = [], shares: [Share] = []) {
+    public init(records: [Record] = [], removals: [Removal] = [], shares: [Share] = [], changeTokens: ChangeTokens = ChangeTokens()) {
         self.records = records
         self.removals = removals
         self.shares = shares
+        self.changeTokens = changeTokens
     }
 }
 
@@ -94,6 +111,10 @@ extension SDSSynchronizer {
                 }
             }
             
+            for (zoneID, token) in adoption.changeTokens.sharedZones {
+                CloudKitZone.getZone(with: zoneID, context: context).changeToken = token
+            }
+            
             for share in adoption.shares {
                 CloudKitShare.updateShare(share.share, for: share.rootRecordName, context: context)
                 if share.share.recordID.zoneID.ownerName != CKCurrentUserDefaultName {
@@ -102,6 +123,10 @@ extension SDSSynchronizer {
             }
             
             try context.save()
+        }
+        
+        if let token = adoption.changeTokens.privateZone {
+            setState(\.changeToken, value: token)
         }
         
         // Pending changes are only added once every record is known, as uploading them needs their objects.
