@@ -17,7 +17,18 @@ extension SDSSynchronizer {
         imageData: Data?,
         model: any PersistentModel
     ) async throws -> URL {
-        try await share(title: title, imageData: imageData, object: managedObject(for: model))
+        try await share(title: title, imageData: imageData, modelID: model.persistentModelID)
+    }
+    
+    /// Shares the model with the given identifier, or returns the URL of its existing share.
+    ///
+    /// Unlike models, identifiers are `Sendable`, so this can be called from any isolation.
+    public func share(
+        title: String,
+        imageData: Data?,
+        modelID: PersistentIdentifier
+    ) async throws -> URL {
+        try await share(title: title, imageData: imageData, object: managedObject(for: modelID))
     }
     
     /// Shares the object, or returns the URL of its existing share.
@@ -97,7 +108,11 @@ extension SDSSynchronizer {
     }
     
     private func managedObject(for model: any PersistentModel) throws -> NSManagedObject {
-        let rep = try JSONDecoder().decode(PersistentIdentifierRepresentation.self, from: JSONEncoder().encode(model.persistentModelID))
+        try managedObject(for: model.persistentModelID)
+    }
+    
+    private func managedObject(for modelID: PersistentIdentifier) throws -> NSManagedObject {
+        let rep = try JSONDecoder().decode(PersistentIdentifierRepresentation.self, from: JSONEncoder().encode(modelID))
         
         guard
             let url = URL(string: rep.implementation.uriRepresentation),
