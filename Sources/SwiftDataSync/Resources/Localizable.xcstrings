@@ -1,6 +1,46 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "adoption.error.invalidShareName" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adopted share is not named after its root record"
+          }
+        }
+      }
+    },
+    "adoption.error.sharedZoneMismatch" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adopted record is not in the zone of its root's share"
+          }
+        }
+      }
+    },
+    "adoption.error.temporaryIdentifier" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adopted model has not been saved"
+          }
+        }
+      }
+    },
+    "adoption.error.unknownModel" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Could not find adopted model"
+          }
+        }
+      }
+    },
     "ckerror.bootstrapFailed" : {
       "localizations" : {
         "en" : {

@@ -127,11 +127,15 @@ public final class SDSSynchronizer {
     ///   - containerName: The name of the iCloud container to sync to.
     ///   - configuration: The configuration.
     ///   - coordinator: The ``NSPersistentStoreCoordinator`` to sync.
+    ///   - adoption: Saves models that already have records in CloudKit, e.g. when migrating from another sync engine, and returns them.
+    ///     It's called once the store was found, before observing it and synchronizing for the first time.
+    ///     Synchronization doesn't start if it throws.
     public func setup(
         containerName: String,
         configuration: SDSConfiguration = .init(rawEntities: [:]),
         coordinator: NSPersistentStoreCoordinator,
-        defaultZoneID: String = "CoreData"
+        defaultZoneID: String = "CoreData",
+        adoption: (() throws -> SDSAdoption)? = nil
     ) {
         self.defaultZoneID = CKRecordZone.ID(zoneName: defaultZoneID)
         
@@ -142,7 +146,7 @@ public final class SDSSynchronizer {
         Task {
             await viewModel.setWaitingForContainerDetection()
         }
-        self.setup(storeToObserve: coordinator, configuration: configuration)
+        self.setup(storeToObserve: coordinator, configuration: configuration, adoption: adoption)
     }
     
     /// Used to setup the synchronizer. Should be called as early as possible.
@@ -150,11 +154,15 @@ public final class SDSSynchronizer {
     ///   - containerName: The name of the iCloud container to sync to.
     ///   - configuration: The configuration.
     ///   - modelContainer: The ``ModelContainer`` to sync. This should be the first time that container is called.
+    ///   - adoption: Saves models that already have records in CloudKit, e.g. when migrating from another sync engine, and returns them.
+    ///     It's called once the store was found, before observing it and synchronizing for the first time.
+    ///     Synchronization doesn't start if it throws.
     public func setup(
         containerName: String,
         configuration: SDSConfiguration = .init(swiftDataEntities: []),
         modelContainer: @autoclosure () -> ModelContainer?,
-        defaultZoneID: String = "CoreData"
+        defaultZoneID: String = "CoreData",
+        adoption: (() throws -> SDSAdoption)? = nil
     ) {
         self.defaultZoneID = CKRecordZone.ID(zoneName: defaultZoneID)
         
@@ -168,7 +176,7 @@ public final class SDSSynchronizer {
                 guard let self else { return }
                 
                 self.containerFinder = nil
-                self.setup(storeToObserve: coordinator, configuration: configuration)
+                self.setup(storeToObserve: coordinator, configuration: configuration, adoption: adoption)
             }
         )
         
@@ -183,7 +191,7 @@ public final class SDSSynchronizer {
         await self.forceDownloadSync()
     }
     
-    private func setup(storeToObserve: NSPersistentStoreCoordinator, configuration: SDSConfiguration) {
+    private func setup(storeToObserve: NSPersistentStoreCoordinator, configuration: SDSConfiguration, adoption: (() throws -> SDSAdoption)?) {
         self.configuration = storeToObserve.makeConfiguration(externalConfiguration: configuration)
         
         self.observedStore = storeToObserve
@@ -195,6 +203,20 @@ public final class SDSSynchronizer {
         // Other processes can change the observed store, so cached values cannot be trusted
         observedUpdateContext.stalenessInterval = 0
         self.observedUpdateContext = observedUpdateContext
+        
+        // Adopted models are saved before observing the store, so they aren't uploaded as new records
+        if let adoption {
+            do {
+                try adopt(adoption())
+            } catch {
+                // Synchronizing without the adopted records would duplicate them
+                logger.log("Failed to adopt existing records: \(error.localizedDescription)")
+                Task {
+                    await viewModel.set(state: .error(error))
+                }
+                return
+            }
+        }
         
         setupNotifications()
         

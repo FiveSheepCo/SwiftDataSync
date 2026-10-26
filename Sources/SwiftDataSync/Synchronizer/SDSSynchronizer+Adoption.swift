@@ -81,14 +81,10 @@ extension SDSSynchronizer {
     
     /// Adopts existing records for models that were created outside of the synchronizer, so they aren't uploaded as new records.
     ///
-    /// Must be called before `setup`, as the first synchronization would otherwise download the existing records as new models.
+    /// Called by `setup` once the store was found, before observing it, as the first synchronization would otherwise download
+    /// the existing records as new models, and saving the adopted models would upload them as new records.
     /// Adopting a record name again replaces its model, so a migration that was interrupted can be repeated.
-    public func adopt(_ adoption: SDSAdoption) throws {
-        // `setup` sets the CloudKit container first
-        guard cloudContainer == nil else {
-            throw SDSSyncError(title: "adoption.error.alreadySetUp")
-        }
-        
+    func adopt(_ adoption: SDSAdoption) throws {
         let mappings = try adoption.records.map { record in
             let representation = try PersistentIdentifierRepresentation(record.modelID)
             guard !representation.implementation.isTemporary else {
@@ -96,6 +92,8 @@ extension SDSSynchronizer {
             }
             return (record, representation.implementation)
         }
+        
+        try validate(adoption, mappings: mappings)
         
         let context = self.context
         try context.performAndWait {
@@ -139,6 +137,76 @@ extension SDSSynchronizer {
         
         try context.performAndWait {
             try context.save()
+        }
+    }
+    
+    /// Makes sure the adoption matches what synchronizing expects later, before anything is written.
+    ///
+    /// Every record has to be an existing, synchronized model of the observed store, as uploading its pending changes needs it.
+    /// Its zone has to be the one later changes are sent to, which is the zone of its root's share if another user shared it.
+    /// Shares have to be named after their root record, as downloading finds the root of a share by its name.
+    private func validate(_ adoption: SDSAdoption, mappings: [(SDSAdoption.Record, PersistentIdentifierRepresentation.Implementation)]) throws {
+        guard let configuration, let observedStore, let observedUpdateContext else {
+            throw SDSSyncError(title: "error.noObservedContext")
+        }
+        
+        for share in adoption.shares where share.share.recordID.recordName != share.rootRecordName + staticShareExtension {
+            throw SDSSyncError(title: "adoption.error.invalidShareName")
+        }
+        
+        let adoptedRecordNames = Dictionary(mappings.map { ($1.uriRepresentation, $0.recordName) }, uniquingKeysWith: { $1 })
+        let adoptedShares = Dictionary(adoption.shares.map { ($0.rootRecordName, $0.share) }, uniquingKeysWith: { $1 })
+        
+        let context = self.context
+        for (record, implementation) in mappings {
+            let root: (uri: String, isSharable: Bool)? = observedUpdateContext.performAndWait {
+                guard
+                    let url = URL(string: implementation.uriRepresentation),
+                    let objectID = observedStore.managedObjectID(forURIRepresentation: url),
+                    var object = try? observedUpdateContext.existingObject(with: objectID),
+                    var entity = configuration.entities[object.entity.name ?? ""]
+                else { return nil }
+                
+                // Like `sharedZoneId`, the root is the topmost synchronized parent
+                while
+                    let parent = entity.parentKey.map({ object.value(forKey: $0) }) as? NSManagedObject,
+                    let parentEntity = configuration.entities[parent.entity.name ?? ""]
+                {
+                    object = parent
+                    entity = parentEntity
+                }
+                return (object.objectID.uriRepresentation().absoluteString, entity.isSharable)
+            }
+            guard let root else {
+                throw SDSSyncError(title: "adoption.error.unknownModel")
+            }
+            
+            let share: CKShare? = context.performAndWait {
+                guard root.isSharable else { return nil }
+
+                let recordName = adoptedRecordNames[root.uri] ?? {
+                    let request = CloudKitLocalEntity.fetchRequest()
+                    request.sortDescriptors = []
+                    request.fetchLimit = 1
+                    request.predicate = NSPredicate(format: "localId = %@", root.uri)
+                    return (try? context.fetch(request).first)?.id
+                }()
+                guard let recordName else { return nil }
+
+                if let share = adoptedShares[recordName] {
+                    return share
+                }
+                // `CloudKitShare.retrieveShare` reads from the view context on the main thread, which `setup` is usually called on
+                let request = CloudKitShare.fetchRequest()
+                request.sortDescriptors = []
+                request.fetchLimit = 1
+                request.predicate = NSPredicate(format: "id = %@", recordName)
+                return (try? context.fetch(request).first)?.share
+            }
+            let sharedZoneID = share.flatMap { $0.currentUserParticipant == $0.owner ? nil : $0.recordID.zoneID }
+            guard sharedZoneID == record.sharedZoneID else {
+                throw SDSSyncError(title: "adoption.error.sharedZoneMismatch")
+            }
         }
     }
 }
