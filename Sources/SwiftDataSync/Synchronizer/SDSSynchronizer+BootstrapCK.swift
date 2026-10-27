@@ -90,6 +90,10 @@ extension SDSSynchronizer {
             guard syncLease.acquire() else { throw SDSSyncLease.UnavailableError() }
             defer { syncLease.release() }
             
+            // E.g. while the device is locked, data protection can keep the stores from being read.
+            // Data that can't be read mustn't be taken for missing data, so nothing is synchronized then.
+            try checkStoresAreReadable()
+            
             refreshSharedData()
             
             await updateUpdatesToSend()
@@ -135,6 +139,18 @@ extension SDSSynchronizer {
         }
         
         await self.setRoutineTimer()
+    }
+    
+    private func checkStoresAreReadable() throws {
+        let context = self.context
+        try context.performAndWait {
+            _ = try context.count(for: SDSSynchronizerSavedState.fetchRequest())
+        }
+        
+        guard let observedUpdateContext, let entityName = configuration?.entities.keys.first else { return }
+        try observedUpdateContext.performAndWait {
+            _ = try observedUpdateContext.count(for: NSFetchRequest<NSFetchRequestResult>(entityName: entityName))
+        }
     }
     
     /// Makes changes of other processes using the same synchronization data visible to this process.

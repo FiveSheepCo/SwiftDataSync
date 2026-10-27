@@ -73,13 +73,14 @@ extension SDSSynchronizer {
         }
     }
     
+    /// Throws if the metadata can't be read, as inserting the object then could duplicate it.
     func retrieve(
         for id: String,
         entityName: String,
         context: NSManagedObjectContext,
         preliminaryUpdateHandler: (SDSSynchronizableContainer?) -> Void
-    ) -> SDSSynchronizableContainer? {
-        if let update = find(for: id) {
+    ) throws -> SDSSynchronizableContainer? {
+        if let update = try lookUp(for: id) {
             preliminaryUpdateHandler(update)
             return update
         } else {
