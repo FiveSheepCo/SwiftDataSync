@@ -2,13 +2,13 @@ import Foundation
 import SwiftData
 
 /// Configuration struct for defining synchronization settings for SwiftData and CoreData entities.
-public struct SDSConfiguration {
+public struct SDSConfiguration: Sendable {
     
     /// Configuration for a SwiftData entity.
-    public struct SwiftDataEntity {
+    public struct SwiftDataEntity: Sendable {
         
         /// Description of synchronization settings for a SwiftData entity.
-        public enum Description {
+        public enum Description: Sendable {
             
             /// Indicates that no synchronization is needed.
             case noSync
@@ -17,7 +17,7 @@ public struct SDSConfiguration {
             case sync(PropertiesSync, assetProperties: [String] = [], parentKey: String? = nil, isSharable: Bool = false)
             
             /// Description of properties synchronization settings.
-            public enum PropertiesSync {
+            public enum PropertiesSync: Sendable {
                 
                 /// Sync with specified properties.
                 case with([String])
@@ -50,10 +50,10 @@ public struct SDSConfiguration {
     }
     
     /// Configuration for a CoreData entity.
-    public enum Entity {
+    public enum Entity: Sendable {
         
         /// Description of synchronization settings for properties of a CoreData entity.
-        public enum PropertiesSync {
+        public enum PropertiesSync: Sendable {
             
             /// Sync with specified properties.
             case with([String])

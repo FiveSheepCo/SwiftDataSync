@@ -11,6 +11,7 @@ final class SDSSharableContainer: SDSSynchronizableContainer {
         return .none
     }
     
+    /// Read through the context it is written in, as other contexts aren't updated when it changes.
     var share: CKShare? {
         SDSSynchronizer.shared.storedShare(for: id)
     }

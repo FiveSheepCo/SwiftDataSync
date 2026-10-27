@@ -4,6 +4,7 @@ import Network
 import UIKit
 #endif
 
+@MainActor
 var generalLoadMultiplier: TimeInterval {
     var multiplier: TimeInterval = 1
     

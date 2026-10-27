@@ -35,10 +35,11 @@ class SDSSynchronizableContainer {
     func delete() {
         guard let context = object.managedObjectContext else { return }
         
-        context.performAndWait {
+        context.performAndWaitUnchecked {
             context.delete(object)
         }
         
+        let id = self.id
         let sync = SDSSynchronizer.shared
         sync.context.performAndWait {
             sync.existingLocalEntity(for: id)?.delete()
@@ -48,7 +49,8 @@ class SDSSynchronizableContainer {
 
 extension SDSSynchronizableContainer {
     var lastObjectChange: Date? {
-        SDSSynchronizer.shared.context.performAndWait {
+        let id = self.id
+        return SDSSynchronizer.shared.context.performAndWait {
             CloudKitUpdate.find(for: id)?.lastChangeDate
         }
     }

@@ -4,12 +4,10 @@ import CloudKit
 
 extension SDSSynchronizer {
     
-    func setUpdate(idBlock: () -> String, zoneId: CKRecordZone.ID?, entityName: String, changedKeys: [String]) {
+    func setUpdate(id: String, zoneId: CKRecordZone.ID?, entityName: String, changedKeys: [String]) {
         let context = self.context
         
         context.performAndWait {
-            let id = idBlock()
-            
             let update = CloudKitUpdate.retrieve(for: id, entityName: entityName, context: context)
             var storageChangedKeys = update.changedKeys
             for changedKey in changedKeys {
@@ -24,12 +22,10 @@ extension SDSSynchronizer {
         }
     }
     
-    func setRemoval(idBlock: () -> String, zoneId: CKRecordZone.ID?) {
+    func setRemoval(id: String, zoneId: CKRecordZone.ID?) {
         let context = self.context
         
         context.performAndWait {
-            let id = idBlock()
-            
             CloudKitUpdate.find(for: id)?.delete()
             let removal = CloudKitRemoval.retrieve(for: id, context: context)
             

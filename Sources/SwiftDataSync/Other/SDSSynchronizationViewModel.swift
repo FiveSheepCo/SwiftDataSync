@@ -5,9 +5,9 @@ import OSLog
 @Observable @MainActor
 public final class SDSSynchronizationViewModel {
     /// The shared instance of the view model.
-    public static let shared = SDSSynchronizationViewModel()
+    nonisolated public static let shared = SDSSynchronizationViewModel()
     
-    public enum State {
+    public enum State: Sendable {
         case waitingForSetup
         case waitingForNetwork
         case waitingForContainerDetection
@@ -48,7 +48,7 @@ public final class SDSSynchronizationViewModel {
     
     // MARK: Initializer
     
-    private init() {}
+    private nonisolated init() {}
     
     // MARK: Functions
     
