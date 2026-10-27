@@ -14,17 +14,28 @@ extension SDSSynchronizer {
         }
     }
     
-    private func _upload(sharedDatabase: Bool, maximumRecords: Int = CKModifyRecordsOperation.maximumRecords) async throws {
+    /// Thrown when records keep changing while they are uploaded, e.g. while the app edits them continuously.
+    /// Downloading would overwrite the newer changes with the uploaded ones, so the synchronization ends without it.
+    struct ChangesStillPendingError: Error {}
+    
+    /// How many rounds in a row may only upload records that changed again since, before the rest is left to a later synchronization.
+    private static let maximumRoundsOfChangedRecords = 3
+    
+    /// - Parameter roundsOfChangedRecords: How many rounds in a row only uploaded records that changed again since.
+    private func _upload(
+        sharedDatabase: Bool,
+        maximumRecords: Int = CKModifyRecordsOperation.maximumRecords,
+        roundsOfChangedRecords: Int = 0
+    ) async throws {
         // Another process could have taken over while this one was suspended
         guard syncLease.renew() else { throw SDSSyncLease.UnavailableError() }
         
         await updateUpdatesToSend()
         
-        let startDate = Date.now
         // Deletes are retrieved first so that every one of them is known when filtering out the updates.
         // The maximum applies to saved and deleted records combined.
         let deletes = synchronizableDeletes(sharedDatabase: sharedDatabase, maximum: maximumRecords)
-        let records = try synchronizableUpdates(sharedDatabase: sharedDatabase, maximum: maximumRecords - deletes.count)
+        let (records, lastChangeDates) = try synchronizableUpdates(sharedDatabase: sharedDatabase, maximum: maximumRecords - deletes.count)
         
         guard records.count + deletes.count > 0 else {
             self.lastCompletedUpload = Date()
@@ -34,9 +45,9 @@ extension SDSSynchronizer {
         
         let database = (sharedDatabase ? cloudSharedDatabase : cloudPrivateDatabase)!
         
-        let completedCount: Int
+        let progress: UploadProgress
         do {
-            completedCount = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int, Error>) in
+            progress = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<UploadProgress, Error>) in
                 
                 let operation = CKModifyRecordsOperation(recordsToSave: records, recordIDsToDelete: deletes)
                 operation.savePolicy = .changedKeys
@@ -60,18 +71,18 @@ extension SDSSynchronizer {
                 operation.modifyRecordsResultBlock = { operationResult in
                     switch operationResult {
                         case .success:
-                            let completedCount = self.deleteObjects(for: doneRecords, deletes: doneDeletes, startDate: startDate)
+                            let progress = self.deleteObjects(for: doneRecords, deletes: doneDeletes, lastChangeDates: lastChangeDates)
                             
                             self.logger.log("Operation completed: \(doneRecords.count) \(doneDeletes.count)")
-                            continuation.resume(returning: completedCount)
+                            continuation.resume(returning: progress)
                         case .failure(let error):
                             // Deleting a record that is already gone fails the whole atomic operation, so those removals
                             // are discarded and the rest is uploaded again. Changes that did succeed in a non-atomic operation are kept.
                             let alreadyDeleted = self.alreadyDeletedRecordIDs(in: error, deletes: deletes)
                             if !alreadyDeleted.isEmpty {
                                 self.logger.log("Discarding removals of \(alreadyDeleted.count) records that are already deleted")
-                                let completedCount = self.deleteObjects(for: doneRecords, deletes: Array(Set(doneDeletes + alreadyDeleted)), startDate: startDate)
-                                continuation.resume(returning: completedCount)
+                                let progress = self.deleteObjects(for: doneRecords, deletes: Array(Set(doneDeletes + alreadyDeleted)), lastChangeDates: lastChangeDates)
+                                continuation.resume(returning: progress)
                                 return
                             }
                             
@@ -86,18 +97,25 @@ extension SDSSynchronizer {
         catch let error as CKError where error.code == .limitExceeded && maximumRecords > 1 {
             // Operations are also limited in size, which cannot easily be determined beforehand
             logger.log("Operation too large, retrying with at most \(maximumRecords / 2) records")
-            try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords / 2)
+            try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords / 2, roundsOfChangedRecords: roundsOfChangedRecords)
             return
         }
         
-        // E.g. records that keep failing, or keep differing from what was uploaded. They are uploaded with a later synchronization.
-        // Downloading now could overwrite their changes before they are uploaded.
-        guard completedCount > 0 else {
+        if progress.completedCount > 0 {
+            try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords)
+        } else if progress.changedAgainCount > 0 {
+            // The newer changes are uploaded next, but not indefinitely while the app keeps changing the records
+            guard roundsOfChangedRecords + 1 < Self.maximumRoundsOfChangedRecords else {
+                logger.log("Records keep changing while uploading, uploading them later")
+                throw ChangesStillPendingError()
+            }
+            try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords, roundsOfChangedRecords: roundsOfChangedRecords + 1)
+        } else {
+            // E.g. records that keep failing, or keep differing from what was uploaded. They are uploaded with a later synchronization.
+            // Downloading now could overwrite their changes before they are uploaded.
             logger.log("No changes completed, uploading the remaining ones later")
             throw SDSSyncError(title: "error.uploadIncomplete")
         }
-        
-        try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords)
     }
     
     /// The removals among `deletes` that failed because their record doesn't exist anymore.
@@ -109,9 +127,11 @@ extension SDSSynchronizer {
         }
     }
     
+    /// Up to `maximum` records to upload, and when their updates last changed, to notice changes made while uploading.
+    ///
     /// Throws if a record can't be prepared. Downloading anyway could overwrite its changes before they are uploaded.
-    private func synchronizableUpdates(sharedDatabase: Bool, maximum: Int) throws -> [CKRecord] {
-        try context.performAndWait {
+    private func synchronizableUpdates(sharedDatabase: Bool, maximum: Int) throws -> (records: [CKRecord], lastChangeDates: [String: Date]) {
+        try context.performAndWaitUnchecked {
             discardUpdatesOfRemovedRecords()
             
             // Referenced records are uploaded in earlier operations than the records referencing them,
@@ -120,10 +140,19 @@ extension SDSSynchronizer {
                 (object.sharedZone != nil) == sharedDatabase
             }).sorted(by: { lhs, rhs in
                 referenceDepth(of: lhs) < referenceDepth(of: rhs)
-            }).prefix(maximum)
-            let records = try updates.compactMap(record(for:))
+            })
             
-            return records
+            // Discarded updates don't count towards the maximum, so the remaining ones aren't taken for uploaded
+            var records: [CKRecord] = []
+            var lastChangeDates: [String: Date] = [:]
+            for update in updates where records.count < maximum {
+                let lastChangeDate = update.lastChangeDate
+                if let record = try record(for: update) {
+                    records.append(record)
+                    lastChangeDates[record.recordID.recordName] = lastChangeDate
+                }
+            }
+            return (records, lastChangeDates)
         }
     }
     
@@ -159,7 +188,8 @@ extension SDSSynchronizer {
         let changedKeys = update.changedKeys
         logger.log("[Upload] Changed from `CloudKitUpdate`: \(changedKeys)")
         
-        guard let container = find(for: id) else {
+        // A failed read throws, rather than being taken for an object that's gone
+        guard let container = try lookUp(for: id) else {
             // There is nothing left to upload
             logger.error("[Upload] Discarding update for `\(id)` as its object is unknown")
             update.delete()
@@ -234,32 +264,55 @@ extension SDSSynchronizer {
         }
     }
     
-    /// Removes the updates and removals that were uploaded. Returns how many were completed, or changed again since and are uploaded next.
-    private func deleteObjects(for updates: [CKRecord], deletes: [CKRecord.ID], startDate: Date) -> Int {
+    struct UploadProgress: Sendable {
+        /// Updates and removals that were uploaded, or that turned out to have nothing left to upload.
+        var completedCount = 0
+        /// Updates that changed again while they were uploaded, so they are uploaded again.
+        var changedAgainCount = 0
+    }
+    
+    /// Removes the updates and removals that were uploaded, and returns the progress.
+    /// - Parameter lastChangeDates: When the updates last changed when their records were prepared, by record name.
+    private func deleteObjects(for updates: [CKRecord], deletes: [CKRecord.ID], lastChangeDates: [String: Date]) -> UploadProgress {
         guard let observedUpdateContext else {
             assertionFailure()
-            return 0
+            return UploadProgress()
         }
         
         let context = self.context
         return context.performAndWait {
-            var completedCount = 0
+            var progress = UploadProgress()
             
             for record in updates {
                 let update = CloudKitUpdate.retrieve(for: record.recordID.recordName, entityName: record.recordType, context: context)
                 let id = update.id
                 let changedKeys = update.changedKeys
                 
+                // An update that changed while it was uploaded, e.g. because the object was changed again, is uploaded again.
+                // It's compared with when it last changed before, rather than the clock, which can be changed.
                 // TODO(later): make new "changedKeys" out of isDone, so that it uploads only the newly changed things
-                var isDone: Bool = true
-                
-                guard let container = find(for: id) else {
-                    // There is nothing left to upload
-                    update.delete()
-                    completedCount += 1
+                guard update.lastChangeDate == lastChangeDates[record.recordID.recordName] else {
+                    logger.log("Scheduling another upload as for `\(record.recordType)` has changed")
+                    progress.changedAgainCount += 1
                     continue
                 }
-                let lastChange = container.lastObjectChange
+                
+                var isDone: Bool = true
+                
+                let container: SDSSynchronizableContainer?
+                do {
+                    container = try lookUp(for: id)
+                } catch {
+                    // The update is kept, so it's uploaded again
+                    logger.error("[Upload] Failed to look up `\(id)`: \(error.localizedDescription)")
+                    continue
+                }
+                guard let container else {
+                    // There is nothing left to upload
+                    update.delete()
+                    progress.completedCount += 1
+                    continue
+                }
                 
                 observedUpdateContext.performAndWaitUnchecked {
                     // Check parent, but only if parent is changed
@@ -274,28 +327,20 @@ extension SDSSynchronizer {
                         isDone = false
                         return
                     }
-                    
-                    if let lastChange, lastChange > startDate {
-                        isDone = false
-                        // The newer changes are uploaded next, which is progress too
-                        completedCount += 1
-                        logger.log("Scheduling another upload as for `\(record.recordType)` has changed")
-                        return
-                    }
                 }
                 
                 if isDone {
                     logger.log("Update for `\(update.id)` deleted")
                     update.delete()
-                    completedCount += 1
+                    progress.completedCount += 1
                 }
             }
             
             for delete in deletes {
                 CloudKitRemoval.retrieve(for: delete.recordName, context: context).delete()
-                completedCount += 1
+                progress.completedCount += 1
             }
-            return completedCount
+            return progress
         }
     }
 }

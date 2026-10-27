@@ -540,8 +540,19 @@ private final class CKDownloadHandler {
         
         // Inserted objects get their permanent IDs before they are saved, so their placeholders know them once other contexts
         // can change the objects. Otherwise a change could find no record id for an object, and give it a second one.
-        observedContext.performAndWait {
-            try? observedContext.obtainPermanentIDs(for: Array(observedContext.insertedObjects))
+        let permanentIdError: (any Error)? = observedContext.performAndWait {
+            do {
+                try observedContext.obtainPermanentIDs(for: Array(observedContext.insertedObjects))
+                return nil
+            } catch {
+                return error
+            }
+        }
+        if let permanentIdError {
+            synchronizer.logger.log("Failed to get permanent IDs, discarding download: \(permanentIdError.localizedDescription)")
+            discardDownload(observedContext: observedContext)
+            completionHandler(permanentIdError)
+            return
         }
         syncContext.performAndWait {
             for (object, container) in synchronizer.temporaryObjectContainers where !object.objectID.isTemporaryID {

@@ -350,6 +350,7 @@ public final class SDSSynchronizer: Sendable {
         }
         
         removeSavedPlaceholders()
+        downloadAgainIfMoreIsSynchronized(configuration)
         
         // Adopted models are saved before observing the store, so they aren't uploaded as new records
         if let adoption {
@@ -396,6 +397,49 @@ public final class SDSSynchronizer: Sendable {
                 // They are removed with the next save
                 logger.log("Failed to remove saved placeholders: \(error.localizedDescription)")
             }
+        }
+    }
+    
+    /// Downloads skip models and keys this version of the app doesn't synchronize, e.g. ones a newer version added,
+    /// while the change tokens move past them. Once more is synchronized, the change tokens are reset to download everything again.
+    ///
+    /// What is synchronized is stored next to the synchronization data, so the data model doesn't change.
+    private func downloadAgainIfMoreIsSynchronized(_ configuration: SDSInternalConfiguration) {
+        guard let url = container.persistentStoreDescriptions.first?.url?.deletingLastPathComponent().appendingPathComponent("CloudKitSync.keys.json") else { return }
+        
+        let keys = Set(configuration.entities.flatMap { name, entity in
+            [name] + entity.syncedProperties.map { "\(name).\($0)" }
+        })
+        let previousKeys = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(Set<String>.self, from: $0) }
+        guard keys != previousKeys else { return }
+        
+        // Without a stored set, e.g. on the first launch of a version that stores it, nothing is reset
+        if let previousKeys, !keys.isSubset(of: previousKeys) {
+            let context = self.context
+            let didReset = context.performAndWait {
+                context.savedState.changeToken = nil
+                for zone in CloudKitZone.getAll() {
+                    zone.changeToken = nil
+                }
+                do {
+                    try context.save()
+                    return true
+                } catch {
+                    return false
+                }
+            }
+            // Otherwise this is tried again with the next launch
+            guard didReset else {
+                logger.log("Failed to reset the change tokens for newly synchronized models and keys")
+                return
+            }
+            logger.log("More models or keys are synchronized than before, downloading everything again")
+        }
+        
+        do {
+            try JSONEncoder().encode(keys).write(to: url, options: .atomic)
+        } catch {
+            logger.log("Failed to store the synchronized models and keys: \(error.localizedDescription)")
         }
     }
     
