@@ -118,6 +118,12 @@ extension SDSSynchronizer {
             
             await set(state: .idle)
         }
+        catch is ChangesStillPendingError {
+            // Not an error: the changes are uploaded and downloads resume once the app stops changing the records
+            await set(state: .idle)
+            await setRoutineTimer(onlyAfterError: false)
+            return
+        }
         catch is SDSSyncLease.UnavailableError {
             // The other process uploads the pending changes of this one too, but changes made after its upload still need to be synchronized
             logger.log("Another process is synchronizing, retrying later")
@@ -163,8 +169,11 @@ extension SDSSynchronizer {
         await viewModel.set(updatesToSend: updatesToSend)
     }
     
-    private func setRoutineTimer() async {
-        guard case .error = await viewModel.state else { return }
+    /// Schedules a synchronization after an error, or also without one.
+    private func setRoutineTimer(onlyAfterError: Bool = true) async {
+        if onlyAfterError {
+            guard case .error = await viewModel.state else { return }
+        }
         
         startTask(at: \.routineSync) { @MainActor in
             let minInterval: TimeInterval

@@ -4,13 +4,18 @@ import CoreData
 extension SDSSynchronizer {
     /// Has to be called on `context`'s queue.
     func existingLocalEntity(for id: String) -> CloudKitLocalEntity? {
+        try? fetchLocalEntity(for: id)
+    }
+    
+    /// Has to be called on `context`'s queue. Throws if the metadata can't be read.
+    private func fetchLocalEntity(for id: String) throws -> CloudKitLocalEntity? {
         let request = CloudKitLocalEntity.fetchRequest()
         
         request.sortDescriptors = []
         request.fetchLimit = 1
         request.predicate = NSPredicate(format: "id = %@", id)
         
-        return try? request.execute().first
+        return try request.execute().first
     }
     
     private func container(
@@ -44,11 +49,16 @@ extension SDSSynchronizer {
     }
     
     func find(for id: String) -> SDSSynchronizableContainer? {
+        try? lookUp(for: id)
+    }
+    
+    /// Like `find(for:)`, but throws if the metadata can't be read, so a failed read isn't taken for an object that's gone.
+    func lookUp(for id: String) throws -> SDSSynchronizableContainer? {
         guard let observedUpdateContext, let observedStore else { return nil }
         
         // The local entity and temporary objects are read on `context`'s queue, the object on `observedUpdateContext`'s
-        let result = context.performAndWaitUnchecked {
-            existingLocalEntity(for: id).map { (localId: $0.localId, temporaryObject: temporaryObject(for: id)) }
+        let result = try context.performAndWaitUnchecked {
+            try fetchLocalEntity(for: id).map { (localId: $0.localId, temporaryObject: temporaryObject(for: id)) }
         }
         
         return observedUpdateContext.performAndWaitUnchecked { () -> SDSSynchronizableContainer? in
