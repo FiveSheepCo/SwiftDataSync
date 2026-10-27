@@ -70,6 +70,11 @@ public final class SDSSynchronizer: Sendable {
         /// IDs of deleted objects aren't reused, so they are kept.
         var deletionsBySynchronizer: Set<NSManagedObjectID> = []
         
+        /// Keys of objects that were changed in a context but not saved yet.
+        var unsavedChanges: [NSManagedObjectID: Set<String>] = [:]
+        
+        fileprivate var containerFinder: _ContainerFinder?
+        
         var routineSync: Task<Void, Never>?
         var syncLeaseRetry: Task<Void, Never>?
     }
@@ -122,10 +127,43 @@ public final class SDSSynchronizer: Sendable {
     /// Contexts that merge its changes report its deletions like deletions made in them, which must not be uploaded:
     /// they are deletions downloaded from iCloud, or local copies of shares that were left, whose records belong to someone else.
     func saveObservedUpdateContext(_ observedUpdateContext: NSManagedObjectContext) throws {
-        let deletedIds = observedUpdateContext.deletedObjects.map(\.objectID)
-        mutableState.withLock { $0.deletionsBySynchronizer.formUnion(deletedIds) }
+        // Deletions only reach related objects, e.g. through cascade rules, once pending changes are processed
+        observedUpdateContext.processPendingChanges()
+        let deletedIds = Set(observedUpdateContext.deletedObjects.map(\.objectID))
+        let newIds = mutableState.withLock { state in
+            let newIds = deletedIds.subtracting(state.deletionsBySynchronizer)
+            state.deletionsBySynchronizer.formUnion(newIds)
+            return newIds
+        }
         
-        try observedUpdateContext.save()
+        do {
+            try observedUpdateContext.save()
+        } catch {
+            // Deletions that weren't saved aren't merged into other contexts, and are uploaded if they are made there
+            mutableState.withLock { $0.deletionsBySynchronizer.subtract(newIds) }
+            throw error
+        }
+    }
+    
+    /// Uploads read values from the store, so a change that isn't saved yet isn't uploaded.
+    /// Its keys are remembered, so the change is stored again once it is saved, see `contextSaved`.
+    func rememberUnsavedChanges(_ changes: [SDSObjectChange]) {
+        mutableState.withLock { state in
+            for change in changes {
+                state.unsavedChanges[change.objectId, default: []].formUnion(change.changedKeys)
+            }
+        }
+    }
+    
+    /// Returns and forgets the changed keys of objects that were saved.
+    func takeUnsavedChanges(of objectIds: [NSManagedObjectID]) -> [NSManagedObjectID: Set<String>] {
+        mutableState.withLock { state in
+            var changes: [NSManagedObjectID: Set<String>] = [:]
+            for objectId in objectIds {
+                changes[objectId] = state.unsavedChanges.removeValue(forKey: objectId)
+            }
+            return changes
+        }
     }
     
     func wasDeletedBySynchronizer(_ objectId: NSManagedObjectID) -> Bool {
@@ -201,8 +239,10 @@ public final class SDSSynchronizer: Sendable {
         self.networkMonitor.start(queue: .main)
     }
     
-    @MainActor
-    private var containerFinder: _ContainerFinder?
+    private var containerFinder: _ContainerFinder? {
+        get { mutableState.withLock { $0.containerFinder } }
+        set { mutableState.withLock { $0.containerFinder = newValue } }
+    }
     
     /// Used to setup the synchronizer. Should be called as early as possible.
     /// - Parameters:
@@ -227,7 +267,7 @@ public final class SDSSynchronizer: Sendable {
         self.setup(storeToObserve: coordinator, configuration: configuration, adoption: adoption)
     }
     
-    /// Used to setup the synchronizer. Should be called as early as possible, on the main actor, like the `ModelContainer` is created.
+    /// Used to setup the synchronizer. Should be called as early as possible.
     /// - Parameters:
     ///   - containerName: The name of the iCloud container to sync to.
     ///   - configuration: The configuration.
@@ -235,7 +275,6 @@ public final class SDSSynchronizer: Sendable {
     ///   - adoption: Saves models that already have records in CloudKit, e.g. when migrating from another sync engine, and returns them.
     ///     It's called once the store was found, before observing it and synchronizing for the first time.
     ///     Synchronization doesn't start if it throws.
-    @MainActor
     public func setup(
         containerName: String,
         configuration: SDSConfiguration = .init(swiftDataEntities: []),
@@ -255,7 +294,9 @@ public final class SDSSynchronizer: Sendable {
             }
         )
         
-        viewModel.setWaitingForContainerDetection()
+        Task {
+            await viewModel.setWaitingForContainerDetection()
+        }
     }
     
     /// Should be called when a remote notification was received.
@@ -290,6 +331,8 @@ public final class SDSSynchronizer: Sendable {
             state.observedUpdateContext = observedUpdateContext
         }
         
+        removeSavedPlaceholders()
+        
         // Adopted models are saved before observing the store, so they aren't uploaded as new records
         if let adoption {
             do {
@@ -310,6 +353,31 @@ public final class SDSSynchronizer: Sendable {
         Task {
             await viewModel.set(state: .idle)
             await synchronize()
+        }
+    }
+    
+    /// Removes placeholders of downloaded objects that earlier versions could save, e.g. when a download failed.
+    ///
+    /// Placeholders only exist while a download runs, and nothing is downloading yet. A saved one has no object, but would
+    /// keep its record from being found, so a download would insert the record's object again with every change.
+    private func removeSavedPlaceholders() {
+        let context = self.context
+        context.performAndWait {
+            let request = CloudKitLocalEntity.fetchRequest()
+            request.sortDescriptors = []
+            request.predicate = NSPredicate(format: "localId == %@", "")
+            
+            let placeholders = (try? context.fetch(request)) ?? []
+            guard !placeholders.isEmpty else { return }
+            
+            placeholders.forEach(context.delete)
+            do {
+                try context.save()
+                logger.log("Removed \(placeholders.count) saved placeholders")
+            } catch {
+                // They are removed with the next save
+                logger.log("Failed to remove saved placeholders: \(error.localizedDescription)")
+            }
         }
     }
     
@@ -342,8 +410,11 @@ public final class SDSSynchronizer: Sendable {
 
 
 
-@MainActor
-private final class _ContainerFinder {
+/// Finds the coordinator of the `ModelContainer` created by a closure, through the notification posted once its stores are loaded.
+///
+/// The notification is posted on the main queue, possibly while the closure is still running on another thread, so the state is guarded by a lock.
+private final class _ContainerFinder: @unchecked Sendable {
+    private let lock = NSLock()
     private var containerObservation: NSObjectProtocol?
     private var completion: ((NSPersistentStoreCoordinator) -> Void)?
     
@@ -365,22 +436,26 @@ private final class _ContainerFinder {
         closure: () -> ModelContainer?,
         completion: @escaping (NSPersistentStoreCoordinator) -> Void
     ) {
-        self.containerObservation = NotificationCenter.default.addObserver(forName: .NSPersistentStoreCoordinatorStoresDidChange, object: nil, queue: .main) { [weak self] notification in
+        self.completion = completion
+        let containerObservation = NotificationCenter.default.addObserver(forName: .NSPersistentStoreCoordinatorStoresDidChange, object: nil, queue: .main) { [weak self] notification in
             guard let store = notification.object as? NSPersistentStoreCoordinator else { return }
             
-            MainActor.assumeIsolated {
-                self?.coordinatorFound(coordinator: store)
-            }
+            self?.coordinatorFound(coordinator: store)
         }
-        self.completion = completion
+        lock.withLock {
+            self.containerObservation = containerObservation
+        }
         
         guard let container = closure() else { return }
         let urls = container.configurations.map(\.url)
         
         assert(!urls.isEmpty, "The ModelContainer supplied to SDSSynchronizer should have at least one URL.")
         
-        let coordinators = state.retrievedCoordinators
-        state = .done(urls)
+        let coordinators = lock.withLock {
+            let coordinators = state.retrievedCoordinators
+            state = .done(urls)
+            return coordinators
+        }
         
         for coordinator in coordinators {
             coordinatorFound(coordinator: coordinator)
@@ -388,18 +463,28 @@ private final class _ContainerFinder {
     }
     
     func coordinatorFound(coordinator: NSPersistentStoreCoordinator) {
-        switch state {
-        case .retrieved(let array):
-            if !array.contains(coordinator) {
-                state = .retrieved(array + [coordinator])
-            }
-        case .done(let urls):
-            let containerUrls = coordinator.persistentStores.compactMap(\.url)
-            if urls.contains(where: { containerUrls.contains($0) }) {
-                completion?(coordinator)
-                completion = nil
-                containerObservation = nil
+        // The completion is called outside of the lock, and only once
+        let found: (completion: (NSPersistentStoreCoordinator) -> Void, observation: NSObjectProtocol?)? = lock.withLock {
+            switch state {
+            case .retrieved(let array):
+                if !array.contains(coordinator) {
+                    state = .retrieved(array + [coordinator])
+                }
+                return nil
+            case .done(let urls):
+                let containerUrls = coordinator.persistentStores.compactMap(\.url)
+                guard urls.contains(where: { containerUrls.contains($0) }), let completion else { return nil }
+                
+                defer {
+                    self.completion = nil
+                    containerObservation = nil
+                }
+                return (completion, containerObservation)
             }
         }
+        guard let found else { return }
+        
+        found.observation.map(NotificationCenter.default.removeObserver)
+        found.completion(coordinator)
     }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import CloudKit
 
 /// A model which contains the current sync state.
 @Observable @MainActor
@@ -58,9 +59,17 @@ public final class SDSSynchronizationViewModel {
         self.set(state: .waitingForContainerDetection)
     }
     
+    /// Starts a synchronization unless another one or another operation is running.
+    ///
+    /// The state is checked and set without suspending, so nothing else can start in between.
     func attemptSyncStart() -> Bool {
         switch state {
-        case .idle, .error, .waitingForNetwork, .notLoggedIntoIcloud: break
+        case .idle, .waitingForNetwork, .notLoggedIntoIcloud: break
+        case .error(let error):
+            // CloudKit can ask to wait before retrying, e.g. while it throttles requests. The routine synchronization retries later.
+            if let retrySeconds = (error as? CKError)?.retryAfterSeconds, -lastStateChange.timeIntervalSinceNow < retrySeconds {
+                return false
+            }
         case .savingShare:
             // Nothing else starts it once the share is saved
             syncWasRequestedWhileSavingShare = true
