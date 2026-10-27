@@ -70,6 +70,9 @@ public final class SDSSynchronizer: Sendable {
         /// IDs of deleted objects aren't reused, so they are kept.
         var deletionsBySynchronizer: Set<NSManagedObjectID> = []
         
+        /// The synchronized models and keys, if more are synchronized than when everything was downloaded last.
+        var keysToCatchUpOn: Set<String>?
+        
         /// Keys of objects that were changed in a context but not saved yet.
         var unsavedChanges: [UnsavedChangeKey: Set<String>] = [:]
         
@@ -350,7 +353,7 @@ public final class SDSSynchronizer: Sendable {
         }
         
         removeSavedPlaceholders()
-        downloadAgainIfMoreIsSynchronized(configuration)
+        checkForNewlySynchronizedKeys(configuration)
         
         // Adopted models are saved before observing the store, so they aren't uploaded as new records
         if let adoption {
@@ -400,47 +403,59 @@ public final class SDSSynchronizer: Sendable {
         }
     }
     
-    /// Downloads skip models and keys this version of the app doesn't synchronize, e.g. ones a newer version added,
-    /// while the change tokens move past them. Once more is synchronized, the change tokens are reset to download everything again.
+    /// Downloads skip models and keys this version of the app doesn't synchronize, e.g. ones a newer version added, while their
+    /// change tokens move on. Once more is synchronized, everything is downloaded once more, see `download(refreshingSharedZones:)`.
     ///
-    /// What is synchronized is stored next to the synchronization data, so the data model doesn't change.
-    private func downloadAgainIfMoreIsSynchronized(_ configuration: SDSInternalConfiguration) {
-        guard let url = container.persistentStoreDescriptions.first?.url?.deletingLastPathComponent().appendingPathComponent("CloudKitSync.keys.json") else { return }
-        
+    /// What was synchronized when everything was downloaded last is stored next to the synchronization data,
+    /// so the data model doesn't change.
+    private func checkForNewlySynchronizedKeys(_ configuration: SDSInternalConfiguration) {
         let keys = Set(configuration.entities.flatMap { name, entity in
             [name] + entity.syncedProperties.map { "\(name).\($0)" }
         })
-        let previousKeys = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(Set<String>.self, from: $0) }
-        guard keys != previousKeys else { return }
+        let previousKeys = synchronizedKeysURL
+            .flatMap { try? Data(contentsOf: $0) }
+            .flatMap { try? JSONDecoder().decode(Set<String>.self, from: $0) }
         
-        // Without a stored set, e.g. on the first launch of a version that stores it, nothing is reset
-        if let previousKeys, !keys.isSubset(of: previousKeys) {
-            let context = self.context
-            let didReset = context.performAndWait {
-                context.savedState.changeToken = nil
-                for zone in CloudKitZone.getAll() {
-                    zone.changeToken = nil
-                }
-                do {
-                    try context.save()
-                    return true
-                } catch {
-                    return false
-                }
+        if let previousKeys, keys.isSubset(of: previousKeys) {
+            // Nothing was skipped that is synchronized now
+            if keys != previousKeys {
+                storeSynchronizedKeys(keys)
             }
-            // Otherwise this is tried again with the next launch
-            guard didReset else {
-                logger.log("Failed to reset the change tokens for newly synchronized models and keys")
-                return
-            }
-            logger.log("More models or keys are synchronized than before, downloading everything again")
+            return
         }
         
+        // Without stored keys, a device that synchronized before could have skipped keys, as earlier versions did that too.
+        // One that never synchronized downloads everything anyway.
+        if previousKeys == nil, !accessState({ $0.changeToken != nil }) {
+            storeSynchronizedKeys(keys)
+            return
+        }
+        
+        mutableState.withLock { $0.keysToCatchUpOn = keys }
+    }
+    
+    private var synchronizedKeysURL: URL? {
+        container.persistentStoreDescriptions.first?.url?.deletingLastPathComponent().appendingPathComponent("CloudKitSync.keys.json")
+    }
+    
+    private func storeSynchronizedKeys(_ keys: Set<String>) {
+        guard let url = synchronizedKeysURL else { return }
         do {
             try JSONEncoder().encode(keys).write(to: url, options: .atomic)
         } catch {
             logger.log("Failed to store the synchronized models and keys: \(error.localizedDescription)")
         }
+    }
+    
+    /// The synchronized models and keys, if more are synchronized than when everything was downloaded last.
+    var keysToCatchUpOn: Set<String>? {
+        mutableState.withLock { $0.keysToCatchUpOn }
+    }
+    
+    /// Called once everything was downloaded with `keys` synchronized.
+    func finishCatchingUp(on keys: Set<String>) {
+        storeSynchronizedKeys(keys)
+        mutableState.withLock { $0.keysToCatchUpOn = nil }
     }
     
     // MARK: - Helper Functions

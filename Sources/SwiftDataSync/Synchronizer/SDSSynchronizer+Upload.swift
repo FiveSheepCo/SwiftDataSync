@@ -5,12 +5,24 @@ import CloudKit
 extension SDSSynchronizer {
     
     func upload() async throws {
-        try await _upload(sharedDatabase: false)
-        try await _upload(sharedDatabase: true)
+        // Records that keep changing in one database don't keep the other's changes from being uploaded.
+        // The download is still skipped afterwards, as it would overwrite their newer changes.
+        var changesStillPending: ChangesStillPendingError?
+        for sharedDatabase in [false, true] {
+            do {
+                try await _upload(sharedDatabase: sharedDatabase)
+            } catch let error as ChangesStillPendingError {
+                changesStillPending = error
+            }
+        }
         
         let context = self.context
         try context.performAndWait {
             try context.save()
+        }
+        
+        if let changesStillPending {
+            throw changesStillPending
         }
     }
     

@@ -36,10 +36,11 @@ extension CloudKitZone {
        return try? request.execute().first
     }
     
-    static func getAll() -> [CloudKitZone] {
+    /// Throws if the zones can't be read, which mustn't be taken for no zones.
+    static func getAll() throws -> [CloudKitZone] {
         let request: NSFetchRequest<CloudKitZone> = self.fetchRequest()
         request.sortDescriptors = []
         
-        return (try? request.execute()) ?? []
+        return try request.execute()
     }
 }

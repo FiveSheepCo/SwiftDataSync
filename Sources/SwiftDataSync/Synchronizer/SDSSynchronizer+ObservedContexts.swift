@@ -76,7 +76,9 @@ extension SDSSynchronizer {
         // Inserted objects only have a valid managed object id after being saved
         // Changes cannot be handled here as we do not get useful information about the properties that have changed
         // The objects belong to the context that was saved, so they are read now, while on its queue
-        let insertedChanges = changes(of: insertedObjects, inserted: true)
+        // They are stored right away, like other changes. Otherwise a running upload could upload a record that references
+        // an inserted object before the object, and another device that downloads in between couldn't store the record.
+        setUpdates(for: changes(of: insertedObjects, inserted: true))
         
         Task {
             // Nothing cancels this task
@@ -93,8 +95,6 @@ extension SDSSynchronizer {
                     observedUpdateContext.rollback()
                 }
             }
-            
-            setUpdates(for: insertedChanges)
             
             let context = self.context
             context.performAndWait {

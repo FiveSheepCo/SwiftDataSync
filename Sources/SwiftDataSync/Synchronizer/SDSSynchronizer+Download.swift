@@ -17,6 +17,16 @@ extension SDSSynchronizer {
         }
         
         try await self._download(sharedDatabase: true)
+        
+        // Downloads skip models and keys this version doesn't synchronize, e.g. ones a newer version added, while their change
+        // tokens move on. Once more is synchronized, every record is downloaded once more. The change tokens are kept,
+        // as downloading from scratch doesn't include deletions, which would then be missed.
+        if let keys = keysToCatchUpOn {
+            logger.log("More models or keys are synchronized than before, downloading everything once more")
+            try await _download(fromScratch: true)
+            try await _download(sharedDatabase: true, fromScratch: true)
+            finishCatchingUp(on: keys)
+        }
     }
     
     /// Registers newly shared zones, and cleans up after zones that are no longer shared with the current user.
@@ -42,7 +52,7 @@ extension SDSSynchronizer {
             }
             
             // Zones that are no longer in the shared database were left, or their owner stopped sharing them
-            let removedZones = CloudKitZone.getAll().filter { !existingZoneIds.contains($0.calculatedId) }
+            let removedZones = try CloudKitZone.getAll().filter { !existingZoneIds.contains($0.calculatedId) }
             let removedZoneIds = Set(removedZones.map(\.calculatedId))
             
             // Their pending changes can never be uploaded
@@ -81,7 +91,7 @@ extension SDSSynchronizer {
         // Zones are only forgotten once none of their shares are left, so failed removals are retried
         try context.performAndWait {
             let remainingShareZoneIds = Set(((try? context.fetch(CloudKitShare.fetchRequest())) ?? []).compactMap { $0.share?.recordID.zoneID })
-            for zone in CloudKitZone.getAll() where !existingZoneIds.contains(zone.calculatedId) && !remainingShareZoneIds.contains(zone.calculatedId) {
+            for zone in try CloudKitZone.getAll() where !existingZoneIds.contains(zone.calculatedId) && !remainingShareZoneIds.contains(zone.calculatedId) {
                 context.delete(zone)
             }
             try context.save()
@@ -118,16 +128,17 @@ extension SDSSynchronizer {
         }
     }
     
-    private func _download(sharedDatabase: Bool = false) async throws {
+    /// - Parameter fromScratch: Whether to download every record rather than the changes since the last download, without saving the change tokens.
+    private func _download(sharedDatabase: Bool = false, fromScratch: Bool = false) async throws {
         logger.log("Starting Download of \(sharedDatabase ? "shared" : "private") database")
         
         var configurations: [CKRecordZone.ID : CKFetchRecordZoneChangesOperation.ZoneConfiguration] = [:]
         
         if sharedDatabase {
-            configurations = context.performAndWaitUnchecked {
-                let zones = CloudKitZone.getAll()
+            configurations = try context.performAndWaitUnchecked {
+                let zones = try CloudKitZone.getAll()
                 return Dictionary(zones.map { savedZone in
-                    (savedZone.calculatedId, CKFetchRecordZoneChangesOperation.ZoneConfiguration(previousServerChangeToken: savedZone.changeToken))
+                    (savedZone.calculatedId, CKFetchRecordZoneChangesOperation.ZoneConfiguration(previousServerChangeToken: fromScratch ? nil : savedZone.changeToken))
                 }, uniquingKeysWith: { $1 })
             }
             
@@ -136,7 +147,7 @@ extension SDSSynchronizer {
                 return
             }
         } else {
-            let token = accessState(\.changeToken)
+            let token = fromScratch ? nil : accessState(\.changeToken)
             let options = CKFetchRecordZoneChangesOperation.ZoneConfiguration(previousServerChangeToken: token)
             
             configurations = [defaultZoneID: options]
@@ -149,7 +160,7 @@ extension SDSSynchronizer {
         operation.fetchAllChanges = true
         
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let handler = CKDownloadHandler(synchronizer: self, forSharedDatabase: sharedDatabase) { [weak self] error in
+            let handler = CKDownloadHandler(synchronizer: self, forSharedDatabase: sharedDatabase, savesChangeTokens: !fromScratch) { [weak self] error in
                 guard let self else { return }
                 
                 if let error = error {
@@ -193,13 +204,16 @@ private final class CKDownloadHandler {
     /// Keeps a record from being stored incompletely. The download is discarded, so the record is downloaded again.
     private var applyError: (any Error)?
     let isForSharedDatabase: Bool
+    /// Whether the change tokens are saved, which a download from scratch doesn't do, as it doesn't include deletions.
+    let savesChangeTokens: Bool
     let completionHandler: (Error?) -> Void
     
-    init(synchronizer: SDSSynchronizer, forSharedDatabase: Bool, completionHandler: @escaping (Error?) -> Void) {
+    init(synchronizer: SDSSynchronizer, forSharedDatabase: Bool, savesChangeTokens: Bool, completionHandler: @escaping (Error?) -> Void) {
         self.synchronizer = synchronizer
         self.context = synchronizer.observedUpdateContext
         
         self.isForSharedDatabase = forSharedDatabase
+        self.savesChangeTokens = savesChangeTokens
         self.completionHandler = completionHandler
     }
     
@@ -372,17 +386,31 @@ private final class CKDownloadHandler {
         return values
     }
     
+    /// A failed read isn't taken for a missing object, which could duplicate it or get records deleted.
+    /// The download is discarded instead, so the records are downloaded again.
     private func findObject(for recordID: CKRecord.ID) -> SDSSynchronizableContainer? {
-        synchronizer.find(for: recordID.recordName)
+        do {
+            return try synchronizer.lookUp(for: recordID.recordName)
+        } catch {
+            synchronizer.logger.error("Failed to look up `\(recordID.recordName)`: \(error.localizedDescription)")
+            applyError = error
+            return nil
+        }
     }
     
     private func retrieveObject(for record: CKRecord, preliminaryUpdateHandler: (SDSSynchronizableContainer?) -> Void) -> SDSSynchronizableContainer? {
-        synchronizer.retrieve(
-            for: record.recordID.recordName,
-            entityName: record.recordType,
-            context: context,
-            preliminaryUpdateHandler: preliminaryUpdateHandler
-        )
+        do {
+            return try synchronizer.retrieve(
+                for: record.recordID.recordName,
+                entityName: record.recordType,
+                context: context,
+                preliminaryUpdateHandler: preliminaryUpdateHandler
+            )
+        } catch {
+            synchronizer.logger.error("Failed to look up `\(record.recordID.recordName)`: \(error.localizedDescription)")
+            applyError = error
+            return nil
+        }
     }
     
     func deleted(recordID: CKRecord.ID, recordType:String) {
@@ -462,6 +490,9 @@ private final class CKDownloadHandler {
             } else if fetchFailed {
                 // The change token was not advanced past these records, so the next download fetches them again
                 synchronizer.logger.log("Fetch failed with \(unresolvedRecords.count) unresolved records, retrying them with the next download")
+            } else if applyError != nil {
+                // Their references might only be missing because they couldn't be read, and the download is discarded
+                synchronizer.logger.log("Failed to apply records, retrying \(unresolvedRecords.count) unresolved records with the next download")
             } else {
                 synchronizer.logger.log("RecordsToAddLater not empty: \(unresolvedRecords.map(\.recordID))")
                 
@@ -474,7 +505,7 @@ private final class CKDownloadHandler {
         
         // Records that still wait for their references were received before this token.
         // If the token was saved and the fetch failed before the references arrived, they would never be fetched again.
-        if let changeToken = changeToken, !recordsToAddLater.contains(where: { isRecord($0, in: zoneID) }) {
+        if let changeToken = changeToken, savesChangeTokens, !recordsToAddLater.contains(where: { isRecord($0, in: zoneID) }) {
             if isForSharedDatabase {
                 tokensToUpdate[zoneID] = changeToken
             } else {
