@@ -61,6 +61,16 @@
         }
       }
     },
+    "error.uploadIncomplete" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Some changes could not be uploaded"
+          }
+        }
+      }
+    },
     "settings.sync" : {
       "localizations" : {
         "en" : {

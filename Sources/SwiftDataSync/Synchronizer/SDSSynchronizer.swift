@@ -71,7 +71,7 @@ public final class SDSSynchronizer: Sendable {
         var deletionsBySynchronizer: Set<NSManagedObjectID> = []
         
         /// Keys of objects that were changed in a context but not saved yet.
-        var unsavedChanges: [NSManagedObjectID: Set<String>] = [:]
+        var unsavedChanges: [UnsavedChangeKey: Set<String>] = [:]
         
         fileprivate var containerFinder: _ContainerFinder?
         
@@ -145,22 +145,40 @@ public final class SDSSynchronizer: Sendable {
         }
     }
     
+    /// An object's changes in the context that saves them to the store.
+    ///
+    /// Several contexts can change the same object, and each one's changes are only saved by its own save.
+    struct UnsavedChangeKey: Hashable, Sendable {
+        let rootContext: ObjectIdentifier
+        let objectId: NSManagedObjectID
+        
+        /// Changes of a child context are saved to the store by its topmost parent.
+        init(context: NSManagedObjectContext, objectId: NSManagedObjectID) {
+            var rootContext = context
+            while let parent = rootContext.parent {
+                rootContext = parent
+            }
+            self.rootContext = ObjectIdentifier(rootContext)
+            self.objectId = objectId
+        }
+    }
+    
     /// Uploads read values from the store, so a change that isn't saved yet isn't uploaded.
     /// Its keys are remembered, so the change is stored again once it is saved, see `contextSaved`.
-    func rememberUnsavedChanges(_ changes: [SDSObjectChange]) {
+    func rememberUnsavedChanges(_ changes: [SDSObjectChange], in context: NSManagedObjectContext) {
         mutableState.withLock { state in
             for change in changes {
-                state.unsavedChanges[change.objectId, default: []].formUnion(change.changedKeys)
+                state.unsavedChanges[UnsavedChangeKey(context: context, objectId: change.objectId), default: []].formUnion(change.changedKeys)
             }
         }
     }
     
-    /// Returns and forgets the changed keys of objects that were saved.
-    func takeUnsavedChanges(of objectIds: [NSManagedObjectID]) -> [NSManagedObjectID: Set<String>] {
+    /// Returns and forgets the changed keys of objects that a root context saved.
+    func takeUnsavedChanges(of objectIds: [NSManagedObjectID], savedBy context: NSManagedObjectContext) -> [NSManagedObjectID: Set<String>] {
         mutableState.withLock { state in
             var changes: [NSManagedObjectID: Set<String>] = [:]
             for objectId in objectIds {
-                changes[objectId] = state.unsavedChanges.removeValue(forKey: objectId)
+                changes[objectId] = state.unsavedChanges.removeValue(forKey: UnsavedChangeKey(context: context, objectId: objectId))
             }
             return changes
         }

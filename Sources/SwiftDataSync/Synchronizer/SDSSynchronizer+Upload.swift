@@ -24,7 +24,7 @@ extension SDSSynchronizer {
         // Deletes are retrieved first so that every one of them is known when filtering out the updates.
         // The maximum applies to saved and deleted records combined.
         let deletes = synchronizableDeletes(sharedDatabase: sharedDatabase, maximum: maximumRecords)
-        let records = synchronizableUpdates(sharedDatabase: sharedDatabase, maximum: maximumRecords - deletes.count)
+        let records = try synchronizableUpdates(sharedDatabase: sharedDatabase, maximum: maximumRecords - deletes.count)
         
         guard records.count + deletes.count > 0 else {
             self.lastCompletedUpload = Date()
@@ -91,9 +91,10 @@ extension SDSSynchronizer {
         }
         
         // E.g. records that keep failing, or keep differing from what was uploaded. They are uploaded with a later synchronization.
+        // Downloading now could overwrite their changes before they are uploaded.
         guard completedCount > 0 else {
             logger.log("No changes completed, uploading the remaining ones later")
-            return
+            throw SDSSyncError(title: "error.uploadIncomplete")
         }
         
         try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords)
@@ -108,8 +109,9 @@ extension SDSSynchronizer {
         }
     }
     
-    private func synchronizableUpdates(sharedDatabase: Bool, maximum: Int) -> [CKRecord] {
-        context.performAndWait {
+    /// Throws if a record can't be prepared. Downloading anyway could overwrite its changes before they are uploaded.
+    private func synchronizableUpdates(sharedDatabase: Bool, maximum: Int) throws -> [CKRecord] {
+        try context.performAndWait {
             discardUpdatesOfRemovedRecords()
             
             // Referenced records are uploaded in earlier operations than the records referencing them,
@@ -119,7 +121,7 @@ extension SDSSynchronizer {
             }).sorted(by: { lhs, rhs in
                 referenceDepth(of: lhs) < referenceDepth(of: rhs)
             }).prefix(maximum)
-            let records = updates.compactMap(record(for:))
+            let records = try updates.compactMap(record(for:))
             
             return records
         }
@@ -149,7 +151,7 @@ extension SDSSynchronizer {
         }
     }
     
-    private func record(for update: CloudKitUpdate) -> CKRecord? {
+    private func record(for update: CloudKitUpdate) throws -> CKRecord? {
         let id = update.id
         let recordId = update.recordId
         let record = CKRecord(recordType: update.recordType, recordID: recordId)
@@ -208,7 +210,7 @@ extension SDSSynchronizer {
         } catch {
             // The update is kept, so the record is uploaded with a later synchronization
             logger.error("[Upload] Failed to prepare the record for `\(id)`: \(error.localizedDescription)")
-            return nil
+            throw error
         }
         
         if !shouldContinue {
@@ -232,7 +234,7 @@ extension SDSSynchronizer {
         }
     }
     
-    /// Removes the updates and removals that were uploaded, and returns how many.
+    /// Removes the updates and removals that were uploaded. Returns how many were completed, or changed again since and are uploaded next.
     private func deleteObjects(for updates: [CKRecord], deletes: [CKRecord.ID], startDate: Date) -> Int {
         guard let observedUpdateContext else {
             assertionFailure()
@@ -275,6 +277,8 @@ extension SDSSynchronizer {
                     
                     if let lastChange, lastChange > startDate {
                         isDone = false
+                        // The newer changes are uploaded next, which is progress too
+                        completedCount += 1
                         logger.log("Scheduling another upload as for `\(record.recordType)` has changed")
                         return
                     }
