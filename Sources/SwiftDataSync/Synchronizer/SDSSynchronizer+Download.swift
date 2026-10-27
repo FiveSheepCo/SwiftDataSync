@@ -188,6 +188,10 @@ private final class CKDownloadHandler {
     weak var synchronizer: SDSSynchronizer!
     weak var context: NSManagedObjectContext!
     private var tokensToUpdate: [CKRecordZone.ID?: CKServerChangeToken] = [:]
+    /// Records this download deletes. Their metadata is only removed once the download is saved, as discarding it restores their objects.
+    private var deletedRecordIds: Set<String> = []
+    /// Keeps a record from being stored incompletely. The download is discarded, so the record is downloaded again.
+    private var applyError: (any Error)?
     let isForSharedDatabase: Bool
     let completionHandler: (Error?) -> Void
     
@@ -226,8 +230,14 @@ private final class CKDownloadHandler {
             return
         }
 
+        // A newer version of the app can add models, which can't be stored by this one
+        guard let entity = context.persistentStoreCoordinator?.managedObjectModel.entitiesByName[record.recordType] else {
+            synchronizer.logger.error("Skipping record of unknown type `\(record.recordType, privacy: .public)`")
+            return
+        }
+        
         // Make sure dependent objects exist, and prefill all values if they do
-        guard let kVPs = self.valuesIfAllReferencesExist(for: record) else {
+        guard let kVPs = self.valuesIfAllReferencesExist(for: record, entity: entity) else {
             self.recordsToAddLater.append(record)
             return
         }
@@ -268,8 +278,9 @@ private final class CKDownloadHandler {
                     do {
                         data = try asset.fileURL.map { try Data(contentsOf: $0) }
                     } catch {
-                        // The current value is kept rather than removed
+                        // Storing the record without it would lose the value, or fail the save of a new object
                         synchronizer.logger.error("Failed reading asset for key `\(object.entity.name ?? "")`.`\(key)`: \(error.localizedDescription)")
+                        applyError = error
                         continue
                     }
                     object.setValue(data, forKey: key)
@@ -323,10 +334,16 @@ private final class CKDownloadHandler {
         return rawKey
     }
 
-    private func valuesIfAllReferencesExist(for record: CKRecord) -> [String: Any?]? {
+    private func valuesIfAllReferencesExist(for record: CKRecord, entity: NSEntityDescription) -> [String: Any?]? {
         var values = [String: Any?]()
         
-        for key in record.allKeys() where key != SDSSynchronizer.Constants.parentWorkaroundKey {
+        // Keys added by a newer version of the app aren't stored by this one. Their references might never be found,
+        // which would keep the record from being stored.
+        let isKnownKey = { (key: String) in
+            entity.propertiesByName[key] != nil || entity.properties.contains { $0.renamingIdentifier == key }
+        }
+        
+        for key in record.allKeys() where key != SDSSynchronizer.Constants.parentWorkaroundKey && isKnownKey(key) {
             let value = record[key]
             
             if let reference = value as? CKRecord.Reference {
@@ -389,15 +406,11 @@ private final class CKDownloadHandler {
         
         // Pending changes of a record that was deleted elsewhere can never be uploaded. Without its object,
         // an update couldn't be built, and a removal would delete a record that is gone.
-        let syncContext = synchronizer.context
-        syncContext.performAndWait {
-            for entityName in ["CloudKitUpdate", "CloudKitRemoval"] {
-                syncContext.metadataEntries(of: entityName, withIds: [recordID.recordName]).forEach(syncContext.delete)
-            }
-        }
+        // They are removed with the object's metadata once the download is saved.
+        deletedRecordIds.insert(recordID.recordName)
         
         if let object = findObject(for: recordID) {
-            object.delete()
+            context.delete(object.object)
         }
     }
     
@@ -518,6 +531,24 @@ private final class CKDownloadHandler {
             return
         }
         
+        if let applyError {
+            synchronizer.logger.log("Failed to apply downloaded records, discarding download: \(applyError.localizedDescription)")
+            discardDownload(observedContext: observedContext)
+            completionHandler(applyError)
+            return
+        }
+        
+        // Inserted objects get their permanent IDs before they are saved, so their placeholders know them once other contexts
+        // can change the objects. Otherwise a change could find no record id for an object, and give it a second one.
+        observedContext.performAndWait {
+            try? observedContext.obtainPermanentIDs(for: Array(observedContext.insertedObjects))
+        }
+        syncContext.performAndWait {
+            for (object, container) in synchronizer.temporaryObjectContainers where !object.objectID.isTemporaryID {
+                container.localId = object.objectID.uriRepresentation().absoluteString
+            }
+        }
+        
         let saveError: (any Error)? = observedContext.performAndWait {
             do {
                 try synchronizer.saveObservedUpdateContext(observedContext)
@@ -548,6 +579,8 @@ private final class CKDownloadHandler {
         
         let tokensToUpdate = self.tokensToUpdate
         self.tokensToUpdate = [:]
+        let deletedRecordIds = Array(self.deletedRecordIds)
+        self.deletedRecordIds = []
         
         do {
             try syncContext.performAndWaitUnchecked {
@@ -561,6 +594,10 @@ private final class CKDownloadHandler {
                     }
                 }
                 synchronizer.temporaryObjectContainers = [:]
+                
+                for entityName in ["CloudKitUpdate", "CloudKitRemoval", "CloudKitLocalEntity"] {
+                    syncContext.metadataEntries(of: entityName, withIds: deletedRecordIds).forEach(syncContext.delete)
+                }
                 
                 for (zoneID, changeToken) in tokensToUpdate {
                     if let zoneID {
@@ -603,6 +640,8 @@ private final class CKDownloadHandler {
             synchronizer.temporaryObjectContainers = [:]
         }
         tokensToUpdate = [:]
+        deletedRecordIds = []
+        applyError = nil
         objectsToEnsureParentReferencesFor = []
         recordsToAddLater = []
     }
@@ -659,8 +698,9 @@ private final class CKDownloadHandler {
         let db = isForSharedDatabase ? synchronizer.cloudSharedDatabase : synchronizer.cloudPrivateDatabase
         db?.add(CKModifyRecordsOperation(recordIDsToDelete: [container.recordId]))
         
-        // Delete object and reference
-        container.delete()
+        // Delete object, and its metadata once the download is saved
+        context.delete(object)
+        deletedRecordIds.insert(container.id)
         
         synchronizer.logger.log("tryFixingObservedContext: Fixed object by deleting: \(object.entity.name ?? "Unknown")")
         

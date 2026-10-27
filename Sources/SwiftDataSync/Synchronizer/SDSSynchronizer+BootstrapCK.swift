@@ -75,25 +75,12 @@ extension SDSSynchronizer {
         await viewModel.set(state: state)
     }
     
-    func checkErrorWaitTimeIsCompleted() async throws {
-        guard
-            case .error(let error) = await viewModel.state,
-            let ckError = error as? CKError,
-            let retrySeconds = ckError.retryAfterSeconds,
-            await -viewModel.lastStateChange.timeIntervalSinceNow < retrySeconds
-        else { return }
-        
-        throw error
-    }
-    
     func synchronize() async {
         // E.g. after a failed adoption, the error state would allow a forced or push-triggered synchronization,
         // whose download would add the existing records as duplicates
         guard isObservingStore else { return }
         
         do {
-            try await checkErrorWaitTimeIsCompleted()
-            
             guard await viewModel.attemptSyncStart() else { return }
             
             guard syncLease.acquire() else { throw SDSSyncLease.UnavailableError() }

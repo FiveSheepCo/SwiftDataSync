@@ -4,6 +4,7 @@ import CloudKit
 
 /// A change of a synchronizable object. It's read on the queue of the object's context, so it can be handled anywhere.
 struct SDSObjectChange: Sendable {
+    let objectId: NSManagedObjectID
     let id: String
     let zoneId: CKRecordZone.ID?
     let entityName: String
@@ -44,12 +45,27 @@ extension SDSSynchronizer {
             .filter { !wasDeletedBySynchronizer($0.objectID) }
             .compactMap(onlyIfSyncronizable)
         
-        handleChangedObjects(updatedObjects)
+        let changes = changes(of: updatedObjects, inserted: false)
+        setUpdates(for: changes)
+        rememberUnsavedChanges(changes)
         handleDeletedObjects(deletedObjects)
     }
     
     @objc func contextSaved(_ notification:Notification) {
-        guard let userInfo = userInfo(from: notification) else { return }
+        guard
+            let userInfo = userInfo(from: notification),
+            // A child context only saves to its parent, whose save is handled. Its inserted objects don't have permanent IDs yet.
+            (notification.object as? NSManagedObjectContext)?.parent == nil
+        else { return }
+        
+        // Changes are stored when they are made, but uploads read the values from the store. Ones that were uploaded or
+        // started uploading before they were saved are stored again, so their saved values are uploaded too.
+        let updatedObjects = (userInfo[NSUpdatedObjectsKey] as? NSSet ?? []).compactMap { $0 as? NSManagedObject }
+        let savedChanges = takeUnsavedChanges(of: updatedObjects.map(\.objectID))
+        setUpdates(for: updatedObjects.compactMap { object in
+            guard let keys = savedChanges[object.objectID], let container = object.synchronizableContainer else { return nil }
+            return SDSObjectChange(objectId: object.objectID, id: container.id, zoneId: container.sharedZoneId, entityName: object.entity.name!, changedKeys: Array(keys))
+        })
         
         let insertedObjects = (userInfo[NSInsertedObjectsKey] as? NSSet ?? []).compactMap(onlyIfSyncronizable)
         
@@ -93,10 +109,6 @@ extension SDSSynchronizer {
         }
     }
     
-    func handleChangedObjects(_ objects: [SDSSynchronizableContainer]) {
-        setUpdates(for: changes(of: objects, inserted: false))
-    }
-    
     /// Has to be called on the queue of the objects' context.
     func changes(of objects: [SDSSynchronizableContainer], inserted: Bool) -> [SDSObjectChange] {
         objects.compactMap { updated in
@@ -124,7 +136,7 @@ extension SDSSynchronizer {
             
             let entityName = updated.object.entity.name!
             
-            return SDSObjectChange(id: updated.id, zoneId: updated.sharedZoneId, entityName: entityName, changedKeys: keysToSync)
+            return SDSObjectChange(objectId: updated.object.objectID, id: updated.id, zoneId: updated.sharedZoneId, entityName: entityName, changedKeys: keysToSync)
         }
     }
     
@@ -138,6 +150,8 @@ extension SDSSynchronizer {
         for delete in objects {
             // Delete the share if neccesary
             let id = delete.id
+            // Read before the share is deleted, which would send the removal to the private database
+            let zoneId = delete.sharedZoneId
             if delete is SDSSharableContainer {
                 let context = self.context
                 context.perform {
@@ -145,7 +159,7 @@ extension SDSSynchronizer {
                 }
             }
             
-            setRemoval(id: id, zoneId: delete.sharedZoneId)
+            setRemoval(id: id, zoneId: zoneId)
         }
     }
 }

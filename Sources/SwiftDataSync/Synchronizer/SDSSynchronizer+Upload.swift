@@ -34,8 +34,9 @@ extension SDSSynchronizer {
         
         let database = (sharedDatabase ? cloudSharedDatabase : cloudPrivateDatabase)!
         
+        let completedCount: Int
         do {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            completedCount = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int, Error>) in
                 
                 let operation = CKModifyRecordsOperation(recordsToSave: records, recordIDsToDelete: deletes)
                 operation.savePolicy = .changedKeys
@@ -59,18 +60,18 @@ extension SDSSynchronizer {
                 operation.modifyRecordsResultBlock = { operationResult in
                     switch operationResult {
                         case .success:
-                            self.deleteObjects(for: doneRecords, deletes: doneDeletes, startDate: startDate)
+                            let completedCount = self.deleteObjects(for: doneRecords, deletes: doneDeletes, startDate: startDate)
                             
                             self.logger.log("Operation completed: \(doneRecords.count) \(doneDeletes.count)")
-                            continuation.resume()
+                            continuation.resume(returning: completedCount)
                         case .failure(let error):
                             // Deleting a record that is already gone fails the whole atomic operation, so those removals
                             // are discarded and the rest is uploaded again. Changes that did succeed in a non-atomic operation are kept.
                             let alreadyDeleted = self.alreadyDeletedRecordIDs(in: error, deletes: deletes)
                             if !alreadyDeleted.isEmpty {
                                 self.logger.log("Discarding removals of \(alreadyDeleted.count) records that are already deleted")
-                                self.deleteObjects(for: doneRecords, deletes: Array(Set(doneDeletes + alreadyDeleted)), startDate: startDate)
-                                continuation.resume()
+                                let completedCount = self.deleteObjects(for: doneRecords, deletes: Array(Set(doneDeletes + alreadyDeleted)), startDate: startDate)
+                                continuation.resume(returning: completedCount)
                                 return
                             }
                             
@@ -86,6 +87,12 @@ extension SDSSynchronizer {
             // Operations are also limited in size, which cannot easily be determined beforehand
             logger.log("Operation too large, retrying with at most \(maximumRecords / 2) records")
             try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords / 2)
+            return
+        }
+        
+        // E.g. records that keep failing, or keep differing from what was uploaded. They are uploaded with a later synchronization.
+        guard completedCount > 0 else {
+            logger.log("No changes completed, uploading the remaining ones later")
             return
         }
         
@@ -162,21 +169,25 @@ extension SDSSynchronizer {
         do {
             shouldContinue = try observedUpdateContext.performAndWaitUnchecked {
                 // The object can be deleted before its removal is stored, e.g. while this runs, or by a batch delete.
-                // Its values would be read as `nil` and overwrite the record's values.
-                guard (try? observedUpdateContext.existingObject(with: container.object.objectID)) != nil else {
+                // Its values would be read as `nil` and overwrite the record's values. Other errors keep the update.
+                do {
+                    _ = try observedUpdateContext.existingObject(with: container.object.objectID)
+                } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSManagedObjectReferentialIntegrityError {
                     logger.error("[Upload] Discarding update for `\(id)` as its object is deleted")
                     return false
                 }
                 
                 // Synchronize parent, but only if parent is changed
-                if let parentKey = container.parentKey,
-                   changedKeys.contains(parentKey),
-                   let parent = container.parent,
-                   let parentRecordId = parent.synchronizableContainer?.recordId
-                {
-                    record.setParent(parentRecordId)
-                    // This workaround is needed so that deletion of records with a parent works
-                    record[Constants.parentWorkaroundKey] = CKRecord.Reference(recordID: parentRecordId, action: .deleteSelf)
+                if let parentKey = container.parentKey, changedKeys.contains(parentKey) {
+                    if let parent = container.parent, let parentRecordId = parent.synchronizableContainer?.recordId {
+                        record.setParent(parentRecordId)
+                        // This workaround is needed so that deletion of records with a parent works
+                        record[Constants.parentWorkaroundKey] = CKRecord.Reference(recordID: parentRecordId, action: .deleteSelf)
+                    } else if container.parent == nil {
+                        // The server would keep the previous parent, which differs from the expected one once uploaded
+                        record.setParent(nil as CKRecord.ID?)
+                        record[Constants.parentWorkaroundKey] = nil
+                    }
                 }
                 
                 // Only sync keys that are actually in the syncKeys array
@@ -221,14 +232,17 @@ extension SDSSynchronizer {
         }
     }
     
-    private func deleteObjects(for updates: [CKRecord], deletes: [CKRecord.ID], startDate: Date) {
+    /// Removes the updates and removals that were uploaded, and returns how many.
+    private func deleteObjects(for updates: [CKRecord], deletes: [CKRecord.ID], startDate: Date) -> Int {
         guard let observedUpdateContext else {
             assertionFailure()
-            return
+            return 0
         }
         
         let context = self.context
-        context.performAndWait {
+        return context.performAndWait {
+            var completedCount = 0
+            
             for record in updates {
                 let update = CloudKitUpdate.retrieve(for: record.recordID.recordName, entityName: record.recordType, context: context)
                 let id = update.id
@@ -240,6 +254,7 @@ extension SDSSynchronizer {
                 guard let container = find(for: id) else {
                     // There is nothing left to upload
                     update.delete()
+                    completedCount += 1
                     continue
                 }
                 let lastChange = container.lastObjectChange
@@ -268,12 +283,15 @@ extension SDSSynchronizer {
                 if isDone {
                     logger.log("Update for `\(update.id)` deleted")
                     update.delete()
+                    completedCount += 1
                 }
             }
             
             for delete in deletes {
                 CloudKitRemoval.retrieve(for: delete.recordName, context: context).delete()
+                completedCount += 1
             }
+            return completedCount
         }
     }
 }
