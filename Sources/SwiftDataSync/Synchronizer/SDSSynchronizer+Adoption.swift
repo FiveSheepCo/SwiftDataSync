@@ -129,10 +129,10 @@ extension SDSSynchronizer {
         
         // Pending changes are only added once every record is known, as uploading them needs their objects.
         for (record, implementation) in mappings where !record.pendingKeys.isEmpty {
-            setUpdate(idBlock: { record.recordName }, zoneId: record.sharedZoneID, entityName: implementation.entityName, changedKeys: record.pendingKeys)
+            setUpdate(id: record.recordName, zoneId: record.sharedZoneID, entityName: implementation.entityName, changedKeys: record.pendingKeys)
         }
         for removal in adoption.removals {
-            setRemoval(idBlock: { removal.recordName }, zoneId: removal.sharedZoneID)
+            setRemoval(id: removal.recordName, zoneId: removal.sharedZoneID)
         }
         
         try context.performAndWait {

@@ -2,6 +2,7 @@ import Foundation
 import CoreData
 
 extension SDSSynchronizer {
+    /// Has to be called on `context`'s queue.
     func existingLocalEntity(for id: String) -> CloudKitLocalEntity? {
         let request = CloudKitLocalEntity.fetchRequest()
         
@@ -45,14 +46,15 @@ extension SDSSynchronizer {
     func find(for id: String) -> SDSSynchronizableContainer? {
         guard let observedUpdateContext, let observedStore else { return nil }
         
-        let result = context.performAndWait {
-            existingLocalEntity(for: id)
+        // The local entity and temporary objects are read on `context`'s queue, the object on `observedUpdateContext`'s
+        let result = context.performAndWaitUnchecked {
+            existingLocalEntity(for: id).map { (localId: $0.localId, temporaryObject: temporaryObject(for: id)) }
         }
         
-        return observedUpdateContext.performAndWait { () -> SDSSynchronizableContainer? in
+        return observedUpdateContext.performAndWaitUnchecked { () -> SDSSynchronizableContainer? in
             guard
-                let localEntity: CloudKitLocalEntity = result,
-                let localObject = temporaryObject(for: id) ?? observedStore.managedObjectID(forURIRepresentation: URL(string: localEntity.localId)!).map(observedUpdateContext.object(with:))
+                let result,
+                let localObject = result.temporaryObject ?? observedStore.managedObjectID(forURIRepresentation: URL(string: result.localId)!).map(observedUpdateContext.object(with:))
             else { return nil }
             
             return container(id: { id }, object: localObject)
@@ -72,7 +74,7 @@ extension SDSSynchronizer {
             let object = NSEntityDescription.insertNewObject(forEntityName: entityName, into: context)
             preliminaryUpdateHandler(container(id: { id }, object: object))
             
-            self.context.performAndWait {
+            self.context.performAndWaitUnchecked {
                 let new = CloudKitLocalEntity(
                     id: id,
                     localId: "",
@@ -89,7 +91,7 @@ extension SDSSynchronizer {
         let objectId = object.objectID.isTemporaryID ? nil : object.objectID.uriRepresentation().absoluteString
         let id: () -> String = {
             let context = self.context
-            return context.performAndWait {
+            return context.performAndWaitUnchecked {
                 if let objectId {
                     let id = (
                         CloudKitLocalEntity.entry(forLocalId: objectId, in: context) ??

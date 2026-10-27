@@ -2,7 +2,7 @@ import SwiftUI
 
 public struct NoticeView: View {
     
-    public enum Kind {
+    public enum Kind: Sendable {
         case problem
         case warning
         

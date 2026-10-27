@@ -8,7 +8,10 @@ extension SDSSynchronizer {
         try await _upload(sharedDatabase: false)
         try await _upload(sharedDatabase: true)
         
-        try self.context.save()
+        let context = self.context
+        try context.performAndWait {
+            try context.save()
+        }
     }
     
     private func _upload(sharedDatabase: Bool, maximumRecords: Int = CKModifyRecordsOperation.maximumRecords) async throws {
@@ -151,7 +154,7 @@ extension SDSSynchronizer {
             fatalError("This should never happen, it cannot be that the object doesn't exist, unless the background context is out of sync with the viewContext.")
         }
         
-        let shouldContinue = self.observedUpdateContext!.performAndWait {
+        let shouldContinue = self.observedUpdateContext!.performAndWaitUnchecked {
             
             // Synchronize parent, but only if parent is changed
             if let parentKey = container.parentKey,
@@ -222,7 +225,7 @@ extension SDSSynchronizer {
                 }
                 let lastChange = container.lastObjectChange
                 
-                observedUpdateContext.performAndWait {
+                observedUpdateContext.performAndWaitUnchecked {
                     // Check parent, but only if parent is changed
                     var expectedParentId: String? = nil
                     if let parentKey = container.parentKey,

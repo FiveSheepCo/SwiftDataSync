@@ -3,6 +3,7 @@ import CoreData
 import CloudKit
 import OSLog
 
+@MainActor
 private var minRoutineDownloadDeltaInterval: TimeInterval {
     return generalLoadMultiplier * 60
 }
@@ -154,15 +155,11 @@ extension SDSSynchronizer {
     }
     
     private func retryAfterSyncLease() {
-        Task { @MainActor in
-            guard self.syncLeaseRetry == nil else { return }
+        startTask(at: \.syncLeaseRetry) {
+            try? await Task.sleep(for: .seconds(SDSSyncLease.duration / 3))
             
-            self.syncLeaseRetry = Task {
-                try? await Task.sleep(for: .seconds(SDSSyncLease.duration / 3))
-                
-                self.syncLeaseRetry = nil
-                self.startSync()
-            }
+            self.finishTask(at: \.syncLeaseRetry)
+            self.startSync()
         }
     }
     
@@ -176,11 +173,11 @@ extension SDSSynchronizer {
     }
     
     private func setRoutineTimer() async {
-        guard routineSyncTimer == nil, case .error = await viewModel.state else { return }
+        guard case .error = await viewModel.state else { return }
         
-        Task { @MainActor in
+        startTask(at: \.routineSync) { @MainActor in
             let minInterval: TimeInterval
-            if case .error(let error) = viewModel.state, let retryAfterSeconds = (error as? CKError)?.retryAfterSeconds {
+            if case .error(let error) = self.viewModel.state, let retryAfterSeconds = (error as? CKError)?.retryAfterSeconds {
                 minInterval = retryAfterSeconds * 1.5
             } else {
                 minInterval = minRoutineDownloadDeltaInterval
@@ -188,7 +185,7 @@ extension SDSSynchronizer {
             
             try? await Task.sleep(for: .milliseconds(minInterval * 1000))
             
-            self.routineSyncTimer = nil
+            self.finishTask(at: \.routineSync)
             self.startSync()
         }
     }

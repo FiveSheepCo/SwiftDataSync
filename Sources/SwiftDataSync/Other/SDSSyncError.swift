@@ -1,7 +1,7 @@
 import Foundation
 import SwiftUI
 
-public struct SDSSyncError: Error {
+public struct SDSSyncError: Error, Sendable {
     public let title: String
     public let message: String?
     

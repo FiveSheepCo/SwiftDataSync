@@ -1,19 +1,15 @@
 import CoreData
 
 extension NSManagedObjectContext {
-    func performAndWaitThrowing<T>(block: () throws -> T) throws -> T {
-        let result: Result<T, Error> = self.performAndWait({
-            do {
-                return .success(try block())
-            }
-            catch {
-                return .failure(error)
-            }
-        })
-        
-        switch result {
-            case .success(let value): return value
-            case .failure(let error): throw error
+
+    /// `performAndWait` for blocks that use managed objects or other values that aren't `Sendable`.
+    ///
+    /// The block runs before this returns, so nothing it captures is used concurrently by the caller.
+    /// Core Data's rule still applies: managed objects may only be used on the queue of the context they belong to.
+    func performAndWaitUnchecked<T>(_ block: () throws -> T) rethrows -> T {
+        try withoutActuallyEscaping(block) { block in
+            nonisolated(unsafe) let block = block
+            return try performAndWait { try block() }
         }
     }
 }

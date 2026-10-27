@@ -27,10 +27,13 @@ extension SDSSynchronizer {
         let ids = try await cloudSharedDatabase.allRecordZones().map(\.zoneID).filter({ $0.zoneName == defaultZoneID.zoneName })
         
         // Zones of just accepted shares are kept even if the shared database doesn't list them yet
-        acceptedShareZones = acceptedShareZones.filter { zoneId, acceptanceDate in
-            !ids.contains(zoneId) && -acceptanceDate.timeIntervalSinceNow < acceptedShareZoneListingDelay
+        let acceptedZoneIds = withAcceptedShareZones { acceptedShareZones in
+            acceptedShareZones = acceptedShareZones.filter { zoneId, acceptanceDate in
+                !ids.contains(zoneId) && -acceptanceDate.timeIntervalSinceNow < acceptedShareZoneListingDelay
+            }
+            return Set(acceptedShareZones.keys)
         }
-        let existingZoneIds = Set(ids).union(acceptedShareZones.keys)
+        let existingZoneIds = Set(ids).union(acceptedZoneIds)
         
         let context = self.context
         let rootIdsInRemovedZones = try context.performAndWait {
@@ -121,11 +124,11 @@ extension SDSSynchronizer {
         var configurations: [CKRecordZone.ID : CKFetchRecordZoneChangesOperation.ZoneConfiguration] = [:]
         
         if sharedDatabase {
-            context.performAndWait {
+            configurations = context.performAndWaitUnchecked {
                 let zones = CloudKitZone.getAll()
-                for savedZone in zones {
-                    configurations[savedZone.calculatedId] = CKFetchRecordZoneChangesOperation.ZoneConfiguration(previousServerChangeToken: savedZone.changeToken)
-                }
+                return Dictionary(zones.map { savedZone in
+                    (savedZone.calculatedId, CKFetchRecordZoneChangesOperation.ZoneConfiguration(previousServerChangeToken: savedZone.changeToken))
+                }, uniquingKeysWith: { $1 })
             }
             
             if configurations.isEmpty {
@@ -204,7 +207,7 @@ private final class CKDownloadHandler {
         } // TODO(later): Should an error be handled here? What kind of error is this? A server error that this one specific record failed to be resolved? Very strange Apple API
         
         synchronizer.logger.log("[Download] Changed: \(record)")
-        context.performAndWait {
+        context.performAndWaitUnchecked {
             self._changed(record: record)
         }
     }
@@ -359,7 +362,7 @@ private final class CKDownloadHandler {
     }
     
     func deleted(recordID: CKRecord.ID, recordType:String) {
-        context.performAndWait {
+        context.performAndWaitUnchecked {
             self._deleted(recordID: recordID, recordType: recordType)
         }
     }
@@ -396,7 +399,7 @@ private final class CKDownloadHandler {
         changeToken: CKServerChangeToken?,
         userToken: Data?
     ) {
-        context.performAndWait {
+        context.performAndWaitUnchecked {
             self._tokensUpdate(for: zoneID, changeToken: changeToken, userToken: userToken)
         }
     }
@@ -474,19 +477,22 @@ private final class CKDownloadHandler {
         case .success((let changeToken, let userToken, _)):
             synchronizer.logger.log("Zone \(zoneID.zoneName) fetch completed successfully")
             
-            context.performAndWait {
+            context.performAndWaitUnchecked {
                 self._tokensUpdate(for: zoneID, changeToken: changeToken, userToken: userToken, finalCompletion: true)
             }
         case .failure(let error):
             synchronizer.logger.log("Zone \(zoneID.zoneName) fetch error: \(error)")
             
-            context.performAndWait {
+            context.performAndWaitUnchecked {
                 self._tokensUpdate(for: zoneID, changeToken: nil, userToken: nil, finalCompletion: true, fetchFailed: true)
             }
         }
     }
     
     func fetchOverallCompletion(result: Result<Void, Error>) {
+        let synchronizer = self.synchronizer!
+        let syncContext = synchronizer.context
+        
         synchronizer.logger.log("Fetch Overall Completion")
         
         guard let observedContext = synchronizer.observedUpdateContext else {
@@ -503,49 +509,65 @@ private final class CKDownloadHandler {
             observedContext.performAndWait {
                 observedContext.rollback()
             }
-            synchronizer.context.performAndWait {
+            syncContext.performAndWait {
                 for container in synchronizer.temporaryObjectContainers.values {
                     container.delete()
                 }
+                synchronizer.temporaryObjectContainers = [:]
             }
-            synchronizer.temporaryObjectContainers = [:]
             tokensToUpdate = [:]
             
             completionHandler(SDSSyncLease.UnavailableError())
             return
         }
         
-        do { try observedContext.save() }
-        catch {
-            synchronizer.logger.log("Observed Context save error: \(error)")
+        let saveError: (any Error)? = observedContext.performAndWait {
+            do {
+                try observedContext.save()
+                return nil
+            } catch {
+                return error
+            }
+        }
+        if let saveError {
+            synchronizer.logger.log("Observed Context save error: \(saveError)")
             
-            if tryFixingObservedContext(error: error) {
+            let isFixed = observedContext.performAndWaitUnchecked {
+                tryFixingObservedContext(error: saveError)
+            }
+            if isFixed {
                 synchronizer.logger.log("Succeeded trying to fix save errors. Trying to save again.")
                 fetchOverallCompletion(result: result)
             } else {
                 synchronizer.logger.log("Failed fixing the save errors")
-                completionHandler(error)
+                completionHandler(saveError)
             }
             
             return
         }
         
-        for (object, container) in synchronizer.temporaryObjectContainers {
-            container.localId = object.objectID.uriRepresentation().absoluteString
-        }
-        synchronizer.temporaryObjectContainers = [:]
+        let tokensToUpdate = self.tokensToUpdate
+        self.tokensToUpdate = [:]
         
-        for (zoneID, changeToken) in tokensToUpdate {
-            if let zoneID {
-                CloudKitZone.getZone(with: zoneID, context: synchronizer.context).changeToken = changeToken
-            } else {
-                synchronizer.setState(\.changeToken, value: changeToken)
+        do {
+            try syncContext.performAndWaitUnchecked {
+                // The objects have permanent IDs once they are saved
+                for (object, container) in synchronizer.temporaryObjectContainers {
+                    container.localId = object.objectID.uriRepresentation().absoluteString
+                }
+                synchronizer.temporaryObjectContainers = [:]
+                
+                for (zoneID, changeToken) in tokensToUpdate {
+                    if let zoneID {
+                        CloudKitZone.getZone(with: zoneID, context: syncContext).changeToken = changeToken
+                    } else {
+                        synchronizer.setState(\.changeToken, value: changeToken)
+                    }
+                }
+                
+                try syncContext.save()
             }
-        }
-        tokensToUpdate = [:]
-        
-        do { try synchronizer.context.save() }
-        catch {
+        } catch {
             synchronizer.logger.log("Sync Context save error: \(error)")
             completionHandler(error)
             return
@@ -562,6 +584,7 @@ private final class CKDownloadHandler {
     }
     
     /// Tries fixing the given error and returns whether the context should try to save again or a fix was not possible.
+    /// Has to be called on `context`'s queue.
     private func tryFixingObservedContext(error: any Error) -> Bool {
         synchronizer.logger.log("tryFixingObservedContext starting: \(error.localizedDescription, privacy: .public)")
         let nsError = error as NSError

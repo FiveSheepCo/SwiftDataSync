@@ -3,6 +3,7 @@ import SwiftData
 import CoreData
 import CloudKit
 import OSLog
+import os
 import Network
 
 private let notificationCenter = NotificationCenter.default
@@ -19,9 +20,15 @@ private extension NSManagedObjectContext {
     }
 }
 
-public final class SDSSynchronizer {
+public final class SDSSynchronizer: Sendable {
     public static let shared = SDSSynchronizer()
-    public static var appGroupToStoreSyncData: String?
+    
+    /// The app group to store the synchronization data in, e.g. to share it with extensions. Has to be set before `shared` is used.
+    public static var appGroupToStoreSyncData: String? {
+        get { appGroupLock.withLock { $0 } }
+        set { appGroupLock.withLock { $0 = newValue } }
+    }
+    private static let appGroupLock = OSAllocatedUnfairLock<String?>(initialState: nil)
     
     enum Constants {
         static let subscriptionName = "DatabaseSubscription"
@@ -31,50 +38,91 @@ public final class SDSSynchronizer {
     
     let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "SDSSynchronizer")
     
-    @MainActor
-    let viewModel = SDSSynchronizationViewModel.shared
+    let viewModel: SDSSynchronizationViewModel
     
     // MARK: - Properties
     
     let container: NSPersistentContainer
     let context: NSManagedObjectContext
     
-    var observedStore: NSPersistentStoreCoordinator?
-    var observedUpdateContext: NSManagedObjectContext?
-    var configuration: SDSInternalConfiguration?
-    /// Whether local changes of the observed store are tracked, which isn't the case if setting up failed.
-    private(set) var isObservingStore = false
+    /// State that is set during setup or changes while synchronizing.
+    /// It's used from CloudKit's callbacks, Core Data's queues and tasks, so it's guarded by a lock.
+    struct MutableState: Sendable {
+        var observedStore: NSPersistentStoreCoordinator?
+        var observedUpdateContext: NSManagedObjectContext?
+        var configuration: SDSInternalConfiguration?
+        /// Whether local changes of the observed store are tracked, which isn't the case if setting up failed.
+        var isObservingStore = false
+        
+        var defaultZoneID: CKRecordZone.ID?
+        var cloudContainer: CKContainer?
+        var cloudPrivateDatabase: CKDatabase?
+        var cloudSharedDatabase: CKDatabase?
+        
+        var lastCompletedUpload: Date?
+        var lastCompletedDownload: Date?
+        
+        /// Zones of recently accepted shares with the date they were accepted, as the shared database might not list them right away.
+        var acceptedShareZones: [CKRecordZone.ID: Date] = [:]
+        
+        var routineSync: Task<Void, Never>?
+        var syncLeaseRetry: Task<Void, Never>?
+    }
+    private let mutableState = OSAllocatedUnfairLock(initialState: MutableState())
     
-    var defaultZoneID: CKRecordZone.ID!
-    var cloudContainer: CKContainer!
-    var cloudPrivateDatabase: CKDatabase!
-    var cloudSharedDatabase: CKDatabase!
+    var observedStore: NSPersistentStoreCoordinator? { mutableState.withLock { $0.observedStore } }
+    var observedUpdateContext: NSManagedObjectContext? { mutableState.withLock { $0.observedUpdateContext } }
+    var configuration: SDSInternalConfiguration? { mutableState.withLock { $0.configuration } }
+    var isObservingStore: Bool { mutableState.withLock { $0.isObservingStore } }
+    
+    var defaultZoneID: CKRecordZone.ID! { mutableState.withLock { $0.defaultZoneID } }
+    var cloudContainer: CKContainer! { mutableState.withLock { $0.cloudContainer } }
+    var cloudPrivateDatabase: CKDatabase! { mutableState.withLock { $0.cloudPrivateDatabase } }
+    var cloudSharedDatabase: CKDatabase! { mutableState.withLock { $0.cloudSharedDatabase } }
     
     // MARK: States
     
     var lastCompletedUpload: Date? {
-        didSet { lastCompletedUpload.map({ viewModel.set(lastCompletionDate: $0) }) }
+        get { mutableState.withLock { $0.lastCompletedUpload } }
+        set {
+            mutableState.withLock { $0.lastCompletedUpload = newValue }
+            newValue.map({ viewModel.set(lastCompletionDate: $0) })
+        }
     }
     var lastCompletedDownload: Date? {
-        didSet { lastCompletedDownload.map({ viewModel.set(lastCompletionDate: $0) }) }
+        get { mutableState.withLock { $0.lastCompletedDownload } }
+        set {
+            mutableState.withLock { $0.lastCompletedDownload = newValue }
+            newValue.map({ viewModel.set(lastCompletionDate: $0) })
+        }
     }
-    
-    var latestError: Error?
-    
-    var routineSyncTimer: Timer?
     
     /// Makes sure only one process using the same synchronization data synchronizes at a time.
     let syncLease: SDSSyncLease
-    var syncLeaseRetry: Task<Void, Never>?
     
-    /// Zones of recently accepted shares with the date they were accepted, as the shared database might not list them right away.
-    var acceptedShareZones: [CKRecordZone.ID: Date] = [:]
+    /// Starts `task` unless a task stored at `keyPath` is still pending. The task has to clear it with `finishTask(at:)`.
+    func startTask(at keyPath: WritableKeyPath<MutableState, Task<Void, Never>?> & Sendable, _ task: @escaping @Sendable () async -> Void) {
+        mutableState.withLock { state in
+            guard state[keyPath: keyPath] == nil else { return }
+            state[keyPath: keyPath] = Task(operation: task)
+        }
+    }
+    
+    func finishTask(at keyPath: WritableKeyPath<MutableState, Task<Void, Never>?> & Sendable) {
+        mutableState.withLock { $0[keyPath: keyPath] = nil }
+    }
+    
+    /// Reads and changes the zones of recently accepted shares at once, as accepting a share can happen while synchronizing.
+    func withAcceptedShareZones<T: Sendable>(_ body: @Sendable (inout [CKRecordZone.ID: Date]) -> T) -> T {
+        mutableState.withLock { body(&$0.acceptedShareZones) }
+    }
     
     let networkMonitor = NWPathMonitor()
     
-    /// The `CloudKitLocalEntity`s for temporary objects.
-    var temporaryObjectContainers: [NSManagedObject: CloudKitLocalEntity] = [:]
+    /// The `CloudKitLocalEntity`s for temporary objects. Only accessed on `context`'s queue, which serializes the access.
+    nonisolated(unsafe) var temporaryObjectContainers: [NSManagedObject: CloudKitLocalEntity] = [:]
     
+    /// Has to be called on `context`'s queue.
     func temporaryObject(for id: String) -> NSManagedObject? {
         temporaryObjectContainers.first { (key: NSManagedObject, value: CloudKitLocalEntity) in
             value.id == id
@@ -84,6 +132,8 @@ public final class SDSSynchronizer {
     // MARK: - Initializer
     
     private init() {
+        self.viewModel = SDSSynchronizationViewModel.shared
+        
         let model = NSManagedObjectModel.mergedModel(from: [.module])!
         for entity in model.entities {
             entity.managedObjectClassName = "SwiftDataSync.\(entity.name!)"
@@ -118,10 +168,13 @@ public final class SDSSynchronizer {
             url: container.persistentStoreDescriptions.first?.url?.deletingLastPathComponent().appendingPathComponent("CloudKitSync.lease")
         )
         
-        self.networkMonitor.pathUpdateHandler = networkPathWasUpdated
+        self.networkMonitor.pathUpdateHandler = { [weak self] path in
+            self?.networkPathWasUpdated(with: path)
+        }
         self.networkMonitor.start(queue: .main)
     }
     
+    @MainActor
     private var containerFinder: _ContainerFinder?
     
     /// Used to setup the synchronizer. Should be called as early as possible.
@@ -139,11 +192,7 @@ public final class SDSSynchronizer {
         defaultZoneID: String = "CoreData",
         adoption: (() throws -> SDSAdoption)? = nil
     ) {
-        self.defaultZoneID = CKRecordZone.ID(zoneName: defaultZoneID)
-        
-        self.cloudContainer = CKContainer(identifier: containerName)
-        self.cloudPrivateDatabase = cloudContainer.privateCloudDatabase
-        self.cloudSharedDatabase = cloudContainer.sharedCloudDatabase
+        setupCloudKit(containerName: containerName, defaultZoneID: defaultZoneID)
         
         Task {
             await viewModel.setWaitingForContainerDetection()
@@ -151,7 +200,7 @@ public final class SDSSynchronizer {
         self.setup(storeToObserve: coordinator, configuration: configuration, adoption: adoption)
     }
     
-    /// Used to setup the synchronizer. Should be called as early as possible.
+    /// Used to setup the synchronizer. Should be called as early as possible, on the main actor, like the `ModelContainer` is created.
     /// - Parameters:
     ///   - containerName: The name of the iCloud container to sync to.
     ///   - configuration: The configuration.
@@ -159,6 +208,7 @@ public final class SDSSynchronizer {
     ///   - adoption: Saves models that already have records in CloudKit, e.g. when migrating from another sync engine, and returns them.
     ///     It's called once the store was found, before observing it and synchronizing for the first time.
     ///     Synchronization doesn't start if it throws.
+    @MainActor
     public func setup(
         containerName: String,
         configuration: SDSConfiguration = .init(swiftDataEntities: []),
@@ -166,11 +216,7 @@ public final class SDSSynchronizer {
         defaultZoneID: String = "CoreData",
         adoption: (() throws -> SDSAdoption)? = nil
     ) {
-        self.defaultZoneID = CKRecordZone.ID(zoneName: defaultZoneID)
-        
-        self.cloudContainer = CKContainer(identifier: containerName)
-        self.cloudPrivateDatabase = cloudContainer.privateCloudDatabase
-        self.cloudSharedDatabase = cloudContainer.sharedCloudDatabase
+        setupCloudKit(containerName: containerName, defaultZoneID: defaultZoneID)
         
         self.containerFinder = .init(
             closure: modelContainer,
@@ -182,9 +228,7 @@ public final class SDSSynchronizer {
             }
         )
         
-        Task {
-            await viewModel.setWaitingForContainerDetection()
-        }
+        viewModel.setWaitingForContainerDetection()
     }
     
     /// Should be called when a remote notification was received.
@@ -193,10 +237,18 @@ public final class SDSSynchronizer {
         await self.forceDownloadSync()
     }
     
+    private func setupCloudKit(containerName: String, defaultZoneID: String) {
+        let cloudContainer = CKContainer(identifier: containerName)
+        mutableState.withLock { state in
+            state.defaultZoneID = CKRecordZone.ID(zoneName: defaultZoneID)
+            state.cloudContainer = cloudContainer
+            state.cloudPrivateDatabase = cloudContainer.privateCloudDatabase
+            state.cloudSharedDatabase = cloudContainer.sharedCloudDatabase
+        }
+    }
+    
     private func setup(storeToObserve: NSPersistentStoreCoordinator, configuration: SDSConfiguration, adoption: (() throws -> SDSAdoption)?) {
-        self.configuration = storeToObserve.makeConfiguration(externalConfiguration: configuration)
-        
-        self.observedStore = storeToObserve
+        let configuration = storeToObserve.makeConfiguration(externalConfiguration: configuration)
         
         let observedUpdateContext = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
         observedUpdateContext.persistentStoreCoordinator = storeToObserve
@@ -204,7 +256,12 @@ public final class SDSSynchronizer {
         observedUpdateContext.automaticallyMergesChangesFromParent = true
         // Other processes can change the observed store, so cached values cannot be trusted
         observedUpdateContext.stalenessInterval = 0
-        self.observedUpdateContext = observedUpdateContext
+        
+        mutableState.withLock { state in
+            state.configuration = configuration
+            state.observedStore = storeToObserve
+            state.observedUpdateContext = observedUpdateContext
+        }
         
         // Adopted models are saved before observing the store, so they aren't uploaded as new records
         if let adoption {
@@ -221,7 +278,7 @@ public final class SDSSynchronizer {
         }
         
         setupNotifications()
-        isObservingStore = true
+        mutableState.withLock { $0.isObservingStore = true }
         
         Task {
             await viewModel.set(state: .idle)
@@ -244,8 +301,8 @@ public final class SDSSynchronizer {
     }
     
     func accessState<T>(_ block: (SDSSynchronizerSavedState) -> T) -> T {
-        context.performAndWait {
-             block(context.savedState)
+        context.performAndWaitUnchecked {
+            block(context.savedState)
         }
     }
     
@@ -258,6 +315,7 @@ public final class SDSSynchronizer {
 
 
 
+@MainActor
 private final class _ContainerFinder {
     private var containerObservation: NSObjectProtocol?
     private var completion: ((NSPersistentStoreCoordinator) -> Void)?
@@ -283,7 +341,9 @@ private final class _ContainerFinder {
         self.containerObservation = NotificationCenter.default.addObserver(forName: .NSPersistentStoreCoordinatorStoresDidChange, object: nil, queue: .main) { [weak self] notification in
             guard let store = notification.object as? NSPersistentStoreCoordinator else { return }
             
-            self?.coordinatorFound(coordinator: store)
+            MainActor.assumeIsolated {
+                self?.coordinatorFound(coordinator: store)
+            }
         }
         self.completion = completion
         

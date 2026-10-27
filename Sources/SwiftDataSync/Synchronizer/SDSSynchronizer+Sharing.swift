@@ -96,7 +96,7 @@ extension SDSSynchronizer {
         }
         
         let context = self.context
-        return context.performAndWait {
+        return context.performAndWaitUnchecked {
             read(context)
         }
     }
@@ -187,7 +187,7 @@ extension SDSSynchronizer {
     func removeLocalCopy(of root: SDSSynchronizableContainer) throws {
         guard let observedUpdateContext else { return }
         
-        let objects = observedUpdateContext.performAndWait {
+        let objects = observedUpdateContext.performAndWaitUnchecked {
             // A root whose row is already gone would raise an exception when its fault fires
             guard (try? observedUpdateContext.existingObject(with: root.object.objectID)) != nil else { return [NSManagedObject]() }
             return hierarchy(of: root.object)
@@ -205,7 +205,7 @@ extension SDSSynchronizer {
         }
         
         // Deletions in the observed update context are not uploaded.
-        try observedUpdateContext.performAndWait {
+        try observedUpdateContext.performAndWaitUnchecked {
             objects.forEach(observedUpdateContext.delete)
             do {
                 try observedUpdateContext.save()
@@ -304,7 +304,7 @@ extension SDSSynchronizer {
         logger.log("Saving Share")
         
         // The record ID depends on the object's parents, which have to be read on its context's queue
-        let id = sharable.object.managedObjectContext?.performAndWait { sharable.recordId } ?? sharable.recordId
+        let id = sharable.object.managedObjectContext?.performAndWaitUnchecked { sharable.recordId } ?? sharable.recordId
         let record = CKRecord(recordType: sharable.object.entity.name!, recordID: id)
         let shareId = CKRecord.ID(recordName: "\(id.recordName)\(staticShareExtension)", zoneID: SDSSynchronizer.shared.defaultZoneID)
         let share = CKShare(rootRecord: record, shareID: shareId)
@@ -402,7 +402,8 @@ extension SDSSynchronizer {
             }
             
             // The shared database might not list the zone right away, which must not get it cleaned up
-            acceptedShareZones[share.recordID.zoneID] = .now
+            let zoneID = share.recordID.zoneID
+            withAcceptedShareZones { $0[zoneID] = .now }
         }
         
         self.forceDownload() // TODO(later): return new root object
