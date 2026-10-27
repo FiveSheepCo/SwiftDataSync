@@ -81,13 +81,26 @@ public final class SDSSynchronizationViewModel {
         return true
     }
     
+    /// A state and when it was set, so it can be restored after another operation.
+    /// Keeping the date keeps a delay CloudKit asked for from starting over.
+    struct StateSnapshot: Sendable {
+        let state: State
+        let lastStateChange: Date
+    }
+    
     /// Restores `state` after saving a share. Returns whether a synchronization was requested in the meantime.
-    func endSavingShare(restoring state: State) -> Bool {
+    func endSavingShare(restoring snapshot: StateSnapshot) -> Bool {
         let syncWasRequested = syncWasRequestedWhileSavingShare
         syncWasRequestedWhileSavingShare = false
         
-        self.set(state: state)
+        restore(snapshot)
         return syncWasRequested
+    }
+    
+    func restore(_ snapshot: StateSnapshot) {
+        logger.log("Restored State: \(String(describing: snapshot.state), privacy: .public)")
+        self.state = snapshot.state
+        self.lastStateChange = snapshot.lastStateChange
     }
     
     private var isSettable: Bool {
@@ -97,15 +110,14 @@ public final class SDSSynchronizationViewModel {
         }
     }
     
-    /// Waits until no synchronization is running, then sets `state`. Returns the state it replaced.
+    /// Waits until no synchronization is running, then sets `state`. Returns the state it replaced, to restore it afterwards.
     /// Throws if the task is cancelled while waiting.
-    @discardableResult
-    func waitForIdle(setting state: State) async throws -> State {
+    func waitForIdle(setting state: State) async throws -> StateSnapshot {
         while !isSettable {
             try await Task.sleep(for: .seconds(1))
         }
         
-        let previousState = self.state
+        let previousState = StateSnapshot(state: self.state, lastStateChange: lastStateChange)
         self.set(state: state)
         return previousState
     }

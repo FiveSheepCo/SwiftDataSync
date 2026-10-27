@@ -47,21 +47,24 @@ extension SDSSynchronizer {
         
         let changes = changes(of: updatedObjects, inserted: false)
         setUpdates(for: changes)
-        rememberUnsavedChanges(changes)
+        if let context = notification.object as? NSManagedObjectContext {
+            rememberUnsavedChanges(changes, in: context)
+        }
         handleDeletedObjects(deletedObjects)
     }
     
     @objc func contextSaved(_ notification:Notification) {
         guard
             let userInfo = userInfo(from: notification),
+            let savingContext = notification.object as? NSManagedObjectContext,
             // A child context only saves to its parent, whose save is handled. Its inserted objects don't have permanent IDs yet.
-            (notification.object as? NSManagedObjectContext)?.parent == nil
+            savingContext.parent == nil
         else { return }
         
         // Changes are stored when they are made, but uploads read the values from the store. Ones that were uploaded or
         // started uploading before they were saved are stored again, so their saved values are uploaded too.
         let updatedObjects = (userInfo[NSUpdatedObjectsKey] as? NSSet ?? []).compactMap { $0 as? NSManagedObject }
-        let savedChanges = takeUnsavedChanges(of: updatedObjects.map(\.objectID))
+        let savedChanges = takeUnsavedChanges(of: updatedObjects.map(\.objectID), savedBy: savingContext)
         setUpdates(for: updatedObjects.compactMap { object in
             guard let keys = savedChanges[object.objectID], let container = object.synchronizableContainer else { return nil }
             return SDSObjectChange(objectId: object.objectID, id: container.id, zoneId: container.sharedZoneId, entityName: object.entity.name!, changedKeys: Array(keys))
@@ -77,7 +80,7 @@ extension SDSSynchronizer {
         
         Task {
             // Nothing cancels this task
-            guard (try? await viewModel.waitForIdle(setting: .processingSaveEvent)) != nil else { return }
+            guard let previousState = try? await viewModel.waitForIdle(setting: .processingSaveEvent) else { return }
             
             // E.g. another process using the same synchronization data can keep the store busy, which must not crash
             let observedUpdateContext = self.observedUpdateContext!
@@ -103,7 +106,8 @@ extension SDSSynchronizer {
                 }
             }
             
-            await viewModel.set(state: .idle)
+            // E.g. an error's retry delay isn't forgotten, which a synchronization started now has to respect
+            await viewModel.restore(previousState)
             
             self.startSync()
         }

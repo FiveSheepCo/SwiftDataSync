@@ -81,7 +81,11 @@ extension SDSSynchronizer {
         guard isObservingStore else { return }
         
         do {
-            guard await viewModel.attemptSyncStart() else { return }
+            guard await viewModel.attemptSyncStart() else {
+                // E.g. while CloudKit asks to wait after an error, a retry has to be scheduled, as a pending one might have been used up
+                await setRoutineTimer()
+                return
+            }
             
             guard syncLease.acquire() else { throw SDSSyncLease.UnavailableError() }
             defer { syncLease.release() }
