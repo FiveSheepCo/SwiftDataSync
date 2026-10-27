@@ -40,6 +40,6 @@ extension CloudKitZone {
         let request: NSFetchRequest<CloudKitZone> = self.fetchRequest()
         request.sortDescriptors = []
         
-        return try! request.execute()
+        return (try? request.execute()) ?? []
     }
 }

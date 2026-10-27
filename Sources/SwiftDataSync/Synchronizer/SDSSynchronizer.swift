@@ -15,7 +15,8 @@ private extension NSManagedObjectContext {
         }
         
         let state = SDSSynchronizerSavedState(entity: SDSSynchronizerSavedState.entity(), insertInto: self)
-        try! self.save()
+        // If this fails, e.g. while another process keeps the store busy, the state is saved with the context's next save
+        try? self.save()
         return state
     }
 }
@@ -65,6 +66,10 @@ public final class SDSSynchronizer: Sendable {
         /// Zones of recently accepted shares with the date they were accepted, as the shared database might not list them right away.
         var acceptedShareZones: [CKRecordZone.ID: Date] = [:]
         
+        /// Objects deleted by the synchronizer, which other contexts report like their own deletions once they merge them.
+        /// IDs of deleted objects aren't reused, so they are kept.
+        var deletionsBySynchronizer: Set<NSManagedObjectID> = []
+        
         var routineSync: Task<Void, Never>?
         var syncLeaseRetry: Task<Void, Never>?
     }
@@ -110,6 +115,28 @@ public final class SDSSynchronizer: Sendable {
     
     func finishTask(at keyPath: WritableKeyPath<MutableState, Task<Void, Never>?> & Sendable) {
         mutableState.withLock { $0[keyPath: keyPath] = nil }
+    }
+    
+    /// Saves `observedUpdateContext`. Has to be called on its queue.
+    ///
+    /// Contexts that merge its changes report its deletions like deletions made in them, which must not be uploaded:
+    /// they are deletions downloaded from iCloud, or local copies of shares that were left, whose records belong to someone else.
+    func saveObservedUpdateContext(_ observedUpdateContext: NSManagedObjectContext) throws {
+        let deletedIds = observedUpdateContext.deletedObjects.map(\.objectID)
+        mutableState.withLock { $0.deletionsBySynchronizer.formUnion(deletedIds) }
+        
+        try observedUpdateContext.save()
+    }
+    
+    func wasDeletedBySynchronizer(_ objectId: NSManagedObjectID) -> Bool {
+        mutableState.withLock { $0.deletionsBySynchronizer.contains(objectId) }
+    }
+    
+    /// Whether a download inserted the object and gave it its record's id. Objects that weren't saved yet otherwise have no id.
+    func isDownloadedObject(_ object: NSManagedObject) -> Bool {
+        context.performAndWaitUnchecked {
+            temporaryObjectContainers[object] != nil
+        }
     }
     
     /// Reads and changes the zones of recently accepted shares at once, as accepting a share can happen while synchronizing.

@@ -54,7 +54,9 @@ extension SDSSynchronizer {
         return observedUpdateContext.performAndWaitUnchecked { () -> SDSSynchronizableContainer? in
             guard
                 let result,
-                let localObject = result.temporaryObject ?? observedStore.managedObjectID(forURIRepresentation: URL(string: result.localId)!).map(observedUpdateContext.object(with:))
+                let localObject = result.temporaryObject ?? URL(string: result.localId)
+                    .flatMap(observedStore.managedObjectID(forURIRepresentation:))
+                    .map(observedUpdateContext.object(with:))
             else { return nil }
             
             return container(id: { id }, object: localObject)

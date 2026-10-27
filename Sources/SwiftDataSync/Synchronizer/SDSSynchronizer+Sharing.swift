@@ -45,6 +45,10 @@ extension SDSSynchronizer {
         object: NSManagedObject,
         publicPermission: CKShare.ParticipantPermission = .readWrite
     ) async throws -> URL {
+        // An object that wasn't saved yet has no record to share, and would get a record id that differs from its later one
+        guard !object.objectID.isTemporaryID else {
+            throw SDSSyncError(title: "share.error.couldNotFindObject")
+        }
         guard let container = container(for: object) as? SDSSharableContainer else {
             throw SDSSyncError(title: "share.error.objectIsNotSharable")
         }
@@ -159,7 +163,7 @@ extension SDSSynchronizer {
     /// The previous state is restored afterwards, so e.g. an error's retry delay or a missing iCloud account isn't forgotten.
     /// A synchronization requested in the meantime is started afterwards.
     private func whileSyncIsIdle<T>(_ work: () async throws -> T) async throws -> T {
-        let previousState = await viewModel.waitForIdle(setting: .savingShare)
+        let previousState = try await viewModel.waitForIdle(setting: .savingShare)
         
         let result: Result<T, Error>
         do {
@@ -208,7 +212,7 @@ extension SDSSynchronizer {
         try observedUpdateContext.performAndWaitUnchecked {
             objects.forEach(observedUpdateContext.delete)
             do {
-                try observedUpdateContext.save()
+                try saveObservedUpdateContext(observedUpdateContext)
             } catch {
                 observedUpdateContext.rollback()
                 throw error
@@ -362,12 +366,6 @@ extension SDSSynchronizer {
         }
     }
     
-    func waitForIdle() async {
-        while case .idle = await viewModel.state {
-            try! await Task.sleep(for: .seconds(1))
-        }
-    }
-    
     public func acceptShare(with metadata: CKShare.Metadata) async throws {
         guard metadata.share.recordID.zoneID.zoneName == defaultZoneID.zoneName else {
             // E.g. a share from an app that uses another default zone in the same container, which can't be synchronized
@@ -377,12 +375,31 @@ extension SDSSynchronizer {
         let acceptSharesOperation = CKAcceptSharesOperation(shareMetadatas: [metadata])
         
         let share = try await withCheckedThrowingContinuation { continuation in
+            // The share's result isn't reported if the whole operation fails, e.g. without a network connection.
+            // The operation's callbacks run serially, so this doesn't need a lock.
+            nonisolated(unsafe) var didResume = false
+            
             acceptSharesOperation.perShareResultBlock = { metadata, result in
+                guard !didResume else { return }
+                didResume = true
+                
                 switch result {
                 case .success(let share):
                     self.logger.log("Share accepted: \(share)")
                     
                     continuation.resume(returning: share)
+                case .failure(let error):
+                    self.logger.log("Share could not be accepted: \(error.localizedDescription)")
+                    continuation.resume(throwing: error)
+                }
+            }
+            acceptSharesOperation.acceptSharesResultBlock = { result in
+                guard !didResume else { return }
+                didResume = true
+                
+                switch result {
+                case .success:
+                    continuation.resume(throwing: SDSSyncError(title: "share.error.notAccepted"))
                 case .failure(let error):
                     self.logger.log("Share could not be accepted: \(error.localizedDescription)")
                     continuation.resume(throwing: error)

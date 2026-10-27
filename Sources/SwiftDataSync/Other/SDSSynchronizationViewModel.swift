@@ -89,10 +89,11 @@ public final class SDSSynchronizationViewModel {
     }
     
     /// Waits until no synchronization is running, then sets `state`. Returns the state it replaced.
+    /// Throws if the task is cancelled while waiting.
     @discardableResult
-    func waitForIdle(setting state: State) async -> State {
+    func waitForIdle(setting state: State) async throws -> State {
         while !isSettable {
-            try! await Task.sleep(for: .seconds(1))
+            try await Task.sleep(for: .seconds(1))
         }
         
         let previousState = self.state
