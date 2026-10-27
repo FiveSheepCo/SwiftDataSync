@@ -73,8 +73,9 @@ extension SDSSynchronizableContainer {
         return nil
     }
     
-    func changeDictionary(for keys: [String]) -> [String: CKRecordValue?] {
-        keys.reduce(into: [:]) { result, key in
+    /// Throws if an asset can't be prepared, e.g. while the disk is full.
+    func changeDictionary(for keys: [String]) throws -> [String: CKRecordValue?] {
+        try keys.reduce(into: [:]) { result, key in
             let value = object.value(forKey: key)
             
             let cloudValue: CKRecordValue?
@@ -94,7 +95,7 @@ extension SDSSynchronizableContainer {
                 let transformer = ValueTransformer(forName: .init(transformerName))!
                 cloudValue = transformer.transformedValue(value) as? any CKRecordValue
             } else if let data = value as? Data, self.assetKeys.contains(key) {
-                cloudValue = try! CKAsset(data: data)
+                cloudValue = try CKAsset(data: data)
             } else if let recordValue = value as? CKRecordValue {
                 cloudValue = recordValue
             } else if
@@ -117,6 +118,11 @@ extension SDSSynchronizableContainer {
         
         while let newParent = parent.parent?.synchronizableContainer {
             parent = newParent
+        }
+        
+        // A root that wasn't saved yet isn't shared, and must not get an id now, as saving it gives it another one
+        if parent.object.objectID.isTemporaryID && !SDSSynchronizer.shared.isDownloadedObject(parent.object) {
+            return nil
         }
         
         if let sharableContainer = parent as? SDSSharableContainer,

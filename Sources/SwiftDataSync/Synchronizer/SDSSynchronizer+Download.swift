@@ -264,7 +264,14 @@ private final class CKDownloadHandler {
                 if let value = value as? SDSSynchronizableContainer {
                     object.setValue(value.object, forKey: key)
                 } else if let asset = value as? CKAsset {
-                    let data = asset.fileURL.map({ try! Data(contentsOf: $0) })
+                    let data: Data?
+                    do {
+                        data = try asset.fileURL.map { try Data(contentsOf: $0) }
+                    } catch {
+                        // The current value is kept rather than removed
+                        synchronizer.logger.error("Failed reading asset for key `\(object.entity.name ?? "")`.`\(key)`: \(error.localizedDescription)")
+                        continue
+                    }
                     object.setValue(data, forKey: key)
                 } else if let data = value as? Data, type != .binaryData {
                     if let transformerName = object.entity.attributesByName[key]?.valueTransformerName {
@@ -381,7 +388,7 @@ private final class CKDownloadHandler {
         }
         
         // Pending changes of a record that was deleted elsewhere can never be uploaded. Without its object,
-        // an update would hit the `fatalError` in `record(for:)`, and a removal would delete a record that is gone.
+        // an update couldn't be built, and a removal would delete a record that is gone.
         let syncContext = synchronizer.context
         syncContext.performAndWait {
             for entityName in ["CloudKitUpdate", "CloudKitRemoval"] {
@@ -506,24 +513,14 @@ private final class CKDownloadHandler {
         guard synchronizer.syncLease.renew() else {
             synchronizer.logger.log("Sync lease lost, discarding download")
             
-            observedContext.performAndWait {
-                observedContext.rollback()
-            }
-            syncContext.performAndWait {
-                for container in synchronizer.temporaryObjectContainers.values {
-                    container.delete()
-                }
-                synchronizer.temporaryObjectContainers = [:]
-            }
-            tokensToUpdate = [:]
-            
+            discardDownload(observedContext: observedContext)
             completionHandler(SDSSyncLease.UnavailableError())
             return
         }
         
         let saveError: (any Error)? = observedContext.performAndWait {
             do {
-                try observedContext.save()
+                try synchronizer.saveObservedUpdateContext(observedContext)
                 return nil
             } catch {
                 return error
@@ -539,7 +536,10 @@ private final class CKDownloadHandler {
                 synchronizer.logger.log("Succeeded trying to fix save errors. Trying to save again.")
                 fetchOverallCompletion(result: result)
             } else {
-                synchronizer.logger.log("Failed fixing the save errors")
+                // The unsaved objects would fail every later save of the context, and their placeholders must not be saved.
+                // The change tokens weren't saved either, so the records are downloaded again.
+                synchronizer.logger.log("Failed fixing the save errors, discarding download")
+                discardDownload(observedContext: observedContext)
                 completionHandler(saveError)
             }
             
@@ -553,7 +553,12 @@ private final class CKDownloadHandler {
             try syncContext.performAndWaitUnchecked {
                 // The objects have permanent IDs once they are saved
                 for (object, container) in synchronizer.temporaryObjectContainers {
-                    container.localId = object.objectID.uriRepresentation().absoluteString
+                    if object.objectID.isTemporaryID {
+                        // E.g. an object that was deleted to fix a failed save
+                        container.delete()
+                    } else {
+                        container.localId = object.objectID.uriRepresentation().absoluteString
+                    }
                 }
                 synchronizer.temporaryObjectContainers = [:]
                 
@@ -581,6 +586,25 @@ private final class CKDownloadHandler {
             synchronizer.logger.log("Database fetch completed with error: \(error)")
             completionHandler(error)
         }
+    }
+    
+    /// Discards the downloaded objects and their placeholders, and doesn't save the change tokens, so the records are downloaded again.
+    private func discardDownload(observedContext: NSManagedObjectContext) {
+        let synchronizer = self.synchronizer!
+        let syncContext = synchronizer.context
+        
+        observedContext.performAndWait {
+            observedContext.rollback()
+        }
+        syncContext.performAndWait {
+            for container in synchronizer.temporaryObjectContainers.values {
+                container.delete()
+            }
+            synchronizer.temporaryObjectContainers = [:]
+        }
+        tokensToUpdate = [:]
+        objectsToEnsureParentReferencesFor = []
+        recordsToAddLater = []
     }
     
     /// Tries fixing the given error and returns whether the context should try to save again or a fix was not possible.

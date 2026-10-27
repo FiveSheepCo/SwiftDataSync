@@ -33,8 +33,16 @@ extension SDSSynchronizer {
         guard let userInfo = userInfo(from: notification) else { return }
         
         // Only changes and deleted objects are handled here so that the update works
-        let updatedObjects = (userInfo[NSUpdatedObjectsKey] as? NSSet ?? []).compactMap(onlyIfSyncronizable)
-        let deletedObjects = (userInfo[NSDeletedObjectsKey] as? NSSet ?? []).compactMap(onlyIfSyncronizable)
+        // Objects that weren't saved yet are reported too. They don't have a record, and must not get a record id now,
+        // as saving them gives them another one. They are uploaded with all keys once they are saved.
+        let savedObjects = { (key: String) in
+            (userInfo[key] as? NSSet ?? []).compactMap { $0 as? NSManagedObject }.filter { !$0.objectID.isTemporaryID }
+        }
+        let updatedObjects = savedObjects(NSUpdatedObjectsKey).compactMap(onlyIfSyncronizable)
+        let deletedObjects = savedObjects(NSDeletedObjectsKey)
+            // Deletions merged from the synchronizer's own saves are reported here too, but must not be uploaded
+            .filter { !wasDeletedBySynchronizer($0.objectID) }
+            .compactMap(onlyIfSyncronizable)
         
         handleChangedObjects(updatedObjects)
         handleDeletedObjects(deletedObjects)
@@ -52,18 +60,31 @@ extension SDSSynchronizer {
         let insertedChanges = changes(of: insertedObjects, inserted: true)
         
         Task {
-            await viewModel.waitForIdle(setting: .processingSaveEvent)
+            // Nothing cancels this task
+            guard (try? await viewModel.waitForIdle(setting: .processingSaveEvent)) != nil else { return }
             
+            // E.g. another process using the same synchronization data can keep the store busy, which must not crash
             let observedUpdateContext = self.observedUpdateContext!
-            try! observedUpdateContext.performAndWait {
-                try observedUpdateContext.save()
+            observedUpdateContext.performAndWait {
+                do {
+                    try self.saveObservedUpdateContext(observedUpdateContext)
+                } catch {
+                    // Nothing else changes this context while no synchronization is running, so nothing of value is discarded
+                    self.logger.log("Failed to save the observed update context: \(error.localizedDescription)")
+                    observedUpdateContext.rollback()
+                }
             }
             
             setUpdates(for: insertedChanges)
             
             let context = self.context
-            try! context.performAndWait {
-                try context.save()
+            context.performAndWait {
+                do {
+                    try context.save()
+                } catch {
+                    // The pending changes stay in the context, so they are saved with its next save
+                    self.logger.log("Failed to save pending changes: \(error.localizedDescription)")
+                }
             }
             
             await viewModel.set(state: .idle)

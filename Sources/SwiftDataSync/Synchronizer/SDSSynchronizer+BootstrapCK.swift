@@ -166,7 +166,7 @@ extension SDSSynchronizer {
     internal func updateUpdatesToSend() async {
         let context = self.context
         let updatesToSend = context.performAndWait {
-            try! context.count(for: CloudKitUpdate.fetchRequest()) + context.count(for: CloudKitRemoval.fetchRequest())
+            ((try? context.count(for: CloudKitUpdate.fetchRequest())) ?? 0) + ((try? context.count(for: CloudKitRemoval.fetchRequest())) ?? 0)
         }
         
         await viewModel.set(updatesToSend: updatesToSend)

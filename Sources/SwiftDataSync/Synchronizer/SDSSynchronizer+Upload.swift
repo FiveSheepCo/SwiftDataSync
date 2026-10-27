@@ -151,36 +151,53 @@ extension SDSSynchronizer {
         logger.log("[Upload] Changed from `CloudKitUpdate`: \(changedKeys)")
         
         guard let container = find(for: id) else {
-            fatalError("This should never happen, it cannot be that the object doesn't exist, unless the background context is out of sync with the viewContext.")
+            // There is nothing left to upload
+            logger.error("[Upload] Discarding update for `\(id)` as its object is unknown")
+            update.delete()
+            return nil
         }
         
-        let shouldContinue = self.observedUpdateContext!.performAndWaitUnchecked {
-            
-            // Synchronize parent, but only if parent is changed
-            if let parentKey = container.parentKey,
-               changedKeys.contains(parentKey),
-               let parent = container.parent,
-               let parentRecordId = parent.synchronizableContainer?.recordId
-            {
-                record.setParent(parentRecordId)
-                // This workaround is needed so that deletion of records with a parent works
-                record[Constants.parentWorkaroundKey] = CKRecord.Reference(recordID: parentRecordId, action: .deleteSelf)
+        let observedUpdateContext = self.observedUpdateContext!
+        let shouldContinue: Bool
+        do {
+            shouldContinue = try observedUpdateContext.performAndWaitUnchecked {
+                // The object can be deleted before its removal is stored, e.g. while this runs, or by a batch delete.
+                // Its values would be read as `nil` and overwrite the record's values.
+                guard (try? observedUpdateContext.existingObject(with: container.object.objectID)) != nil else {
+                    logger.error("[Upload] Discarding update for `\(id)` as its object is deleted")
+                    return false
+                }
+                
+                // Synchronize parent, but only if parent is changed
+                if let parentKey = container.parentKey,
+                   changedKeys.contains(parentKey),
+                   let parent = container.parent,
+                   let parentRecordId = parent.synchronizableContainer?.recordId
+                {
+                    record.setParent(parentRecordId)
+                    // This workaround is needed so that deletion of records with a parent works
+                    record[Constants.parentWorkaroundKey] = CKRecord.Reference(recordID: parentRecordId, action: .deleteSelf)
+                }
+                
+                // Only sync keys that are actually in the syncKeys array
+                // Important because `changedKeys` could also include the parent key
+                let syncKeys = changedKeys.filter { key in
+                    container.syncKeys.contains(key)
+                }
+                if syncKeys.isEmpty {
+                    return false
+                }
+                
+                for (key, value) in try container.changeDictionary(for: syncKeys) {
+                    logger.log("Setting `\(String(describing: value), privacy: .private)` for \(key, privacy: .public)")
+                    record[key] = value
+                }
+                return true
             }
-            
-            // Only sync keys that are actually in the syncKeys array
-            // Important because `changedKeys` could also include the parent key
-            let syncKeys = changedKeys.filter { key in
-                container.syncKeys.contains(key)
-            }
-            if syncKeys.isEmpty {
-                return false
-            }
-            
-            for (key, value) in container.changeDictionary(for: syncKeys) {
-                logger.log("Setting `\(String(describing: value), privacy: .private)` for \(key, privacy: .public)")
-                record[key] = value
-            }
-            return true
+        } catch {
+            // The update is kept, so the record is uploaded with a later synchronization
+            logger.error("[Upload] Failed to prepare the record for `\(id)`: \(error.localizedDescription)")
+            return nil
         }
         
         if !shouldContinue {
@@ -221,7 +238,9 @@ extension SDSSynchronizer {
                 var isDone: Bool = true
                 
                 guard let container = find(for: id) else {
-                    fatalError("This should never happen, it cannot be that the object doesn't exist, unless the background context is out of sync with the viewContext.")
+                    // There is nothing left to upload
+                    update.delete()
+                    continue
                 }
                 let lastChange = container.lastObjectChange
                 

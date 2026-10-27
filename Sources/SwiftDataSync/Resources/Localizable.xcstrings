@@ -101,6 +101,16 @@
         }
       }
     },
+    "share.error.notAccepted" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The share could not be accepted"
+          }
+        }
+      }
+    },
     "share.error.notSaved" : {
       "localizations" : {
         "en" : {
