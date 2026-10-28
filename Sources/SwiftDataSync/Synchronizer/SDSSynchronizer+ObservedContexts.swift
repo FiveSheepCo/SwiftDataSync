@@ -15,6 +15,7 @@ extension SDSSynchronizer {
     
     func setupNotifications() {
         NotificationCenter.default.addObserver(self, selector: #selector(contextChanged(_:)), name: .NSManagedObjectContextObjectsDidChange, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(contextWillSave(_:)), name: .NSManagedObjectContextWillSave, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(contextSaved(_:)), name: .NSManagedObjectContextDidSave, object: nil)
     }
     
@@ -45,12 +46,32 @@ extension SDSSynchronizer {
             .filter { !wasDeletedBySynchronizer($0.objectID) }
             .compactMap(onlyIfSyncronizable)
         
-        let changes = changes(of: updatedObjects, inserted: false)
-        setUpdates(for: changes)
-        if let context = notification.object as? NSManagedObjectContext {
-            rememberUnsavedChanges(changes, in: context)
-        }
+        setUpdates(for: changes(of: updatedObjects, inserted: false))
         handleDeletedObjects(deletedObjects)
+    }
+    
+    /// Changes are stored when they are made, but uploads read the values from the store, so ones that were uploaded
+    /// before they were saved are stored again once they are, see `contextSaved`.
+    /// The keys are read from what is being saved, so changes that were discarded, e.g. by a rollback, aren't stored again.
+    @objc func contextWillSave(_ notification: Notification) {
+        guard
+            let context = notification.object as? NSManagedObjectContext,
+            context.persistentStoreCoordinator == observedStore,
+            context != observedUpdateContext,
+            // A child context only saves to its parent, whose save is handled
+            context.parent == nil
+        else { return }
+        
+        var keys: [NSManagedObjectID: Set<String>] = [:]
+        for object in context.updatedObjects where !object.objectID.isTemporaryID {
+            guard let container = object.synchronizableContainer else { continue }
+            let synchronizedKeys = Set(container.syncKeys + [container.parentKey].compactMap { $0 })
+            let savedKeys = synchronizedKeys.intersection(object.changedValues().keys)
+            if !savedKeys.isEmpty {
+                keys[object.objectID] = savedKeys
+            }
+        }
+        rememberKeysBeingSaved(keys, by: context)
     }
     
     @objc func contextSaved(_ notification:Notification) {
@@ -61,10 +82,9 @@ extension SDSSynchronizer {
             savingContext.parent == nil
         else { return }
         
-        // Changes are stored when they are made, but uploads read the values from the store. Ones that were uploaded or
-        // started uploading before they were saved are stored again, so their saved values are uploaded too.
+        // Changes that were saved are stored again, so their saved values are uploaded too, see `contextWillSave`
         let updatedObjects = (userInfo[NSUpdatedObjectsKey] as? NSSet ?? []).compactMap { $0 as? NSManagedObject }
-        let savedChanges = takeUnsavedChanges(of: updatedObjects.map(\.objectID), savedBy: savingContext)
+        let savedChanges = takeKeysBeingSaved(by: savingContext)
         let updatedChanges = updatedObjects.compactMap { object -> SDSObjectChange? in
             guard let keys = savedChanges[object.objectID], let container = object.synchronizableContainer else { return nil }
             return SDSObjectChange(objectId: object.objectID, id: container.id, zoneId: container.sharedZoneId, entityName: object.entity.name!, changedKeys: Array(keys))

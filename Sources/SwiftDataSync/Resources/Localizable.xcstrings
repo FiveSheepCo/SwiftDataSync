@@ -51,6 +51,16 @@
         }
       }
     },
+    "error.changedWhileCatchingUp" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Objects were changed while newly synchronized data was downloaded"
+          }
+        }
+      }
+    },
     "error.noObservedContext" : {
       "localizations" : {
         "en" : {

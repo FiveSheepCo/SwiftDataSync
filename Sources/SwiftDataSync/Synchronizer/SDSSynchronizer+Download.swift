@@ -61,7 +61,9 @@ extension SDSSynchronizer {
         
         try await self._download(sharedDatabase: true, scope: scope)
         
-        if let catchUp, catchUp.retryDate.map({ $0 <= .now }) ?? true {
+        // Extensions can have little memory and time, so the app catches up
+        let isAppExtension = Bundle.main.bundleURL.pathExtension == "appex"
+        if let catchUp, !isAppExtension, catchUp.retryDate.map({ $0 <= .now }) ?? true {
             logger.log("More models or keys are synchronized than before, catching up on them")
             do {
                 // The change tokens are kept, as downloading every record doesn't include deletions, which would then be missed
@@ -318,6 +320,10 @@ private final class CKDownloadHandler {
     private func _changed(record: CKRecord) {
         // Catch CKShare
         if let share = record as? CKShare {
+            // A catch-up only downloads some keys, so it would store the share without its title and thumbnail.
+            // Shares are stored by the other downloads.
+            guard !scope.isCatchingUp else { return }
+            
             let context = synchronizer.context
             context.perform {
                 CloudKitShare.updateShare(
@@ -687,6 +693,20 @@ private final class CKDownloadHandler {
             return
         }
         
+        // A catch-up downloads every record, which can take long. Objects that were changed locally meanwhile keep their changes,
+        // which would otherwise be overwritten with the older values, and the catch-up is done again later, after they're uploaded.
+        let hasLocalChanges = scope.isCatchingUp && observedContext.performAndWaitUnchecked {
+            var hasLocalChanges = false
+            for object in observedContext.updatedObjects {
+                guard let id = synchronizer.container(for: object)?.id else { continue }
+                if !synchronizer.pendingChangedKeys(of: id).isDisjoint(with: object.changedValues().keys) {
+                    observedContext.refresh(object, mergeChanges: false)
+                    hasLocalChanges = true
+                }
+            }
+            return hasLocalChanges
+        }
+        
         // Inserted objects get their permanent IDs before they are saved, so their placeholders know them once other contexts
         // can change the objects. Otherwise a change could find no record id for an object, and give it a second one.
         let permanentIdError: (any Error)? = observedContext.performAndWait {
@@ -776,6 +796,9 @@ private final class CKDownloadHandler {
         }
         
         switch result {
+        case .success where hasLocalChanges:
+            synchronizer.logger.log("Database fetch completed, but objects changed locally meanwhile")
+            completionHandler(SDSSyncError(title: "error.changedWhileCatchingUp"))
         case .success:
             synchronizer.logger.log("Database fetch completed successfully")
             completionHandler(nil)

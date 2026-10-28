@@ -73,8 +73,8 @@ public final class SDSSynchronizer: Sendable {
         /// Models and keys that still have to be caught up on.
         var catchUp: CatchUp?
         
-        /// Keys of objects that were changed in a context but not saved yet.
-        var unsavedChanges: [UnsavedChangeKey: Set<String>] = [:]
+        /// The synchronized keys a context is saving to the store, by object. Read when the save starts, and taken when it's done.
+        var keysBeingSaved: [ObjectIdentifier: [NSManagedObjectID: Set<String>]] = [:]
         
         fileprivate var containerFinder: _ContainerFinder?
         
@@ -149,43 +149,14 @@ public final class SDSSynchronizer: Sendable {
         }
     }
     
-    /// An object's changes in the context that saves them to the store.
-    ///
-    /// Several contexts can change the same object, and each one's changes are only saved by its own save.
-    struct UnsavedChangeKey: Hashable, Sendable {
-        let rootContext: ObjectIdentifier
-        let objectId: NSManagedObjectID
-        
-        /// Changes of a child context are saved to the store by its topmost parent.
-        init(context: NSManagedObjectContext, objectId: NSManagedObjectID) {
-            var rootContext = context
-            while let parent = rootContext.parent {
-                rootContext = parent
-            }
-            self.rootContext = ObjectIdentifier(rootContext)
-            self.objectId = objectId
-        }
+    /// Remembers the synchronized keys a context is about to save to the store, see `contextWillSave`.
+    func rememberKeysBeingSaved(_ keys: [NSManagedObjectID: Set<String>], by context: NSManagedObjectContext) {
+        mutableState.withLock { $0.keysBeingSaved[ObjectIdentifier(context)] = keys }
     }
     
-    /// Uploads read values from the store, so a change that isn't saved yet isn't uploaded.
-    /// Its keys are remembered, so the change is stored again once it is saved, see `contextSaved`.
-    func rememberUnsavedChanges(_ changes: [SDSObjectChange], in context: NSManagedObjectContext) {
-        mutableState.withLock { state in
-            for change in changes {
-                state.unsavedChanges[UnsavedChangeKey(context: context, objectId: change.objectId), default: []].formUnion(change.changedKeys)
-            }
-        }
-    }
-    
-    /// Returns and forgets the changed keys of objects that a root context saved.
-    func takeUnsavedChanges(of objectIds: [NSManagedObjectID], savedBy context: NSManagedObjectContext) -> [NSManagedObjectID: Set<String>] {
-        mutableState.withLock { state in
-            var changes: [NSManagedObjectID: Set<String>] = [:]
-            for objectId in objectIds {
-                changes[objectId] = state.unsavedChanges.removeValue(forKey: UnsavedChangeKey(context: context, objectId: objectId))
-            }
-            return changes
-        }
+    /// Returns and forgets the synchronized keys a context saved to the store.
+    func takeKeysBeingSaved(by context: NSManagedObjectContext) -> [NSManagedObjectID: Set<String>] {
+        mutableState.withLock { $0.keysBeingSaved.removeValue(forKey: ObjectIdentifier(context)) ?? [:] }
     }
     
     func wasDeletedBySynchronizer(_ objectId: NSManagedObjectID) -> Bool {
@@ -429,14 +400,15 @@ public final class SDSSynchronizer: Sendable {
         
         // Without stored keys, e.g. on the first launch of a version that stores them, what was skipped before is unknown.
         // Catching up on every key would overwrite local changes with older values, so only later additions are caught up on.
-        guard let previousKeys, !keys.isSubset(of: previousKeys) else {
-            if keys != previousKeys {
-                storeSynchronizedKeys(keys)
-            }
+        guard let previousKeys else {
+            storeSynchronizedKeys(keys)
             return
         }
+        // The stored keys aren't reduced, as another process using the same synchronization data, e.g. an extension,
+        // can synchronize less, which would make the others catch up again every time
+        guard !keys.isSubset(of: previousKeys) else { return }
         
-        mutableState.withLock { $0.catchUp = CatchUp(keys: keys, newKeys: keys.subtracting(previousKeys)) }
+        mutableState.withLock { $0.catchUp = CatchUp(keys: keys.union(previousKeys), newKeys: keys.subtracting(previousKeys)) }
     }
     
     private var synchronizedKeysURL: URL? {
