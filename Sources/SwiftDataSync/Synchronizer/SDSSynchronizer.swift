@@ -79,6 +79,7 @@ public final class SDSSynchronizer: Sendable {
         fileprivate var containerFinder: _ContainerFinder?
         
         var routineSync: Task<Void, Never>?
+        var catchUpRetry: Task<Void, Never>?
         var syncLeaseRetry: Task<Void, Never>?
     }
     private let mutableState = OSAllocatedUnfairLock(initialState: MutableState())
