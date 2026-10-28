@@ -65,10 +65,10 @@ extension SDSSynchronizer {
         // started uploading before they were saved are stored again, so their saved values are uploaded too.
         let updatedObjects = (userInfo[NSUpdatedObjectsKey] as? NSSet ?? []).compactMap { $0 as? NSManagedObject }
         let savedChanges = takeUnsavedChanges(of: updatedObjects.map(\.objectID), savedBy: savingContext)
-        setUpdates(for: updatedObjects.compactMap { object in
+        let updatedChanges = updatedObjects.compactMap { object -> SDSObjectChange? in
             guard let keys = savedChanges[object.objectID], let container = object.synchronizableContainer else { return nil }
             return SDSObjectChange(objectId: object.objectID, id: container.id, zoneId: container.sharedZoneId, entityName: object.entity.name!, changedKeys: Array(keys))
-        })
+        }
         
         let insertedObjects = (userInfo[NSInsertedObjectsKey] as? NSSet ?? []).compactMap(onlyIfSyncronizable)
         
@@ -76,9 +76,10 @@ extension SDSSynchronizer {
         // Inserted objects only have a valid managed object id after being saved
         // Changes cannot be handled here as we do not get useful information about the properties that have changed
         // The objects belong to the context that was saved, so they are read now, while on its queue
-        // They are stored right away, like other changes. Otherwise a running upload could upload a record that references
-        // an inserted object before the object, and another device that downloads in between couldn't store the record.
-        setUpdates(for: changes(of: insertedObjects, inserted: true))
+        // They are stored right away, like other changes, and together with the saved changes of updated objects.
+        // Otherwise a running upload could upload a record that references an inserted object before the object,
+        // and another device that downloads in between couldn't store the record.
+        setUpdates(for: updatedChanges + changes(of: insertedObjects, inserted: true))
         
         Task {
             // Nothing cancels this task
@@ -144,9 +145,13 @@ extension SDSSynchronizer {
         }
     }
     
+    /// Stores the changes at once, so an upload never selects some of them without the others.
     func setUpdates(for changes: [SDSObjectChange]) {
-        for change in changes {
-            setUpdate(id: change.id, zoneId: change.zoneId, entityName: change.entityName, changedKeys: change.changedKeys)
+        let context = self.context
+        context.performAndWait {
+            for change in changes {
+                setUpdate(id: change.id, zoneId: change.zoneId, entityName: change.entityName, changedKeys: change.changedKeys)
+            }
         }
     }
     

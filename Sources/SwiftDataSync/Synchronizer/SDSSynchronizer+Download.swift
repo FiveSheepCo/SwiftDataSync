@@ -6,26 +6,73 @@ import OSLog
 /// How long the zone of an accepted share is kept although the shared database doesn't list it.
 private let acceptedShareZoneListingDelay: TimeInterval = 5 * 60
 
+/// How long a failed catch-up waits before it's tried again, as it downloads every record.
+private let catchUpRetryDelay: TimeInterval = 60 * 60
+
+/// Which models and keys a download stores. Keys are given as `Entity.key`, and a whole model by its entity name.
+private enum DownloadScope {
+    /// Everything that is synchronized, from the changes since the last download.
+    /// While a catch-up is pending, records whose references are missing might reference records only it downloads.
+    case all(catchUpIsPending: Bool)
+    /// Only models and keys to catch up on, from every record rather than the changes since the last download.
+    case catchingUp(on: Set<String>)
+    
+    var isCatchingUp: Bool {
+        if case .catchingUp = self { true } else { false }
+    }
+    
+    func includes(entity: String) -> Bool {
+        switch self {
+        case .all: true
+        case .catchingUp(let keys): keys.contains(entity) || keys.contains { $0.hasPrefix("\(entity).") }
+        }
+    }
+    
+    func includes(entity: String, key: String) -> Bool {
+        switch self {
+        case .all: true
+        case .catchingUp(let keys): keys.contains(entity) || keys.contains("\(entity).\(key)")
+        }
+    }
+    
+    /// Whether missing objects are inserted. A catch-up only adds keys to existing objects of models that were synchronized before.
+    func insertsObjects(of entity: String) -> Bool {
+        switch self {
+        case .all: true
+        case .catchingUp(let keys): keys.contains(entity)
+        }
+    }
+}
+
 extension SDSSynchronizer {
     
     /// - Parameter refreshingSharedZones: Whether the shared zones have to be refreshed, which `synchronize()` usually did before uploading already.
     func download(refreshingSharedZones: Bool = true) async throws {
-        try await _download()
+        // Downloads skip models and keys this version doesn't synchronize, e.g. ones a newer version added, while their change
+        // tokens move on. Once more is synchronized, they are caught up on by downloading every record once more.
+        let catchUp = pendingCatchUp
+        let scope = DownloadScope.all(catchUpIsPending: catchUp != nil)
+        
+        try await _download(scope: scope)
         
         if refreshingSharedZones {
             try await refreshSharedZoneIDs()
         }
         
-        try await self._download(sharedDatabase: true)
+        try await self._download(sharedDatabase: true, scope: scope)
         
-        // Downloads skip models and keys this version doesn't synchronize, e.g. ones a newer version added, while their change
-        // tokens move on. Once more is synchronized, every record is downloaded once more. The change tokens are kept,
-        // as downloading from scratch doesn't include deletions, which would then be missed.
-        if let keys = keysToCatchUpOn {
-            logger.log("More models or keys are synchronized than before, downloading everything once more")
-            try await _download(fromScratch: true)
-            try await _download(sharedDatabase: true, fromScratch: true)
-            finishCatchingUp(on: keys)
+        if let catchUp, catchUp.retryDate.map({ $0 <= .now }) ?? true {
+            logger.log("More models or keys are synchronized than before, catching up on them")
+            do {
+                // The change tokens are kept, as downloading every record doesn't include deletions, which would then be missed
+                try await _download(scope: .catchingUp(on: catchUp.newKeys))
+                try await _download(sharedDatabase: true, scope: .catchingUp(on: catchUp.newKeys))
+                finishCatchUp(catchUp)
+            } catch {
+                // The synchronization itself succeeded
+                logger.log("Failed to catch up, retrying later: \(error.localizedDescription)")
+                postponeCatchUp(until: .now.addingTimeInterval(catchUpRetryDelay))
+            }
         }
     }
     
@@ -128,9 +175,12 @@ extension SDSSynchronizer {
         }
     }
     
-    /// - Parameter fromScratch: Whether to download every record rather than the changes since the last download, without saving the change tokens.
-    private func _download(sharedDatabase: Bool = false, fromScratch: Bool = false) async throws {
+    private func _download(sharedDatabase: Bool = false, scope: DownloadScope) async throws {
         logger.log("Starting Download of \(sharedDatabase ? "shared" : "private") database")
+        
+        // A catch-up downloads every record, rather than the changes since the last download, but only the keys it needs
+        let fromScratch = scope.isCatchingUp
+        let desiredKeys: [CKRecord.FieldKey]? = if case .catchingUp(let keys) = scope { cloudKeys(for: keys) } else { nil }
         
         var configurations: [CKRecordZone.ID : CKFetchRecordZoneChangesOperation.ZoneConfiguration] = [:]
         
@@ -138,7 +188,10 @@ extension SDSSynchronizer {
             configurations = try context.performAndWaitUnchecked {
                 let zones = try CloudKitZone.getAll()
                 return Dictionary(zones.map { savedZone in
-                    (savedZone.calculatedId, CKFetchRecordZoneChangesOperation.ZoneConfiguration(previousServerChangeToken: fromScratch ? nil : savedZone.changeToken))
+                    (savedZone.calculatedId, CKFetchRecordZoneChangesOperation.ZoneConfiguration(
+                        previousServerChangeToken: fromScratch ? nil : savedZone.changeToken,
+                        desiredKeys: desiredKeys
+                    ))
                 }, uniquingKeysWith: { $1 })
             }
             
@@ -148,7 +201,7 @@ extension SDSSynchronizer {
             }
         } else {
             let token = fromScratch ? nil : accessState(\.changeToken)
-            let options = CKFetchRecordZoneChangesOperation.ZoneConfiguration(previousServerChangeToken: token)
+            let options = CKFetchRecordZoneChangesOperation.ZoneConfiguration(previousServerChangeToken: token, desiredKeys: desiredKeys)
             
             configurations = [defaultZoneID: options]
         }
@@ -160,7 +213,7 @@ extension SDSSynchronizer {
         operation.fetchAllChanges = true
         
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let handler = CKDownloadHandler(synchronizer: self, forSharedDatabase: sharedDatabase, savesChangeTokens: !fromScratch) { [weak self] error in
+            let handler = CKDownloadHandler(synchronizer: self, forSharedDatabase: sharedDatabase, scope: scope) { [weak self] error in
                 guard let self else { return }
                 
                 if let error = error {
@@ -191,6 +244,20 @@ extension SDSSynchronizer {
     }
 }
 
+extension SDSSynchronizer {
+    /// The record keys of models and keys given as entity names and `Entity.key`. Records store keys under their renaming identifier.
+    fileprivate func cloudKeys(for keys: Set<String>) -> [CKRecord.FieldKey] {
+        guard let model = observedStore?.managedObjectModel, let configuration else { return [] }
+        
+        return keys.flatMap { key -> [CKRecord.FieldKey] in
+            let parts = key.split(separator: ".", maxSplits: 1).map(String.init)
+            guard let entity = model.entitiesByName[parts[0]] else { return [] }
+            let propertyNames = parts.count == 2 ? [parts[1]] : configuration.entities[parts[0]]?.syncedProperties ?? []
+            return propertyNames.map { entity.propertiesByName[$0]?.renamingIdentifier ?? $0 }
+        }
+    }
+}
+
 private final class CKDownloadHandler {
     
     var recordsToAddLater: [CKRecord] = []
@@ -204,16 +271,20 @@ private final class CKDownloadHandler {
     /// Keeps a record from being stored incompletely. The download is discarded, so the record is downloaded again.
     private var applyError: (any Error)?
     let isForSharedDatabase: Bool
-    /// Whether the change tokens are saved, which a download from scratch doesn't do, as it doesn't include deletions.
-    let savesChangeTokens: Bool
+    /// The models and keys that are stored.
+    let scope: DownloadScope
+    /// Whether the change tokens are saved, which a catch-up doesn't do, as it doesn't include deletions.
+    var savesChangeTokens: Bool { !scope.isCatchingUp }
+    /// Zones whose change tokens aren't saved, as their records with missing references are downloaded again later.
+    private var zonesWithHeldRecords: Set<CKRecordZone.ID> = []
     let completionHandler: (Error?) -> Void
     
-    init(synchronizer: SDSSynchronizer, forSharedDatabase: Bool, savesChangeTokens: Bool, completionHandler: @escaping (Error?) -> Void) {
+    init(synchronizer: SDSSynchronizer, forSharedDatabase: Bool, scope: DownloadScope, completionHandler: @escaping (Error?) -> Void) {
         self.synchronizer = synchronizer
         self.context = synchronizer.observedUpdateContext
         
         self.isForSharedDatabase = forSharedDatabase
-        self.savesChangeTokens = savesChangeTokens
+        self.scope = scope
         self.completionHandler = completionHandler
     }
     
@@ -249,14 +320,24 @@ private final class CKDownloadHandler {
             synchronizer.logger.error("Skipping record of unknown type `\(record.recordType, privacy: .public)`")
             return
         }
+        guard scope.includes(entity: record.recordType) else { return }
         
         // Make sure dependent objects exist, and prefill all values if they do
-        guard let kVPs = self.valuesIfAllReferencesExist(for: record, entity: entity) else {
+        guard var kVPs = self.valuesIfAllReferencesExist(for: record, entity: entity) else {
             self.recordsToAddLater.append(record)
             return
         }
+        
+        let insertsObject = scope.insertsObjects(of: record.recordType)
+        if scope.isCatchingUp {
+            // Every record is downloaded, rather than the ones that changed since. Local changes that weren't uploaded yet
+            // must not be overwritten with their older values.
+            let pendingKeys = synchronizer.pendingChangedKeys(of: record.recordID.recordName)
+            kVPs = kVPs.filter { rawKey, _ in !pendingKeys.contains(findCorrespondingKey(entity: entity, rawKey: rawKey)) }
+            guard !kVPs.isEmpty || insertsObject else { return }
+        }
 
-        guard let container = retrieveObject(for: record, preliminaryUpdateHandler: { container in
+        guard let container = retrieveObject(for: record, insertingIfMissing: insertsObject, preliminaryUpdateHandler: { container in
             guard let container else { return }
 
             let object = container.object
@@ -329,7 +410,7 @@ private final class CKDownloadHandler {
             synchronizer.logger.log("Object updated: \(object)")
         }) else { return }
 
-        if let reference = record.parent {
+        if let reference = record.parent, container.parentKey.map({ scope.includes(entity: record.recordType, key: $0) }) ?? true {
             // This is the receiving end fix for the problem a few lines above.
             objectsToEnsureParentReferencesFor.append((container, reference))
         }
@@ -356,8 +437,12 @@ private final class CKDownloadHandler {
         let isKnownKey = { (key: String) in
             entity.propertiesByName[key] != nil || entity.properties.contains { $0.renamingIdentifier == key }
         }
+        // Keys outside of the download's scope are stored by another download, so their references don't have to exist yet
+        let isInScope = { (key: String) in
+            self.scope.includes(entity: entity.name ?? "", key: self.findCorrespondingKey(entity: entity, rawKey: key))
+        }
         
-        for key in record.allKeys() where key != SDSSynchronizer.Constants.parentWorkaroundKey && isKnownKey(key) {
+        for key in record.allKeys() where key != SDSSynchronizer.Constants.parentWorkaroundKey && isKnownKey(key) && isInScope(key) {
             let value = record[key]
             
             if let reference = value as? CKRecord.Reference {
@@ -398,7 +483,18 @@ private final class CKDownloadHandler {
         }
     }
     
-    private func retrieveObject(for record: CKRecord, preliminaryUpdateHandler: (SDSSynchronizableContainer?) -> Void) -> SDSSynchronizableContainer? {
+    private func retrieveObject(
+        for record: CKRecord,
+        insertingIfMissing: Bool,
+        preliminaryUpdateHandler: (SDSSynchronizableContainer?) -> Void
+    ) -> SDSSynchronizableContainer? {
+        guard insertingIfMissing else {
+            // An object with only some of its keys would be incomplete
+            let container = findObject(for: record.recordID)
+            preliminaryUpdateHandler(container)
+            return container
+        }
+        
         do {
             return try synchronizer.retrieve(
                 for: record.recordID.recordName,
@@ -490,6 +586,14 @@ private final class CKDownloadHandler {
             } else if fetchFailed {
                 // The change token was not advanced past these records, so the next download fetches them again
                 synchronizer.logger.log("Fetch failed with \(unresolvedRecords.count) unresolved records, retrying them with the next download")
+            } else if !savesChangeTokens {
+                // A catch-up downloads every record, also ones whose references were deleted long ago. They stay as they are.
+                synchronizer.logger.log("Leaving \(unresolvedRecords.count) records with unresolved references alone while catching up")
+            } else if case .all(catchUpIsPending: true) = scope {
+                // They might reference records of newly synchronized models, which only the pending catch-up downloads.
+                // The change token isn't saved, so they are downloaded again.
+                synchronizer.logger.log("Retrying \(unresolvedRecords.count) unresolved records once newly synchronized models are caught up on")
+                zonesWithHeldRecords.insert(zoneID)
             } else if applyError != nil {
                 // Their references might only be missing because they couldn't be read, and the download is discarded
                 synchronizer.logger.log("Failed to apply records, retrying \(unresolvedRecords.count) unresolved records with the next download")
@@ -505,7 +609,7 @@ private final class CKDownloadHandler {
         
         // Records that still wait for their references were received before this token.
         // If the token was saved and the fetch failed before the references arrived, they would never be fetched again.
-        if let changeToken = changeToken, savesChangeTokens, !recordsToAddLater.contains(where: { isRecord($0, in: zoneID) }) {
+        if let changeToken = changeToken, savesChangeTokens, !zonesWithHeldRecords.contains(zoneID), !recordsToAddLater.contains(where: { isRecord($0, in: zoneID) }) {
             if isForSharedDatabase {
                 tokensToUpdate[zoneID] = changeToken
             } else {

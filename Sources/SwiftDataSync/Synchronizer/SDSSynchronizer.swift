@@ -70,8 +70,8 @@ public final class SDSSynchronizer: Sendable {
         /// IDs of deleted objects aren't reused, so they are kept.
         var deletionsBySynchronizer: Set<NSManagedObjectID> = []
         
-        /// The synchronized models and keys, if more are synchronized than when everything was downloaded last.
-        var keysToCatchUpOn: Set<String>?
+        /// Models and keys that still have to be caught up on.
+        var catchUp: CatchUp?
         
         /// Keys of objects that were changed in a context but not saved yet.
         var unsavedChanges: [UnsavedChangeKey: Set<String>] = [:]
@@ -403,10 +403,20 @@ public final class SDSSynchronizer: Sendable {
         }
     }
     
+    /// Models and keys that are synchronized now, but weren't when everything was downloaded last.
+    struct CatchUp: Sendable {
+        /// What is synchronized now, stored once the catch-up succeeded.
+        let keys: Set<String>
+        /// Entity names, and keys as `Entity.key`.
+        let newKeys: Set<String>
+        /// After a failure, the catch-up waits until then, as it downloads every record.
+        var retryDate: Date?
+    }
+    
     /// Downloads skip models and keys this version of the app doesn't synchronize, e.g. ones a newer version added, while their
-    /// change tokens move on. Once more is synchronized, everything is downloaded once more, see `download(refreshingSharedZones:)`.
+    /// change tokens move on. Once more is synchronized, they are caught up on, see `download(refreshingSharedZones:)`.
     ///
-    /// What was synchronized when everything was downloaded last is stored next to the synchronization data,
+    /// What was synchronized when everything was caught up on last is stored next to the synchronization data,
     /// so the data model doesn't change.
     private func checkForNewlySynchronizedKeys(_ configuration: SDSInternalConfiguration) {
         let keys = Set(configuration.entities.flatMap { name, entity in
@@ -416,22 +426,16 @@ public final class SDSSynchronizer: Sendable {
             .flatMap { try? Data(contentsOf: $0) }
             .flatMap { try? JSONDecoder().decode(Set<String>.self, from: $0) }
         
-        if let previousKeys, keys.isSubset(of: previousKeys) {
-            // Nothing was skipped that is synchronized now
+        // Without stored keys, e.g. on the first launch of a version that stores them, what was skipped before is unknown.
+        // Catching up on every key would overwrite local changes with older values, so only later additions are caught up on.
+        guard let previousKeys, !keys.isSubset(of: previousKeys) else {
             if keys != previousKeys {
                 storeSynchronizedKeys(keys)
             }
             return
         }
         
-        // Without stored keys, a device that synchronized before could have skipped keys, as earlier versions did that too.
-        // One that never synchronized downloads everything anyway.
-        if previousKeys == nil, !accessState({ $0.changeToken != nil }) {
-            storeSynchronizedKeys(keys)
-            return
-        }
-        
-        mutableState.withLock { $0.keysToCatchUpOn = keys }
+        mutableState.withLock { $0.catchUp = CatchUp(keys: keys, newKeys: keys.subtracting(previousKeys)) }
     }
     
     private var synchronizedKeysURL: URL? {
@@ -447,15 +451,26 @@ public final class SDSSynchronizer: Sendable {
         }
     }
     
-    /// The synchronized models and keys, if more are synchronized than when everything was downloaded last.
-    var keysToCatchUpOn: Set<String>? {
-        mutableState.withLock { $0.keysToCatchUpOn }
+    /// Models and keys that still have to be caught up on.
+    var pendingCatchUp: CatchUp? {
+        mutableState.withLock { $0.catchUp }
     }
     
-    /// Called once everything was downloaded with `keys` synchronized.
-    func finishCatchingUp(on keys: Set<String>) {
-        storeSynchronizedKeys(keys)
-        mutableState.withLock { $0.keysToCatchUpOn = nil }
+    func finishCatchUp(_ catchUp: CatchUp) {
+        storeSynchronizedKeys(catchUp.keys)
+        mutableState.withLock { $0.catchUp = nil }
+    }
+    
+    func postponeCatchUp(until date: Date) {
+        mutableState.withLock { $0.catchUp?.retryDate = date }
+    }
+    
+    /// The keys of a record that changed locally and weren't uploaded yet.
+    func pendingChangedKeys(of id: String) -> Set<String> {
+        let context = self.context
+        return context.performAndWait {
+            Set(CloudKitUpdate.find(for: id)?.changedKeys ?? [])
+        }
     }
     
     // MARK: - Helper Functions
