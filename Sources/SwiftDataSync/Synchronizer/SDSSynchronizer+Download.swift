@@ -72,6 +72,14 @@ extension SDSSynchronizer {
                 // The synchronization itself succeeded
                 logger.log("Failed to catch up, retrying later: \(error.localizedDescription)")
                 postponeCatchUp(until: .now.addingTimeInterval(catchUpRetryDelay))
+                
+                // Nothing else might start a synchronization by then
+                startTask(at: \.catchUpRetry) {
+                    try? await Task.sleep(for: .seconds(catchUpRetryDelay))
+                    
+                    self.finishTask(at: \.catchUpRetry)
+                    self.startSync()
+                }
             }
         }
     }
