@@ -133,7 +133,21 @@ extension SDSSynchronizableContainer {
         
         return nil
     }
-    
+
+    /// The URI of the object ID of the root, which decides the record's zone like in `sharedZoneId`, if it can be shared and was saved.
+    /// Has to be called on the queue of the object's context, while the zone is looked up on the synchronizer's, see `SDSObjectChange`.
+    var sharableRootLocalId: String? {
+        var root: SDSSynchronizableContainer = self
+
+        while let newParent = root.parent?.synchronizableContainer {
+            root = newParent
+        }
+
+        // A root that wasn't saved yet isn't shared. The app's contexts have no downloaded objects without saved ones.
+        guard root is SDSSharableContainer, !root.object.objectID.isTemporaryID else { return nil }
+        return root.object.objectID.uriRepresentation().absoluteString
+    }
+
     var zoneId: CKRecordZone.ID {
         sharedZoneId ?? SDSSynchronizer.shared.defaultZoneID
     }

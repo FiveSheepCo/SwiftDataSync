@@ -2,11 +2,13 @@ import Foundation
 import CoreData
 import CloudKit
 
-/// A change of a synchronizable object. It's read on the queue of the object's context, so it can be handled anywhere.
+/// A change of a saved synchronizable object. It's read on the queue of the object's context, so it can be handled anywhere.
+/// Its record id and zone are looked up later, on the synchronizer's queue, see `setUpdates(for:)`.
 struct SDSObjectChange: Sendable {
-    let objectId: NSManagedObjectID
-    let id: String
-    let zoneId: CKRecordZone.ID?
+    /// The URI of the object's ID.
+    let localId: String
+    /// See `SDSSynchronizableContainer.sharableRootLocalId`.
+    let sharableRootLocalId: String?
     let entityName: String
     let changedKeys: [String]
 }
@@ -87,7 +89,12 @@ extension SDSSynchronizer {
         let savedChanges = takeKeysBeingSaved(by: savingContext)
         let updatedChanges = updatedObjects.compactMap { object -> SDSObjectChange? in
             guard let keys = savedChanges[object.objectID], let container = object.synchronizableContainer else { return nil }
-            return SDSObjectChange(objectId: object.objectID, id: container.id, zoneId: container.sharedZoneId, entityName: object.entity.name!, changedKeys: Array(keys))
+            return SDSObjectChange(
+                localId: object.objectID.uriRepresentation().absoluteString,
+                sharableRootLocalId: container.sharableRootLocalId,
+                entityName: object.entity.name!,
+                changedKeys: Array(keys)
+            )
         }
         
         let insertedObjects = (userInfo[NSInsertedObjectsKey] as? NSSet ?? []).compactMap(onlyIfSyncronizable)
@@ -158,37 +165,67 @@ extension SDSSynchronizer {
             
             // Make sure there are keys that have changed
             guard !keysToSync.isEmpty else { return nil }
-            
+
+            // Callers only pass saved objects. Others don't have a record yet, see `contextChanged`.
+            guard !updated.object.objectID.isTemporaryID else { return nil }
+
             let entityName = updated.object.entity.name!
-            
-            return SDSObjectChange(objectId: updated.object.objectID, id: updated.id, zoneId: updated.sharedZoneId, entityName: entityName, changedKeys: keysToSync)
+
+            return SDSObjectChange(
+                localId: updated.object.objectID.uriRepresentation().absoluteString,
+                sharableRootLocalId: updated.sharableRootLocalId,
+                entityName: entityName,
+                changedKeys: keysToSync
+            )
         }
     }
-    
+
     /// Stores the changes at once, so an upload never selects some of them without the others.
+    ///
+    /// They're stored without waiting for `context`, as notifications are often handled on the main thread, which must never wait for it.
+    /// Blocks run on its queue in order, so anything that reads the changes on its queue afterwards finds them.
     func setUpdates(for changes: [SDSObjectChange]) {
+        guard !changes.isEmpty else { return }
+
         let context = self.context
-        context.performAndWait {
+        context.perform {
             for change in changes {
-                setUpdate(id: change.id, zoneId: change.zoneId, entityName: change.entityName, changedKeys: change.changedKeys)
+                self.setUpdate(
+                    id: self.recordId(forLocalId: change.localId),
+                    zoneId: self.sharedZoneId(forRootLocalId: change.sharableRootLocalId),
+                    entityName: change.entityName,
+                    changedKeys: change.changedKeys
+                )
             }
         }
     }
-    
+
+    /// Stores the removals without waiting for `context`, like `setUpdates(for:)`. Has to be called on the queue of the objects' context.
     func handleDeletedObjects(_ objects: [SDSSynchronizableContainer]) {
-        for delete in objects {
-            // Delete the share if neccesary
-            let id = delete.id
-            // Read before the share is deleted, which would send the removal to the private database
-            let zoneId = delete.sharedZoneId
-            if delete is SDSSharableContainer {
-                let context = self.context
-                context.perform {
+        // Callers only pass saved objects, see `contextChanged`
+        let deletions = objects.filter { !$0.object.objectID.isTemporaryID }.map { delete in
+            (
+                localId: delete.object.objectID.uriRepresentation().absoluteString,
+                sharableRootLocalId: delete.sharableRootLocalId,
+                isSharable: delete is SDSSharableContainer
+            )
+        }
+        guard !deletions.isEmpty else { return }
+
+        let context = self.context
+        context.perform {
+            for deletion in deletions {
+                let id = self.recordId(forLocalId: deletion.localId)
+                // Read before the share is deleted, which would send the removal to the private database
+                let zoneId = self.sharedZoneId(forRootLocalId: deletion.sharableRootLocalId)
+
+                // Delete the share if neccesary
+                if deletion.isSharable {
                     CloudKitShare.updateShare(nil, for: id, context: context)
                 }
+
+                self.setRemoval(id: id, zoneId: zoneId)
             }
-            
-            setRemoval(id: id, zoneId: zoneId)
         }
     }
 }

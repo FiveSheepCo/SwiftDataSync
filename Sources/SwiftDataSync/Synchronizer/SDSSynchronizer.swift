@@ -44,6 +44,10 @@ public final class SDSSynchronizer: Sendable {
     // MARK: - Properties
     
     let container: NSPersistentContainer
+    /// The context of the synchronization data.
+    ///
+    /// The main thread must never wait for it, or for `observedUpdateContext`: their saves post `NSManagedObjectContextDidSave` on their queues,
+    /// and an app observing it with `queue: .main` makes the save wait for the main thread, so both would wait for each other.
     let context: NSManagedObjectContext
     
     /// State that is set during setup or changes while synchronizing.
