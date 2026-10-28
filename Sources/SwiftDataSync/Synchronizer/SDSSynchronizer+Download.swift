@@ -80,7 +80,13 @@ extension SDSSynchronizer {
                     self.finishTask(at: \.catchUpRetry)
                     self.startSync()
                 }
+                return
             }
+
+            // Records were held back if they reference records only the catch-up downloaded.
+            // Their zones' change tokens weren't saved, so they are downloaded again now.
+            try await _download(scope: .all(catchUpIsPending: false))
+            try await _download(sharedDatabase: true, scope: .all(catchUpIsPending: false))
         }
     }
     
