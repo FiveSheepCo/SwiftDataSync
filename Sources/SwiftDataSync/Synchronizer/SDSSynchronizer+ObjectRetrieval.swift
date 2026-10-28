@@ -1,7 +1,28 @@
 import Foundation
 import CoreData
+import CloudKit
 
 extension SDSSynchronizer {
+    /// The record id of a saved object, given by the URI of its object ID. An object without one gets one.
+    /// Has to be called on `context`'s queue.
+    func recordId(forLocalId localId: String) -> String {
+        (
+            CloudKitLocalEntity.entry(forLocalId: localId, in: context) ??
+            CloudKitLocalEntity(id: UUID().uuidString, localId: localId, context: context)
+        ).id
+    }
+
+    /// The zone of a record whose root is shared by someone else, like `SDSSynchronizableContainer.sharedZoneId`.
+    /// The root is given by the URI of its object ID. Has to be called on `context`'s queue.
+    func sharedZoneId(forRootLocalId rootLocalId: String?) -> CKRecordZone.ID? {
+        guard
+            let rootLocalId,
+            let share = CloudKitShare.share(for: recordId(forLocalId: rootLocalId), in: context),
+            share.isSharedByOtherUser
+        else { return nil }
+        return share.recordID.zoneID
+    }
+
     /// Has to be called on `context`'s queue.
     func existingLocalEntity(for id: String) -> CloudKitLocalEntity? {
         try? fetchLocalEntity(for: id)
@@ -106,15 +127,7 @@ extension SDSSynchronizer {
             let context = self.context
             return context.performAndWaitUnchecked {
                 if let objectId {
-                    let id = (
-                        CloudKitLocalEntity.entry(forLocalId: objectId, in: context) ??
-                        CloudKitLocalEntity(
-                            id: UUID().uuidString,
-                            localId: objectId,
-                            context: context
-                        )
-                    ).id
-                    return id
+                    return self.recordId(forLocalId: objectId)
                 } else {
                     if let cached = self.temporaryObjectContainers[object] {
                         return cached.id
