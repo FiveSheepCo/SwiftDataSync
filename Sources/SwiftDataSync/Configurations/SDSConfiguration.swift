@@ -14,7 +14,11 @@ public struct SDSConfiguration: Sendable {
             case noSync
             
             /// Indicates synchronization with specified properties.
-            case sync(PropertiesSync, assetProperties: [String] = [], parentKey: String? = nil, isSharable: Bool = false)
+            ///
+            /// `identity` names attributes that identify a model on every device, e.g. a link that models created
+            /// independently on several devices share. Their records are named after these values instead of randomly,
+            /// so such models become one record instead of duplicates. See ``SDSConfiguration/Entity/sync(_:assetProperties:parentKey:isSharable:identity:)``.
+            case sync(PropertiesSync, assetProperties: [String] = [], parentKey: String? = nil, isSharable: Bool = false, identity: [String] = [])
             
             /// Description of properties synchronization settings.
             public enum PropertiesSync: Sendable {
@@ -71,7 +75,18 @@ public struct SDSConfiguration: Sendable {
         case noSync
         
         /// Indicates synchronization with specified properties.
-        case sync(PropertiesSync, assetProperties: [String] = [], parentKey: String? = nil, isSharable: Bool = false)
+        ///
+        /// `identity` names synchronized attributes (not relationships) whose values identify a model on every device.
+        /// Without it, every model gets a random record name, so models that several devices create for the same thing
+        /// become duplicate records. With it:
+        /// - The record is named `<Entity>.<SHA-256 of the values>`, the same on every device.
+        /// - A downloaded record whose name isn't known yet is matched to a local model with the same values, which is
+        ///   updated instead of inserting another one.
+        /// - Uploading a record that another device created already updates it with the changed keys.
+        /// - Changing an identity value deletes the record of the old values and uploads the model as a new record.
+        ///
+        /// Models with an identity can't be shared, as their records have to be in the private database.
+        case sync(PropertiesSync, assetProperties: [String] = [], parentKey: String? = nil, isSharable: Bool = false, identity: [String] = [])
     }
     
     /// Dictionary containing entity descriptions keyed by entity names.
@@ -86,12 +101,13 @@ public struct SDSConfiguration: Sendable {
             entityDescriptions[String(describing: entity.entity)] = switch entity.description {
             case .noSync:
                 .noSync
-            case .sync(let propertiesSync, let assetProperties, let parentKey, let isSharable):
+            case .sync(let propertiesSync, let assetProperties, let parentKey, let isSharable, let identity):
                 .sync(
                     propertiesSync.raw,
                     assetProperties: assetProperties,
                     parentKey: parentKey,
-                    isSharable: isSharable
+                    isSharable: isSharable,
+                    identity: identity
                 )
             }
         }

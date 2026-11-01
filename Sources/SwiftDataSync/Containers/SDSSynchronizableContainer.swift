@@ -63,52 +63,41 @@ extension SDSSynchronizableContainer {
         .init(recordID: recordId, action: .none)
     }
     
-    private func jsonData(for object: Any) -> Data? {
-        do {
-            return try JSONSerialization.data(withJSONObject: object)
-        }
-        catch {
-            SDSSynchronizer.shared.logger.log("Failed to provide json data: \(error.localizedDescription)")
-        }
-        return nil
-    }
-    
     /// Throws if an asset can't be prepared, e.g. while the disk is full.
+    /// Values records can't store are left out with a logged error, see `SDSValueCoding`.
     func changeDictionary(for keys: [String]) throws -> [String: CKRecordValue?] {
         try keys.reduce(into: [:]) { result, key in
             let value = object.value(forKey: key)
-            
+
             let cloudValue: CKRecordValue?
             if let referenceObjectContainer = (value as? NSManagedObject)?.synchronizableContainer {
                 cloudValue = referenceObjectContainer.cloudReference
-            } else if let referenceObjectList = value as? NSOrderedSet, referenceObjectList.count > 0 {
-                cloudValue = (referenceObjectList.array as! [NSManagedObject]).compactMap { synchronizable in
+            } else if let referenceObjectList = value as? NSOrderedSet {
+                // Records leave out empty lists, so an empty relationship is stored as no value
+                cloudValue = referenceObjectList.count == 0 ? nil : (referenceObjectList.array as! [NSManagedObject]).compactMap { synchronizable in
                     synchronizable.synchronizableContainer?.cloudReference
                 } as CKRecordValue
-            } else if value is NSSet {
-                fatalError("An unordered NSSet should use the reverse relationship. Found at \(object.entity.name!).\(key). If this is a many-to-many relationship, these are not currently supported. Please add an intermediary model.")
-            } else if value == nil {
+            } else if let set = value as? NSSet {
+                guard set.count == 0 else {
+                    SDSValueCoding.logger.error("Leaving out `\(self.object.entity.name ?? "", privacy: .public)`.`\(key, privacy: .public)`: An unordered relationship should be synchronized through its inverse relationship. Many-to-many relationships aren't supported, please add an intermediary model.")
+                    return
+                }
                 cloudValue = nil
-            } else
-                if let transformerName = (object.entity.propertiesByName[key] as? NSAttributeDescription)?.valueTransformerName
-            {
-                let transformer = ValueTransformer(forName: .init(transformerName))!
-                cloudValue = transformer.transformedValue(value) as? any CKRecordValue
-            } else if let data = value as? Data, self.assetKeys.contains(key) {
-                cloudValue = try CKAsset(data: data)
-            } else if let recordValue = value as? CKRecordValue {
-                cloudValue = recordValue
-            } else if
-                JSONSerialization.isValidJSONObject(value as Any),
-                let data = jsonData(for: value as Any)
-            {
-                cloudValue = data as any CKRecordValue
-            } else if let url = value as? URL {
-                cloudValue = url.absoluteString as any CKRecordValue
+            } else if let value {
+                if let data = value as? Data, self.assetKeys.contains(key) {
+                    cloudValue = try CKAsset(data: data)
+                } else {
+                    do {
+                        cloudValue = try SDSValueCoding.cloudValue(for: value, attribute: object.entity.attributesByName[key])
+                    } catch {
+                        SDSValueCoding.logger.error("Leaving out `\(self.object.entity.name ?? "", privacy: .public)`.`\(key, privacy: .public)`: \(String(describing: error), privacy: .public)")
+                        return
+                    }
+                }
             } else {
-                fatalError("`\(self.object.entity.name ?? "")`.`\(key)` is not a valid CKRecordValue or JSON object: \(String(describing: value)) \(String(describing: (object.entity.propertiesByName[key] as? NSAttributeDescription)?.type.rawValue.rawValue))")
+                cloudValue = nil
             }
-            
+
             result[self.object.entity.propertiesByName[key]?.renamingIdentifier ?? key] = cloudValue
         }
     }

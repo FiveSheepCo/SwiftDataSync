@@ -231,6 +231,16 @@
         }
       }
     },
+    "sync.state.stopped" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Synchronization is turned off"
+          }
+        }
+      }
+    },
     "sync.state.synchronizing" : {
       "localizations" : {
         "en" : {

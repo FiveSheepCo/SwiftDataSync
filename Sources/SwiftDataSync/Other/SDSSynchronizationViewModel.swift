@@ -22,11 +22,14 @@ public final class SDSSynchronizationViewModel {
         
         case notLoggedIntoIcloud
         case error(Error)
+
+        /// Synchronizing was stopped with `SDSSynchronizer.stop()`.
+        case stopped
     }
-    
+
     // MARK: Properties
-    
-    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "SDSSynchronizationViewModel")
+
+    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "SwiftDataSync", category: "SDSSynchronizationViewModel")
     
     public private(set) var lastStateChange: Date = .now
     public private(set) var state: State = .waitingForSetup
@@ -39,7 +42,10 @@ public final class SDSSynchronizationViewModel {
     
     @ObservationIgnored
     private var syncWasRequestedWhileSavingShare = false
-    
+
+    @ObservationIgnored
+    private var syncWasRequestedWhileSyncing = false
+
     public var isSavingShare: Bool {
         if case .savingShare = state {
             return true
@@ -74,11 +80,28 @@ public final class SDSSynchronizationViewModel {
             // Nothing else starts it once the share is saved
             syncWasRequestedWhileSavingShare = true
             return false
+        case .bootstrapping, .uploading, .downloading:
+            // The running synchronization might not include what it was requested for, e.g. a push for a change that was
+            // uploaded after its download began, so another one follows, see `takeSyncRequestedWhileSyncing()`
+            syncWasRequestedWhileSyncing = true
+            return false
         default: return false
         }
-        
+
         self.set(state: .bootstrapping)
         return true
+    }
+
+    /// Returns whether a synchronization was requested while one was running, and forgets it.
+    func takeSyncRequestedWhileSyncing() -> Bool {
+        defer { syncWasRequestedWhileSyncing = false }
+        return syncWasRequestedWhileSyncing
+    }
+
+    /// Ends the `.stopped` state once synchronizing starts again.
+    func endStop() {
+        guard case .stopped = state else { return }
+        set(state: .idle)
     }
     
     /// A state and when it was set, so it can be restored after another operation.
@@ -98,14 +121,17 @@ public final class SDSSynchronizationViewModel {
     }
     
     func restore(_ snapshot: StateSnapshot) {
+        // Synchronizing was stopped meanwhile, which stays visible
+        if case .stopped = state { return }
+
         logger.log("Restored State: \(String(describing: snapshot.state), privacy: .public)")
         self.state = snapshot.state
         self.lastStateChange = snapshot.lastStateChange
     }
-    
+
     private var isSettable: Bool {
         switch state {
-        case .idle, .error, .waitingForNetwork, .notLoggedIntoIcloud: true
+        case .idle, .error, .waitingForNetwork, .notLoggedIntoIcloud, .stopped: true
         default: false
         }
     }
