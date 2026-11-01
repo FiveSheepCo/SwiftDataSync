@@ -72,6 +72,8 @@ private struct _Footer<T: View>: View {
                     Text("sync.state.processing", bundle: .module)
                 case .savingShare:
                     Text("sync.state.savingShare", bundle: .module)
+                case .stopped:
+                    Text("sync.state.stopped", bundle: .module)
             }
             Text("sync.updatesToSend \(model.updatesToSend)", bundle: .module)
         }

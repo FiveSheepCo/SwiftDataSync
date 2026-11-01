@@ -156,13 +156,17 @@ extension SDSSynchronizer {
     
     /// Runs `work` while no synchronization is running, in this process or another one using the same synchronization data.
     ///
-    /// A running download keeps unsaved placeholders in the synchronization contexts, which must not be saved or rolled back
-    /// by anything else. Persisted placeholders crash every later lookup of their records.
-    /// Another process's upload could also still read metadata that `work` removes.
+    /// A running download keeps the objects it inserted unsaved in the observed update context, which must not be saved or
+    /// rolled back by anything else. Another process's upload could also still read metadata that `work` removes.
     ///
     /// The previous state is restored afterwards, so e.g. an error's retry delay or a missing iCloud account isn't forgotten.
     /// A synchronization requested in the meantime is started afterwards.
     private func whileSyncIsIdle<T>(_ work: () async throws -> T) async throws -> T {
+        // Without its data, which couldn't be loaded, the synchronizer isn't set up, and using its context would raise exceptions
+        guard isSyncDataLoaded else {
+            throw SDSSyncError(title: "error.noObservedContext")
+        }
+
         let previousState = try await viewModel.waitForIdle(setting: .savingShare)
         
         let result: Result<T, Error>

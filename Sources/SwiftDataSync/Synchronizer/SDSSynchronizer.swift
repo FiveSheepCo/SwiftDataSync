@@ -37,7 +37,7 @@ public final class SDSSynchronizer: Sendable {
         static let parentWorkaroundKey = "parentWorkaround"
     }
     
-    let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "SDSSynchronizer")
+    let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "SwiftDataSync", category: "SDSSynchronizer")
     
     let viewModel: SDSSynchronizationViewModel
     
@@ -58,7 +58,11 @@ public final class SDSSynchronizer: Sendable {
         var configuration: SDSInternalConfiguration?
         /// Whether local changes of the observed store are tracked, which isn't the case if setting up failed.
         var isObservingStore = false
-        
+        /// Whether `setup` was called, which must only happen once.
+        var isSetUp = false
+        /// Whether synchronizing was stopped with `stop()`.
+        var isStopped = false
+
         var defaultZoneID: CKRecordZone.ID?
         var cloudContainer: CKContainer?
         var cloudPrivateDatabase: CKDatabase?
@@ -80,11 +84,20 @@ public final class SDSSynchronizer: Sendable {
         /// The synchronized keys a context is saving to the store, by object. Read when the save starts, and taken when it's done.
         var keysBeingSaved: [ObjectIdentifier: [NSManagedObjectID: Set<String>]] = [:]
         
+        /// Records of entities with an identity that another device saved first, by name. Their next upload saves the
+        /// changed keys over them, see `takeServerRecordOfConflict(named:)`.
+        var serverRecordsOfConflicts: [String: CKRecord] = [:]
+
+        /// Records CloudKit rejected, which aren't uploaded for a while.
+        var quarantine = SDSRecordQuarantine()
+
         fileprivate var containerFinder: _ContainerFinder?
-        
+
         var routineSync: Task<Void, Never>?
         var catchUpRetry: Task<Void, Never>?
         var syncLeaseRetry: Task<Void, Never>?
+        /// Saves the synchronization data and synchronizes shortly after the observed store was saved, see `contextSaved`.
+        var saveSync: Task<Void, Never>?
     }
     private let mutableState = OSAllocatedUnfairLock(initialState: MutableState())
     
@@ -92,7 +105,8 @@ public final class SDSSynchronizer: Sendable {
     var observedUpdateContext: NSManagedObjectContext? { mutableState.withLock { $0.observedUpdateContext } }
     var configuration: SDSInternalConfiguration? { mutableState.withLock { $0.configuration } }
     var isObservingStore: Bool { mutableState.withLock { $0.isObservingStore } }
-    
+    var isStopped: Bool { mutableState.withLock { $0.isStopped } }
+
     var defaultZoneID: CKRecordZone.ID! { mutableState.withLock { $0.defaultZoneID } }
     var cloudContainer: CKContainer! { mutableState.withLock { $0.cloudContainer } }
     var cloudPrivateDatabase: CKDatabase! { mutableState.withLock { $0.cloudPrivateDatabase } }
@@ -163,6 +177,15 @@ public final class SDSSynchronizer: Sendable {
         mutableState.withLock { $0.keysBeingSaved.removeValue(forKey: ObjectIdentifier(context)) ?? [:] }
     }
     
+    func rememberServerRecordsOfConflicts(_ records: [String: CKRecord]) {
+        mutableState.withLock { $0.serverRecordsOfConflicts.merge(records) { $1 } }
+    }
+    
+    /// The record another device saved first under this name, which is only used once.
+    func takeServerRecordOfConflict(named name: String) -> CKRecord? {
+        mutableState.withLock { $0.serverRecordsOfConflicts.removeValue(forKey: name) }
+    }
+    
     func wasDeletedBySynchronizer(_ objectId: NSManagedObjectID) -> Bool {
         mutableState.withLock { $0.deletionsBySynchronizer.contains(objectId) }
     }
@@ -170,8 +193,25 @@ public final class SDSSynchronizer: Sendable {
     /// Whether a download inserted the object and gave it its record's id. Objects that weren't saved yet otherwise have no id.
     func isDownloadedObject(_ object: NSManagedObject) -> Bool {
         context.performAndWaitUnchecked {
-            temporaryObjectContainers[object] != nil
+            temporaryObjectIds[object] != nil
         }
+    }
+
+    /// Whether a record CloudKit rejected isn't uploaded now. See `SDSRecordQuarantine`.
+    func isQuarantined(_ recordName: String, lastChangeDate: Date) -> Bool {
+        mutableState.withLock { $0.quarantine.contains(recordName, lastChangeDate: lastChangeDate) }
+    }
+
+    func quarantine(_ recordNames: [String: Date]) {
+        mutableState.withLock { state in
+            for (recordName, lastChangeDate) in recordNames {
+                state.quarantine.add(recordName, lastChangeDate: lastChangeDate)
+            }
+        }
+    }
+
+    func resetQuarantine() {
+        mutableState.withLock { $0.quarantine = SDSRecordQuarantine() }
     }
     
     /// Reads and changes the zones of recently accepted shares at once, as accepting a share can happen while synchronizing.
@@ -181,14 +221,30 @@ public final class SDSSynchronizer: Sendable {
     
     let networkMonitor = NWPathMonitor()
     
-    /// The `CloudKitLocalEntity`s for temporary objects. Only accessed on `context`'s queue, which serializes the access.
-    nonisolated(unsafe) var temporaryObjectContainers: [NSManagedObject: CloudKitLocalEntity] = [:]
-    
+    /// The record ids of objects that weren't saved yet, e.g. ones a download inserted. They get their `CloudKitLocalEntity`
+    /// once they have permanent IDs, see `CKDownloadHandler.fetchOverallCompletion`.
+    ///
+    /// They're kept out of `context`, so it can be saved at any time, e.g. right after changes were stored, without saving
+    /// entities that don't know their objects yet. Only accessed on `context`'s queue, which serializes the access.
+    nonisolated(unsafe) private(set) var temporaryObjectIds: [NSManagedObject: String] = [:]
+    /// The objects of `temporaryObjectIds` by record id.
+    nonisolated(unsafe) private var temporaryObjectsById: [String: NSManagedObject] = [:]
+
     /// Has to be called on `context`'s queue.
     func temporaryObject(for id: String) -> NSManagedObject? {
-        temporaryObjectContainers.first { (key: NSManagedObject, value: CloudKitLocalEntity) in
-            value.id == id
-        }?.key
+        temporaryObjectsById[id]
+    }
+
+    /// Has to be called on `context`'s queue.
+    func setTemporaryId(_ id: String, for object: NSManagedObject) {
+        temporaryObjectIds[object] = id
+        temporaryObjectsById[id] = object
+    }
+
+    /// Has to be called on `context`'s queue.
+    func removeAllTemporaryObjects() {
+        temporaryObjectIds = [:]
+        temporaryObjectsById = [:]
     }
     
     // MARK: - Initializer
@@ -209,13 +265,23 @@ public final class SDSSynchronizer: Sendable {
             let appGroup = Self.appGroupToStoreSyncData,
             let containerUrl = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup)
         {
-            container.persistentStoreDescriptions = [
-                .init(url: containerUrl.appendingPathComponent("CloudKitSync.sqlite"))
-            ]
+            let url = containerUrl.appendingPathComponent("CloudKitSync.sqlite")
+            Self.moveSyncData(
+                from: NSPersistentContainer.defaultDirectoryURL().appendingPathComponent("CloudKitSync.sqlite"),
+                to: url,
+                coordinator: container.persistentStoreCoordinator
+            )
+            container.persistentStoreDescriptions = [.init(url: url)]
+        } else if let appGroup = Self.appGroupToStoreSyncData {
+            Logger(subsystem: Bundle.main.bundleIdentifier ?? "SwiftDataSync", category: "SDSSynchronizer")
+                .error("The app group `\(appGroup, privacy: .public)` isn't available, is it in the app's entitlements? Storing the synchronization data in the app's container instead.")
         }
+        // E.g. while the device is locked before it was unlocked once, data protection keeps the store from being loaded.
+        // That mustn't crash the app: setting up loads it again, and doesn't synchronize if it can't, see `loadSyncData()`.
         container.loadPersistentStores(completionHandler: { (storeDescription, error) in
             if let error {
-                fatalError("Unresolved error \(error)")
+                Logger(subsystem: Bundle.main.bundleIdentifier ?? "SwiftDataSync", category: "SDSSynchronizer")
+                    .error("Failed to load the synchronization data: \(error)")
             }
         })
         self.container = container
@@ -236,6 +302,32 @@ public final class SDSSynchronizer: Sendable {
         self.networkMonitor.start(queue: .main)
     }
     
+    /// Moves the synchronization data to `url` unless something is stored there already, e.g. into the app group once an app that
+    /// synchronized before sets `appGroupToStoreSyncData`. Starting over without it would download every record again as new models.
+    static func moveSyncData(from sourceURL: URL, to url: URL, coordinator: NSPersistentStoreCoordinator) {
+        let fileManager = FileManager.default
+        guard
+            sourceURL.standardizedFileURL != url.standardizedFileURL,
+            !fileManager.fileExists(atPath: url.path),
+            fileManager.fileExists(atPath: sourceURL.path)
+        else { return }
+
+        let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "SwiftDataSync", category: "SDSSynchronizer")
+        do {
+            try coordinator.replacePersistentStore(at: url, withPersistentStoreFrom: sourceURL, type: .sqlite)
+            try coordinator.destroyPersistentStore(at: sourceURL, type: .sqlite)
+
+            // What was synchronized when everything was caught up on last, see `checkForNewlySynchronizedKeys(_:)`
+            let keysURL = sourceURL.deletingLastPathComponent().appendingPathComponent("CloudKitSync.keys.json")
+            if fileManager.fileExists(atPath: keysURL.path) {
+                try fileManager.moveItem(at: keysURL, to: url.deletingLastPathComponent().appendingPathComponent("CloudKitSync.keys.json"))
+            }
+            logger.log("Moved the synchronization data to \(url.path, privacy: .public)")
+        } catch {
+            logger.error("Failed to move the synchronization data to \(url.path, privacy: .public): \(error)")
+        }
+    }
+
     private var containerFinder: _ContainerFinder? {
         get { mutableState.withLock { $0.containerFinder } }
         set { mutableState.withLock { $0.containerFinder = newValue } }
@@ -256,8 +348,9 @@ public final class SDSSynchronizer: Sendable {
         defaultZoneID: String = "CoreData",
         adoption: (() throws -> SDSAdoption)? = nil
     ) {
+        guard markSetUp() else { return }
         setupCloudKit(containerName: containerName, defaultZoneID: defaultZoneID)
-        
+
         Task {
             await viewModel.setWaitingForContainerDetection()
         }
@@ -279,8 +372,9 @@ public final class SDSSynchronizer: Sendable {
         defaultZoneID: String = "CoreData",
         adoption: (() throws -> SDSAdoption)? = nil
     ) {
+        guard markSetUp() else { return }
         setupCloudKit(containerName: containerName, defaultZoneID: defaultZoneID)
-        
+
         self.containerFinder = .init(
             closure: modelContainer,
             completion: { [weak self] coordinator in
@@ -296,12 +390,91 @@ public final class SDSSynchronizer: Sendable {
         }
     }
     
-    /// Should be called when a remote notification was received.
+    /// Should be called when a remote notification was received. It's ignored while synchronizing is stopped.
     public func didReceiveRemoteNotification(userInfo: [AnyHashable : Any]) async {
         // TODO(later): selectively download based on the user info
         await self.forceDownloadSync()
     }
-    
+
+    /// Stops synchronizing until `start()` is called, e.g. when the app's setting for it is turned off, without relaunching the app.
+    ///
+    /// Nothing is uploaded or downloaded anymore: synchronizations that saves, pushes (`didReceiveRemoteNotification(userInfo:)`),
+    /// network changes or retries would start are skipped, and scheduled retries are cancelled. A running synchronization stops
+    /// at its next step. The state becomes `.stopped`.
+    ///
+    /// Local changes are still recorded, without contacting iCloud, so they're uploaded once synchronizing starts again.
+    public func stop() {
+        stopSynchronizing()
+
+        Task {
+            await viewModel.set(state: .stopped)
+        }
+    }
+
+    /// Stops synchronizing like `stop()`, but leaves the state as it is.
+    func stopSynchronizing() {
+        let tasks = mutableState.withLock { state in
+            state.isStopped = true
+            return [state.routineSync, state.catchUpRetry, state.syncLeaseRetry].compactMap { $0 }
+        }
+        // They clear themselves once they end
+        tasks.forEach { $0.cancel() }
+    }
+
+    /// Starts synchronizing again after `stop()`, and synchronizes right away.
+    public func start() {
+        let wasStopped = mutableState.withLock { state in
+            defer { state.isStopped = false }
+            return state.isStopped
+        }
+        guard wasStopped else { return }
+
+        Task {
+            // Unless it was never set up, or setting up failed
+            guard self.isObservingStore else { return }
+            await viewModel.endStop()
+            await synchronize()
+        }
+    }
+
+    /// Thrown when a running synchronization notices that synchronizing was stopped, see `stop()`.
+    struct StoppedError: Error {}
+
+    /// Throws if synchronizing was stopped, so a running synchronization ends at its next step.
+    func checkNotStopped() throws {
+        if isStopped {
+            throw StoppedError()
+        }
+    }
+
+    /// Marks the synchronizer as set up, and returns whether it wasn't before. It must only be set up once.
+    private func markSetUp() -> Bool {
+        let wasSetUp = mutableState.withLock { state in
+            defer { state.isSetUp = true }
+            return state.isSetUp
+        }
+        if wasSetUp {
+            logger.error("`setup` was called again, which is ignored. Use `stop()` and `start()` to turn synchronizing off and on.")
+        }
+        return !wasSetUp
+    }
+
+    /// Whether the synchronization data is loaded. It isn't if loading it failed, see `loadSyncData()`.
+    var isSyncDataLoaded: Bool {
+        !container.persistentStoreCoordinator.persistentStores.isEmpty
+    }
+
+    /// Loads the synchronization data if loading it failed before, and returns the error if it fails again.
+    private func loadSyncData() -> (any Error)? {
+        guard !isSyncDataLoaded else { return nil }
+
+        var loadError: (any Error)?
+        container.loadPersistentStores { _, error in
+            loadError = error
+        }
+        return loadError
+    }
+
     private func setupCloudKit(containerName: String, defaultZoneID: String) {
         let cloudContainer = CKContainer(identifier: containerName)
         mutableState.withLock { state in
@@ -313,6 +486,15 @@ public final class SDSSynchronizer: Sendable {
     }
     
     private func setup(storeToObserve: NSPersistentStoreCoordinator, configuration: SDSConfiguration, adoption: (() throws -> SDSAdoption)?) {
+        // Without its data, the synchronizer can't track changes, and using its context would raise exceptions
+        if let error = loadSyncData() {
+            logger.error("Failed to load the synchronization data, not synchronizing: \(error)")
+            Task {
+                await viewModel.set(state: .error(error))
+            }
+            return
+        }
+
         let configuration = storeToObserve.makeConfiguration(externalConfiguration: configuration)
         
         let observedUpdateContext = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
@@ -330,6 +512,8 @@ public final class SDSSynchronizer: Sendable {
         
         removeSavedPlaceholders()
         checkForNewlySynchronizedKeys(configuration)
+        // Files of assets that earlier uploads couldn't remove, e.g. because the app was terminated while uploading
+        CKAsset.removeAllTemporaryFiles()
         
         // Adopted models are saved before observing the store, so they aren't uploaded as new records
         if let adoption {
@@ -347,9 +531,10 @@ public final class SDSSynchronizer: Sendable {
         
         setupNotifications()
         mutableState.withLock { $0.isObservingStore = true }
-        
+
         Task {
-            await viewModel.set(state: .idle)
+            // `stop()` can be called before the store is found
+            await viewModel.set(state: isStopped ? .stopped : .idle)
             await synchronize()
         }
     }
@@ -442,11 +627,14 @@ public final class SDSSynchronizer: Sendable {
         mutableState.withLock { $0.catchUp?.retryDate = date }
     }
     
-    /// The keys of a record that changed locally and weren't uploaded yet.
-    func pendingChangedKeys(of id: String) -> Set<String> {
+    /// The keys of a record that changed locally and weren't uploaded yet, and whether it was deleted locally and that wasn't uploaded yet.
+    func pendingLocalChange(of id: String) -> (keys: Set<String>, isRemoved: Bool) {
         let context = self.context
         return context.performAndWait {
-            Set(CloudKitUpdate.find(for: id)?.changedKeys ?? [])
+            let request = CloudKitRemoval.fetchRequest()
+            request.predicate = NSPredicate(format: "id = %@", id)
+            let isRemoved = ((try? context.count(for: request)) ?? 0) > 0
+            return (Set(CloudKitUpdate.find(for: id)?.changedKeys ?? []), isRemoved)
         }
     }
     

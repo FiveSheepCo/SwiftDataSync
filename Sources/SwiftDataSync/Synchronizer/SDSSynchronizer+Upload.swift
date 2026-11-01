@@ -4,26 +4,30 @@ import CloudKit
 
 extension SDSSynchronizer {
     
-    func upload() async throws {
+    /// Uploads the pending changes, and returns how many records are left for later as CloudKit rejected them, see `SDSRecordQuarantine`.
+    @discardableResult
+    func upload() async throws -> Int {
         // Records that keep changing in one database don't keep the other's changes from being uploaded.
         // The download is still skipped afterwards, as it would overwrite their newer changes.
         var changesStillPending: ChangesStillPendingError?
+        var rejectedCount = 0
         for sharedDatabase in [false, true] {
             do {
-                try await _upload(sharedDatabase: sharedDatabase)
+                rejectedCount += try await _upload(sharedDatabase: sharedDatabase)
             } catch let error as ChangesStillPendingError {
                 changesStillPending = error
             }
         }
-        
+
         let context = self.context
         try context.performAndWait {
             try context.save()
         }
-        
+
         if let changesStillPending {
             throw changesStillPending
         }
+        return rejectedCount
     }
     
     /// Thrown when records keep changing while they are uploaded, e.g. while the app edits them continuously.
@@ -33,43 +37,57 @@ extension SDSSynchronizer {
     /// How many rounds in a row may only upload records that changed again since, before the rest is left to a later synchronization.
     private static let maximumRoundsOfChangedRecords = 3
     
+    /// Returns how many records are left for later as CloudKit rejected them, see `SDSRecordQuarantine`.
     /// - Parameter roundsOfChangedRecords: How many rounds in a row only uploaded records that changed again since.
+    /// - Parameter didRetryConflicts: Whether records that another device saved first were uploaded again in this round already.
     private func _upload(
         sharedDatabase: Bool,
         maximumRecords: Int = CKModifyRecordsOperation.maximumRecords,
-        roundsOfChangedRecords: Int = 0
-    ) async throws {
+        roundsOfChangedRecords: Int = 0,
+        didRetryConflicts: Bool = false
+    ) async throws -> Int {
         // Another process could have taken over while this one was suspended
         guard syncLease.renew() else { throw SDSSyncLease.UnavailableError() }
-        
+        try checkNotStopped()
+
         await updateUpdatesToSend()
-        
+
         // Deletes are retrieved first so that every one of them is known when filtering out the updates.
         // The maximum applies to saved and deleted records combined.
         let deletes = synchronizableDeletes(sharedDatabase: sharedDatabase, maximum: maximumRecords)
-        let (records, lastChangeDates) = try synchronizableUpdates(sharedDatabase: sharedDatabase, maximum: maximumRecords - deletes.count)
-        
+        let (records, lastChangeDates, quarantinedCount) = try synchronizableUpdates(sharedDatabase: sharedDatabase, maximum: maximumRecords - deletes.count)
+
         guard records.count + deletes.count > 0 else {
             self.lastCompletedUpload = Date()
             logger.log("No remaining changed records")
-            return
+            return quarantinedCount
         }
-        
+
         let database = (sharedDatabase ? cloudSharedDatabase : cloudPrivateDatabase)!
-        
+
         let progress: UploadProgress
         do {
             progress = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<UploadProgress, Error>) in
-                
+
                 let operation = CKModifyRecordsOperation(recordsToSave: records, recordIDsToDelete: deletes)
                 operation.savePolicy = .changedKeys
-                
+                // A record that fails doesn't keep the others from being saved, e.g. one CloudKit rejects
+                operation.isAtomic = false
+
                 var doneRecords: [CKRecord] = []
                 var doneDeletes: [CKRecord.ID] = []
-                operation.perRecordSaveBlock = { _, result in
+                var conflicts: [String: CKRecord] = [:]
+                var rejected: [String: Date] = [:]
+                operation.perRecordSaveBlock = { recordId, result in
                     switch result {
                     case .success(let record): doneRecords.append(record)
-                    case .failure(let error): self.logger.log("Error while uploading single record: \(error, privacy: .public)") // TODO: This should propably hold the auto upload for 15 minutes or something and show the error for the user to display
+                    case .failure(let error):
+                        if let serverRecord = self.serverRecordOfIdentityConflict(error, recordId: recordId) {
+                            conflicts[recordId.recordName] = serverRecord
+                        } else if SDSRecordQuarantine.isPermanentRejection(error), let lastChangeDate = lastChangeDates[recordId.recordName] {
+                            rejected[recordId.recordName] = lastChangeDate
+                        }
+                        self.logger.log("Error while uploading single record: \(error, privacy: .public)")
                     }
                 }
                 operation.perRecordDeleteBlock = { recordId, result in
@@ -81,47 +99,75 @@ extension SDSSynchronizer {
                     }
                 }
                 operation.modifyRecordsResultBlock = { operationResult in
+                    // The files of the assets were only written for this upload
+                    CKAsset.removeTemporaryFiles(of: records)
+
                     switch operationResult {
                         case .success:
-                            let progress = self.deleteObjects(for: doneRecords, deletes: doneDeletes, lastChangeDates: lastChangeDates)
-                            
+                            var progress = self.deleteObjects(for: doneRecords, deletes: doneDeletes, lastChangeDates: lastChangeDates)
+                            progress.conflictCount = self.retryConflicts(conflicts)
+                            progress.rejectedCount = self.quarantineRejectedRecords(rejected)
+
                             self.logger.log("Operation completed: \(doneRecords.count) \(doneDeletes.count)")
                             continuation.resume(returning: progress)
                         case .failure(let error):
-                            // Deleting a record that is already gone fails the whole atomic operation, so those removals
-                            // are discarded and the rest is uploaded again. Changes that did succeed in a non-atomic operation are kept.
+                            // The zone is gone, e.g. because the user deleted the app's data in iCloud, see `PrivateZoneMissingError`
+                            if !sharedDatabase, let zoneError = self.privateZoneMissingError(in: error) {
+                                continuation.resume(throwing: PrivateZoneMissingError(error: zoneError))
+                                return
+                            }
+                            guard (error as? CKError)?.code == .partialFailure else {
+                                self.logger.log("Error while uploading records: \(error)")
+                                continuation.resume(throwing: error)
+                                return
+                            }
+
+                            // Records that failed don't keep the others from being saved, as the operation isn't atomic.
+                            // Removals of records that are already gone are done. Records of an identity that another device
+                            // saved first are saved over its records next. Records CloudKit rejected are left for later.
+                            // The other records are uploaded again.
                             let alreadyDeleted = self.alreadyDeletedRecordIDs(in: error, deletes: deletes)
                             if !alreadyDeleted.isEmpty {
                                 self.logger.log("Discarding removals of \(alreadyDeleted.count) records that are already deleted")
-                                let progress = self.deleteObjects(for: doneRecords, deletes: Array(Set(doneDeletes + alreadyDeleted)), lastChangeDates: lastChangeDates)
-                                continuation.resume(returning: progress)
-                                return
                             }
-                            
-                            self.logger.log("Error while uploading records: \(error)")
-                            continuation.resume(throwing: error)
+                            let conflicts = conflicts.merging(self.serverRecordsOfIdentityConflicts(in: error)) { $1 }
+                            let rejected = rejected.merging(self.rejectedRecords(in: error, lastChangeDates: lastChangeDates)) { $1 }
+
+                            var progress = self.deleteObjects(for: doneRecords, deletes: Array(Set(doneDeletes + alreadyDeleted)), lastChangeDates: lastChangeDates)
+                            progress.conflictCount = self.retryConflicts(conflicts)
+                            progress.rejectedCount = self.quarantineRejectedRecords(rejected)
+                            continuation.resume(returning: progress)
                     }
                 }
                 database.add(operation)
                 logger.log("Operation added to \(sharedDatabase ? "shared" : "private") database")
             }
         }
-        catch let error as CKError where error.code == .limitExceeded && maximumRecords > 1 {
+        catch let error as CKError where error.code == .limitExceeded {
             // Operations are also limited in size, which cannot easily be determined beforehand
-            logger.log("Operation too large, retrying with at most \(maximumRecords / 2) records")
-            try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords / 2, roundsOfChangedRecords: roundsOfChangedRecords)
-            return
+            let count = records.count + deletes.count
+            if count > 1 {
+                logger.log("Operation too large, retrying with at most \(count / 2) records")
+                return try await _upload(sharedDatabase: sharedDatabase, maximumRecords: count / 2, roundsOfChangedRecords: roundsOfChangedRecords)
+            }
+            // A single record that is too large on its own is left for later, see `SDSRecordQuarantine`
+            guard let record = records.first, let lastChangeDate = lastChangeDates[record.recordID.recordName] else { throw error }
+            _ = quarantineRejectedRecords([record.recordID.recordName: lastChangeDate])
+            return try await _upload(sharedDatabase: sharedDatabase, roundsOfChangedRecords: roundsOfChangedRecords)
         }
-        
-        if progress.completedCount > 0 {
-            try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords)
+
+        if progress.completedCount > 0 || progress.rejectedCount > 0 {
+            return try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords)
+        } else if progress.conflictCount > 0 && !didRetryConflicts {
+            // Once more with the records another device saved first, but not indefinitely if they keep changing
+            return try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords, roundsOfChangedRecords: roundsOfChangedRecords, didRetryConflicts: true)
         } else if progress.changedAgainCount > 0 {
             // The newer changes are uploaded next, but not indefinitely while the app keeps changing the records
             guard roundsOfChangedRecords + 1 < Self.maximumRoundsOfChangedRecords else {
                 logger.log("Records keep changing while uploading, uploading them later")
                 throw ChangesStillPendingError()
             }
-            try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords, roundsOfChangedRecords: roundsOfChangedRecords + 1)
+            return try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords, roundsOfChangedRecords: roundsOfChangedRecords + 1)
         } else {
             // E.g. records that keep failing, or keep differing from what was uploaded. They are uploaded with a later synchronization.
             // Downloading now could overwrite their changes before they are uploaded.
@@ -130,6 +176,62 @@ extension SDSSynchronizer {
         }
     }
     
+    /// The record another device saved first, if saving a record of an entity with an identity failed because it exists.
+    /// Two devices that created a model for the same thing save it under the same name, see `SDSConfiguration.Entity.sync`.
+    private func serverRecordOfIdentityConflict(_ error: Error, recordId: CKRecord.ID) -> CKRecord? {
+        guard
+            let error = error as? CKError,
+            error.code == .serverRecordChanged,
+            let serverRecord = error.serverRecord,
+            configuration?.entities[serverRecord.recordType]?.identity.isEmpty == false
+        else { return nil }
+        return serverRecord
+    }
+    
+    /// Like `serverRecordOfIdentityConflict`, for the records of a failed operation, by name.
+    private func serverRecordsOfIdentityConflicts(in error: Error) -> [String: CKRecord] {
+        guard let error = error as? CKError, error.code == .partialFailure else { return [:] }
+        
+        var records: [String: CKRecord] = [:]
+        for (itemId, itemError) in error.partialErrorsByItemID ?? [:] {
+            guard let recordId = itemId as? CKRecord.ID, let serverRecord = serverRecordOfIdentityConflict(itemError, recordId: recordId) else { continue }
+            records[recordId.recordName] = serverRecord
+        }
+        return records
+    }
+    
+    /// Remembers the records another device saved first, so the next upload saves the changed keys over them, and returns how many.
+    private func retryConflicts(_ conflicts: [String: CKRecord]) -> Int {
+        guard !conflicts.isEmpty else { return 0 }
+        logger.log("Saving \(conflicts.count) records over the ones another device saved first under the same identity")
+        rememberServerRecordsOfConflicts(conflicts)
+        return conflicts.count
+    }
+    
+    /// The records of a failed operation that CloudKit rejected, with when their updates last changed, see `SDSRecordQuarantine`.
+    private func rejectedRecords(in error: Error, lastChangeDates: [String: Date]) -> [String: Date] {
+        guard let error = error as? CKError, error.code == .partialFailure else { return [:] }
+
+        var records: [String: Date] = [:]
+        for (itemId, itemError) in error.partialErrorsByItemID ?? [:] {
+            guard
+                let recordName = (itemId as? CKRecord.ID)?.recordName,
+                let lastChangeDate = lastChangeDates[recordName],
+                SDSRecordQuarantine.isPermanentRejection(itemError)
+            else { continue }
+            records[recordName] = lastChangeDate
+        }
+        return records
+    }
+
+    /// Leaves records that CloudKit rejected out of uploads for a while, and returns how many.
+    private func quarantineRejectedRecords(_ records: [String: Date]) -> Int {
+        guard !records.isEmpty else { return 0 }
+        logger.error("Uploading \(records.count) records that CloudKit rejected later: \(records.keys.sorted())")
+        quarantine(records)
+        return records.count
+    }
+
     /// The removals among `deletes` that failed because their record doesn't exist anymore.
     private func alreadyDeletedRecordIDs(in error: Error, deletes: [CKRecord.ID]) -> [CKRecord.ID] {
         guard let error = error as? CKError, error.code == .partialFailure else { return [] }
@@ -142,34 +244,38 @@ extension SDSSynchronizer {
     /// Up to `maximum` records to upload, and when their updates last changed, to notice changes made while uploading.
     ///
     /// Throws if a record can't be prepared. Downloading anyway could overwrite its changes before they are uploaded.
-    private func synchronizableUpdates(sharedDatabase: Bool, maximum: Int) throws -> (records: [CKRecord], lastChangeDates: [String: Date]) {
-        try context.performAndWaitUnchecked {
+    /// Also returns how many records were left out as CloudKit rejected them, see `SDSRecordQuarantine`.
+    private func synchronizableUpdates(sharedDatabase: Bool, maximum: Int) throws -> (records: [CKRecord], lastChangeDates: [String: Date], quarantinedCount: Int) {
+        let referenceDepths = (configuration?.entities ?? [:]).mapValues(\.referenceDepth)
+
+        return try context.performAndWaitUnchecked {
             discardUpdatesOfRemovedRecords()
-            
+
             // Referenced records are uploaded in earlier operations than the records referencing them,
             // so that a download in between never receives a record whose references do not exist yet
             let updates = CloudKitUpdate.retrieveAll().filter({ object -> Bool in
                 (object.sharedZone != nil) == sharedDatabase
             }).sorted(by: { lhs, rhs in
-                referenceDepth(of: lhs) < referenceDepth(of: rhs)
+                referenceDepths[lhs.recordType, default: 0] < referenceDepths[rhs.recordType, default: 0]
             })
-            
+
             // Discarded updates don't count towards the maximum, so the remaining ones aren't taken for uploaded
             var records: [CKRecord] = []
             var lastChangeDates: [String: Date] = [:]
+            var quarantinedCount = 0
             for update in updates where records.count < maximum {
                 let lastChangeDate = update.lastChangeDate
+                guard !isQuarantined(update.id, lastChangeDate: lastChangeDate) else {
+                    quarantinedCount += 1
+                    continue
+                }
                 if let record = try record(for: update) {
                     records.append(record)
                     lastChangeDates[record.recordID.recordName] = lastChangeDate
                 }
             }
-            return (records, lastChangeDates)
+            return (records, lastChangeDates, quarantinedCount)
         }
-    }
-    
-    private func referenceDepth(of update: CloudKitUpdate) -> Int {
-        configuration?.entities[update.recordType]?.referenceDepth ?? 0
     }
     
     /// CloudKit rejects saving and deleting the same record in a single operation.
@@ -195,7 +301,9 @@ extension SDSSynchronizer {
     private func record(for update: CloudKitUpdate) throws -> CKRecord? {
         let id = update.id
         let recordId = update.recordId
-        let record = CKRecord(recordType: update.recordType, recordID: recordId)
+        let newRecord = CKRecord(recordType: update.recordType, recordID: recordId)
+        // A record that another device saved first is updated with this device's changes, see `serverRecordOfIdentityConflict`
+        let serverRecord = takeServerRecordOfConflict(named: recordId.recordName)
         
         let changedKeys = update.changedKeys
         logger.log("[Upload] Changed from `CloudKitUpdate`: \(changedKeys)")
@@ -224,13 +332,13 @@ extension SDSSynchronizer {
                 // Synchronize parent, but only if parent is changed
                 if let parentKey = container.parentKey, changedKeys.contains(parentKey) {
                     if let parent = container.parent, let parentRecordId = parent.synchronizableContainer?.recordId {
-                        record.setParent(parentRecordId)
+                        newRecord.setParent(parentRecordId)
                         // This workaround is needed so that deletion of records with a parent works
-                        record[Constants.parentWorkaroundKey] = CKRecord.Reference(recordID: parentRecordId, action: .deleteSelf)
+                        newRecord[Constants.parentWorkaroundKey] = CKRecord.Reference(recordID: parentRecordId, action: .deleteSelf)
                     } else if container.parent == nil {
                         // The server would keep the previous parent, which differs from the expected one once uploaded
-                        record.setParent(nil as CKRecord.ID?)
-                        record[Constants.parentWorkaroundKey] = nil
+                        newRecord.setParent(nil as CKRecord.ID?)
+                        newRecord[Constants.parentWorkaroundKey] = nil
                     }
                 }
                 
@@ -245,7 +353,7 @@ extension SDSSynchronizer {
                 
                 for (key, value) in try container.changeDictionary(for: syncKeys) {
                     logger.log("Setting `\(String(describing: value), privacy: .private)` for \(key, privacy: .public)")
-                    record[key] = value
+                    newRecord[key] = value
                 }
                 return true
             }
@@ -260,7 +368,7 @@ extension SDSSynchronizer {
             return nil
         }
         
-        return record
+        return serverRecord.map { SDSIdentity.merging(newRecord, into: $0) } ?? newRecord
     }
     
     private func synchronizableDeletes(sharedDatabase: Bool, maximum: Int) -> [CKRecord.ID] {
@@ -281,6 +389,10 @@ extension SDSSynchronizer {
         var completedCount = 0
         /// Updates that changed again while they were uploaded, so they are uploaded again.
         var changedAgainCount = 0
+        /// Records of an identity that another device saved first, which are uploaded again over its records.
+        var conflictCount = 0
+        /// Records CloudKit rejected, which are uploaded later, see `SDSRecordQuarantine`.
+        var rejectedCount = 0
     }
     
     /// Removes the updates and removals that were uploaded, and returns the progress.
@@ -296,7 +408,11 @@ extension SDSSynchronizer {
             var progress = UploadProgress()
             
             for record in updates {
-                let update = CloudKitUpdate.retrieve(for: record.recordID.recordName, entityName: record.recordType, context: context)
+                guard let update = CloudKitUpdate.find(for: record.recordID.recordName) else {
+                    // E.g. the object was deleted while uploading, and its removal replaced the update
+                    progress.completedCount += 1
+                    continue
+                }
                 let id = update.id
                 let changedKeys = update.changedKeys
                 

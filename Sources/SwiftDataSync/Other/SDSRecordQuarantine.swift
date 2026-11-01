@@ -1,0 +1,44 @@
+import Foundation
+import CloudKit
+
+/// Records that CloudKit rejected for a reason that retrying doesn't fix, e.g. a value too large for a record, or a field type
+/// the production schema doesn't have.
+///
+/// They're left out of uploads for a while, so they don't keep the other changes from being uploaded and downloads from
+/// running. A record is uploaded again once it changes, as that might fix it, or once the time is up.
+struct SDSRecordQuarantine: Sendable {
+
+    /// How long a rejected record isn't uploaded, unless it changes.
+    static let duration: TimeInterval = 60 * 60
+
+    private struct Entry: Sendable {
+        /// When the record's update last changed when it was rejected.
+        let lastChangeDate: Date
+        let endDate: Date
+    }
+
+    private var entries: [String: Entry] = [:]
+
+    /// Whether a record isn't uploaded now. `lastChangeDate` is when its update last changed.
+    func contains(_ recordName: String, lastChangeDate: Date, now: Date = .now) -> Bool {
+        guard let entry = entries[recordName] else { return false }
+        return entry.lastChangeDate == lastChangeDate && now < entry.endDate
+    }
+
+    mutating func add(_ recordName: String, lastChangeDate: Date, now: Date = .now) {
+        entries[recordName] = Entry(lastChangeDate: lastChangeDate, endDate: now.addingTimeInterval(Self.duration))
+    }
+
+    /// Whether CloudKit rejected a record for a reason that retrying it unchanged doesn't fix.
+    static func isPermanentRejection(_ error: Error) -> Bool {
+        guard let error = error as? CKError else { return false }
+
+        return switch error.code {
+        case .invalidArguments, .limitExceeded, .referenceViolation, .constraintViolation, .serverRejectedRequest,
+             .permissionFailure, .assetFileNotFound, .assetFileModified, .incompatibleVersion:
+            true
+        default:
+            false
+        }
+    }
+}

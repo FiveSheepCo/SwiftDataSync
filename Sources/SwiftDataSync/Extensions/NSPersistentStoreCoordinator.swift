@@ -21,7 +21,7 @@ extension NSPersistentStoreCoordinator {
             switch externalDescriptions[relationship.entity.name ?? ""] {
             case .none: break
             case .noSync: continue // Entities that are not synced should not have their relationships synced either.
-            case .sync(let properties, _, let parentKey, _):
+            case .sync(let properties, _, let parentKey, _, _):
                 (shouldDefinetelySync, shouldDefinetelyNotSync) = relationship.syncProperties(properties: properties, parentKey: parentKey)
             }
             
@@ -33,8 +33,8 @@ extension NSPersistentStoreCoordinator {
                 switch externalDescriptions[inverse.entity.name ?? ""] {
                 case .none: break
                 case .noSync: continue // Entities that are not synced should not have their relationships synced either.
-                case .sync(let properties, _, let parentKey, _):
-                    (inverseShouldDefinetelySync, inverseShouldDefinetelyNotSync) = relationship.syncProperties(properties: properties, parentKey: parentKey)
+                case .sync(let properties, _, let parentKey, _, _):
+                    (inverseShouldDefinetelySync, inverseShouldDefinetelyNotSync) = inverse.syncProperties(properties: properties, parentKey: parentKey)
                 }
                 
                 if shouldDefinetelySync {
@@ -82,8 +82,12 @@ extension NSPersistentStoreCoordinator {
         let externalDescriptions = externalConfiguration.entityDescriptions
         let entities = managedObjectModel.entitiesByName
         
+        // In a stable order: dictionaries are ordered differently with every launch, which would otherwise decide
+        // relationships that can be synchronized either way differently
         let relationshipsToSync = self.relationshipsToSync(
-            relationships: entities.values.flatMap(\.relationshipsByName.values),
+            relationships: entities.values.flatMap(\.relationshipsByName.values).sorted { lhs, rhs in
+                (lhs.entity.name ?? "", lhs.name) < (rhs.entity.name ?? "", rhs.name)
+            },
             externalDescriptions: externalDescriptions
         )
         
@@ -111,26 +115,42 @@ extension NSPersistentStoreCoordinator {
         
         for (entityName, entityDescription) in entities {
             let description = externalDescriptions[entityDescription.name ?? ""] ?? .sync(.all, parentKey: nil)
-            guard case .sync(let properties, let assetProperties, let parentKey, let isSharable) = description else { continue }
+            guard case .sync(let properties, let assetProperties, let parentKey, let isSharable, let identity) = description else { continue }
             
+            let syncedProperties = entityDescription.properties.filter({ property in
+                if let relationship = property as? NSRelationshipDescription {
+                    return relationshipsToSync.contains(where: { $0 == relationship })
+                }
+                
+                let name = property.name
+                
+                return switch properties {
+                case .with(let with): with.contains(name)
+                case .without(let without): !without.contains(name)
+                }
+            }).map(\.name)
+            
+            // Downloads match records to models by these values, so the records have to contain them
+            for key in identity where entityDescription.attributesByName[key] == nil || !syncedProperties.contains(key) {
+                fatalError("`\(entityName).\(key)`: An identity has to consist of synchronized attributes. Please fix your configuration.")
+            }
+            if !identity.isEmpty && isSharable {
+                fatalError("`\(entityName)`: Entities with an identity can't be sharable. Please fix your configuration.")
+            }
+            // Downloaded models are inserted with the values of their records, so they couldn't be saved without these.
+            // Not a crash, as apps could have such configurations already. Their downloaded models are skipped.
+            for key in SDSInternalConfiguration.unsynchronizedRequiredAttributes(of: entityDescription, syncedProperties: syncedProperties) {
+                assertionFailure("`\(entityName).\(key)` is required and has no default value, but isn't synchronized, so models downloaded from other devices can't be saved. Please give it a default value, make it optional or synchronize it.")
+            }
+
             configurationEntities[entityName] =
                 SDSInternalConfiguration.Entity(
-                    syncedProperties: entityDescription.properties.filter({ property in
-                        if let relationship = property as? NSRelationshipDescription {
-                            return relationshipsToSync.contains(where: { $0 == relationship })
-                        }
-                        
-                        let name = property.name
-                        
-                        return switch properties {
-                        case .with(let with): with.contains(name)
-                        case .without(let without): !without.contains(name)
-                        }
-                    }).map(\.name),
+                    syncedProperties: syncedProperties,
                     assetProperties: assetProperties,
                     parentKey: parentKey,
                     isSharable: isSharable,
-                    referenceDepth: referenceDepth(of: entityName)
+                    referenceDepth: referenceDepth(of: entityName),
+                    identity: identity
                 )
         }
         

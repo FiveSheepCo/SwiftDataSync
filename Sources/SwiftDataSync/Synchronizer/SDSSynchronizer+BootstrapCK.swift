@@ -33,10 +33,9 @@ extension SDSSynchronizer {
         startSync()
     }
     
+    /// Checks the account once, and again after it changed, see `accountChanged(_:)`.
     private func checkLoggedIntoIcloud() async throws {
         if await !viewModel.isLoggedIntoiCloud {
-            // TODO(later): Handle user change, CKAccountChanged notification
-            
             guard let accountStatus = try? await cloudContainer.accountStatus() else {
                 logger.log("No Account Status")
                 throw SDSStateError(state: .notLoggedIntoIcloud)
@@ -52,9 +51,126 @@ extension SDSSynchronizer {
                 throw SDSStateError(state: .notLoggedIntoIcloud)
             }
             
+            // The synchronization data of another account doesn't apply to this one
+            if let previousUserRecordID = accessState(\.userId), previousUserRecordID != userRecordID {
+                logger.log("The iCloud account changed, starting over with the new account")
+                try resetForNewAccount()
+            }
+
             logger.log("Logged in to iCloud")
             setState(\.userId, value: userRecordID)
+            try context.performAndWait {
+                try context.save()
+            }
             await viewModel.set(loggedIntoiCloud: true)
+        }
+    }
+
+    /// Forgets the records, shares, zones and change tokens of the previous account, so the new account is synchronized from scratch.
+    ///
+    /// Local copies of other users' shares are removed, as they were shared with the previous account. Other local models stay.
+    /// They're uploaded to the new account if this device creates its zone (see `bootstrap()`), and otherwise once they change.
+    private func resetForNewAccount() throws {
+        let context = self.context
+        let sharedRootIds: [String] = context.performAndWait {
+            ((try? context.fetch(CloudKitShare.fetchRequest())) ?? []).compactMap { entry in
+                entry.share?.isSharedByOtherUser == true ? entry.id : nil
+            }
+        }
+        for id in sharedRootIds {
+            if let root = find(for: id) {
+                try removeLocalCopy(of: root)
+            }
+        }
+
+        try context.performAndWaitUnchecked {
+            for entityName in ["CloudKitLocalEntity", "CloudKitUpdate", "CloudKitRemoval", "CloudKitShare", "CloudKitZone"] {
+                let request = NSFetchRequest<NSManagedObject>(entityName: entityName)
+                request.includesPropertyValues = false
+                try context.fetch(request).forEach(context.delete)
+            }
+            accessState { state in
+                state.changeToken = nil
+                state.didCreateZone = false
+                state.didCreatePrivateSubscription = false
+                state.didCreateSharedSubscription = false
+            }
+            try context.save()
+        }
+
+        withAcceptedShareZones { $0 = [:] }
+        resetQuarantine()
+    }
+
+    /// Thrown when the zone of the private database is gone, e.g. because it was deleted on another device, or because the
+    /// user deleted the app's data in iCloud (`CKError.Code.userDeletedZone`).
+    struct PrivateZoneMissingError: Error {
+        let error: CKError
+    }
+
+    /// Thrown when change tokens expired. They're reset, so the zones are downloaded completely next.
+    struct ChangeTokenExpiredError: Error {}
+
+    /// The error of an operation of the private database if its zone is gone. Zones of the shared database disappear when they
+    /// are no longer shared, which `refreshSharedZoneIDs()` handles.
+    func privateZoneMissingError(in error: Error) -> CKError? {
+        Self.privateZoneMissingError(in: error, defaultZoneID: defaultZoneID)
+    }
+
+    static func privateZoneMissingError(in error: Error, defaultZoneID: CKRecordZone.ID) -> CKError? {
+        guard let error = error as? CKError else { return nil }
+
+        let codes: Set<CKError.Code> = [.zoneNotFound, .userDeletedZone]
+        if codes.contains(error.code) {
+            return error
+        }
+        guard error.code == .partialFailure else { return nil }
+
+        for (itemId, itemError) in error.partialErrorsByItemID ?? [:] {
+            guard let itemError = itemError as? CKError, codes.contains(itemError.code) else { continue }
+            let zoneID = (itemId as? CKRecordZone.ID) ?? (itemId as? CKRecord.ID)?.zoneID
+            if zoneID == nil || zoneID == defaultZoneID {
+                return itemError
+            }
+        }
+        return nil
+    }
+
+    /// The zone is created again with the next synchronization, which uploads every local model, see `bootstrap()`.
+    ///
+    /// If the user deleted the app's data in iCloud, the data isn't uploaded again without asking: synchronizing stops until
+    /// it's started again (`start()`, or the next launch), and the state shows the error, so the app can ask the user.
+    private func handlePrivateZoneMissing(_ error: PrivateZoneMissingError) async {
+        let isDeletedByUser = error.error.code == .userDeletedZone
+        logger.error("The zone of the private database is gone\(isDeletedByUser ? ", deleted by the user" : ""): \(error.error)")
+
+        let context = self.context
+        context.performAndWaitUnchecked {
+            accessState { state in
+                state.changeToken = nil
+                state.didCreateZone = false
+            }
+            if isDeletedByUser {
+                // The changes of the data that was deleted aren't uploaded anymore
+                for entityName in ["CloudKitUpdate", "CloudKitRemoval"] {
+                    let request = NSFetchRequest<NSManagedObject>(entityName: entityName)
+                    request.predicate = NSPredicate(format: "sharedZone == nil")
+                    ((try? context.fetch(request)) ?? []).forEach(context.delete)
+                }
+            }
+            do {
+                try context.save()
+            } catch {
+                logger.error("Failed to save after the zone was gone: \(error.localizedDescription)")
+            }
+        }
+
+        if isDeletedByUser {
+            stopSynchronizing()
+            await viewModel.set(state: .error(error.error))
+        } else {
+            await set(state: .idle)
+            startSync()
         }
     }
     
@@ -71,15 +187,16 @@ extension SDSSynchronizer {
         }
     }
     
+    /// Sets the state, or `.stopped` once synchronizing was stopped, which a running synchronization only notices at its next step.
     func set(state: SDSSynchronizationViewModel.State) async {
-        await viewModel.set(state: state)
+        await viewModel.set(state: isStopped ? .stopped : state)
     }
-    
+
     func synchronize() async {
         // E.g. after a failed adoption, the error state would allow a forced or push-triggered synchronization,
         // whose download would add the existing records as duplicates
-        guard isObservingStore else { return }
-        
+        guard isObservingStore, !isStopped else { return }
+
         do {
             guard await viewModel.attemptSyncStart() else {
                 // E.g. while CloudKit asks to wait after an error, a retry has to be scheduled, as a pending one might have been used up
@@ -103,7 +220,8 @@ extension SDSSynchronizer {
             try await checkLoggedIntoIcloud()
             
             try await bootstrap()
-            
+            try checkNotStopped()
+
             // Pending changes for shares that are gone would fail the upload, so they are cleaned up first.
             // This is best effort: a failure here shouldn't keep the private database from uploading. The download retries it.
             var didRefreshSharedZones = false
@@ -115,17 +233,27 @@ extension SDSSynchronizer {
             }
             
             await set(state: .uploading)
-            try await upload()
-            
+            let rejectedCount = try await upload()
+            try checkNotStopped()
+
+            // Also after records were rejected, as downloads don't overwrite changes that weren't uploaded yet
             await set(state: .downloading)
             try await download(refreshingSharedZones: !didRefreshSharedZones)
-            
+
+            if rejectedCount > 0 {
+                // They're uploaded once they change, or after a while, see `SDSRecordQuarantine`
+                await set(state: .error(SDSSyncError(title: "error.uploadIncomplete")))
+                await setRoutineTimer(interval: SDSRecordQuarantine.duration)
+                await synchronizeAgainIfRequested()
+                return
+            }
             await set(state: .idle)
         }
         catch is ChangesStillPendingError {
             // Not an error: the changes are uploaded and downloads resume once the app stops changing the records
             await set(state: .idle)
             await setRoutineTimer(onlyAfterError: false)
+            await synchronizeAgainIfRequested()
             return
         }
         catch is SDSSyncLease.UnavailableError {
@@ -134,11 +262,35 @@ extension SDSSynchronizer {
             await set(state: .idle)
             retryAfterSyncLease()
         }
+        catch is StoppedError {
+            logger.log("Synchronizing was stopped")
+            await set(state: .stopped)
+            return
+        }
+        catch let error as PrivateZoneMissingError {
+            await handlePrivateZoneMissing(error)
+            return
+        }
+        catch let error as CKError where error.code == .notAuthenticated {
+            // E.g. signed out of iCloud. The account is checked again with the next synchronization, see `accountChanged(_:)`.
+            logger.log("Not logged in to iCloud anymore: \(error)")
+            await viewModel.set(loggedIntoiCloud: false)
+            await set(state: .notLoggedIntoIcloud)
+            return
+        }
         catch {
             await set(state: (error as? SDSStateError)?.state ?? .error(error))
         }
-        
+
         await self.setRoutineTimer()
+        await synchronizeAgainIfRequested()
+    }
+
+    /// Synchronizes again if that was requested while synchronizing, e.g. by a push for a change the download might have missed.
+    private func synchronizeAgainIfRequested() async {
+        if await viewModel.takeSyncRequestedWhileSyncing() {
+            startSync()
+        }
     }
     
     private func checkStoresAreReadable() throws {
@@ -186,14 +338,17 @@ extension SDSSynchronizer {
     }
     
     /// Schedules a synchronization after an error, or also without one.
-    private func setRoutineTimer(onlyAfterError: Bool = true) async {
+    /// - Parameter interval: How long it waits, rather than depending on the error.
+    private func setRoutineTimer(onlyAfterError: Bool = true, interval: TimeInterval? = nil) async {
         if onlyAfterError {
             guard case .error = await viewModel.state else { return }
         }
-        
+
         startTask(at: \.routineSync) { @MainActor in
             let minInterval: TimeInterval
-            if case .error(let error) = self.viewModel.state, let retryAfterSeconds = (error as? CKError)?.retryAfterSeconds {
+            if let interval {
+                minInterval = interval
+            } else if case .error(let error) = self.viewModel.state, let retryAfterSeconds = (error as? CKError)?.retryAfterSeconds {
                 minInterval = retryAfterSeconds * 1.5
             } else {
                 minInterval = minRoutineDownloadDeltaInterval
@@ -211,8 +366,13 @@ extension SDSSynchronizer {
         // Private DB Zone
         if !accessState(\.didCreateZone) {
             logger.log("Zone not created")
-            try await createZone()
+            let isNewZone = try await createZone()
             setState(\.didCreateZone, value: true)
+
+            // It holds none of the local models, e.g. on the first device that synchronizes, or after the zone was deleted
+            if isNewZone {
+                uploadLocalObjects(keysByEntity: (configuration?.entities ?? [:]).mapValues { _ -> [String]? in nil })
+            }
         }
         
         // Private DB Subscription
@@ -230,16 +390,16 @@ extension SDSSynchronizer {
         }
     }
     
-    /// Creates the `CoreData` record zone, if needed.
-    func createZone() async throws {
+    /// Creates the `CoreData` record zone, if needed, and returns whether it was created.
+    func createZone() async throws -> Bool {
         logger.log("Checking for existing zones")
         let zones = try await self.cloudPrivateDatabase.allRecordZones()
-        
+
         guard !zones.contains(where: { zone -> Bool in
             zone.zoneID.zoneName == defaultZoneID.zoneName
         }) else {
             logger.log("Existing zone found")
-            return
+            return false
         }
         
         logger.log("Zone not found, creating...")
@@ -267,8 +427,9 @@ extension SDSSynchronizer {
             }
             self.cloudPrivateDatabase.add(modifyZonesOperation)
         }
+        return true
     }
-    
+
     private func createSubscription(sharedDatabase: Bool = false) async throws {
         if !sharedDatabase {
             // Register for remote notifications so CKSubscriptions work
