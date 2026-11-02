@@ -3,22 +3,22 @@ import CoreData
 import CloudKit
 import OSLog
 
-@MainActor
-private var minRoutineDownloadDeltaInterval: TimeInterval {
-    return generalLoadMultiplier * 60
-}
-
 private let bootstrapFailedError: SDSSyncError = SDSSyncError(title: "ckerror.bootstrapFailed")
 
 extension SDSSynchronizer {
     
+    /// Synchronizes now, e.g. when the user asks for it. Uploads that paused as iCloud was full are tried again, e.g. after
+    /// the user freed up storage, see `QuotaExceededError`.
     public func forceDownload() {
         lastCompletedDownload = nil
+        resumeUploads()
         startSync()
     }
     
+    /// Like `forceDownload()`, and returns once the synchronization is done.
     public func forceDownloadSync() async {
         lastCompletedDownload = nil
+        resumeUploads()
         await synchronize()
     }
     
@@ -27,32 +27,50 @@ extension SDSSynchronizer {
         startSync()
     }
     
+    /// Synchronizes now, e.g. when the user asks for it, also if uploads paused as iCloud was full, see `QuotaExceededError`.
     func forceSyncEverything() {
         lastCompletedUpload = nil
         lastCompletedDownload = nil
+        resumeUploads()
         startSync()
     }
     
     /// Checks the account once, and again after it changed, see `accountChanged(_:)`.
     private func checkLoggedIntoIcloud() async throws {
-        if await !viewModel.isLoggedIntoiCloud {
-            guard let accountStatus = try? await cloudContainer.accountStatus() else {
-                logger.log("No Account Status")
-                throw SDSStateError(state: .notLoggedIntoIcloud)
+        if accountNeedsCheck {
+            // An account change while checking isn't taken for checked
+            let accountChangeCount = self.accountChangeCount
+            let accountStatus: CKAccountStatus
+            do {
+                accountStatus = try await cloud.accountStatus()
+            } catch {
+                logger.log("No Account Status: \(error.localizedDescription)")
+                throw AccountUnavailableError(isTemporary: true)
             }
             
-            guard accountStatus == .available else {
+            switch accountStatus {
+            case .available:
+                break
+            case .temporarilyUnavailable, .couldNotDetermine:
+                // E.g. until the user enters their password again. Nothing is reset, and `CKAccountChanged` might not be posted.
+                logger.log("Account Status is temporarily not `available`: \(accountStatus.rawValue, privacy: .public)")
+                throw AccountUnavailableError(isTemporary: true)
+            default:
                 logger.log("Account Status is not `available`: \(accountStatus.rawValue, privacy: .public)")
-                throw SDSStateError(state: .notLoggedIntoIcloud)
+                throw AccountUnavailableError(isTemporary: false)
             }
             
-            guard let userRecordID = try? await cloudContainer.userRecordID() else {
-                logger.log("No user record id")
-                throw SDSStateError(state: .notLoggedIntoIcloud)
+            let userRecordID: CKRecord.ID
+            do {
+                userRecordID = try await cloud.userRecordID()
+            } catch {
+                logger.log("No user record id: \(error.localizedDescription)")
+                throw AccountUnavailableError(isTemporary: true)
             }
             
             // The synchronization data of another account doesn't apply to this one
-            if let previousUserRecordID = accessState(\.userId), previousUserRecordID != userRecordID {
+            let isOtherAccount = accessState(\.userId).map { $0 != userRecordID } ?? false
+            if isOtherAccount {
                 logger.log("The iCloud account changed, starting over with the new account")
                 try resetForNewAccount()
             }
@@ -62,14 +80,24 @@ extension SDSSynchronizer {
             try context.performAndWait {
                 try context.save()
             }
+            
+            confirmAccount(ifUnchangedSince: accountChangeCount)
             await viewModel.set(loggedIntoiCloud: true)
         }
     }
+    
+    /// Thrown when there's no iCloud account to synchronize with. A temporary state, e.g. while the user has to enter their
+    /// password again, or an error checking it, is checked again later, as iCloud doesn't always tell when it's over.
+    struct AccountUnavailableError: Error {
+        let isTemporary: Bool
+    }
 
-    /// Forgets the records, shares, zones and change tokens of the previous account, so the new account is synchronized from scratch.
+    /// Forgets the shares, zones, change tokens and pending changes of the previous account, so the new account is
+    /// synchronized from scratch, and every local model is uploaded to it like a backfilled one, see `backfill(onlyUntracked:)`.
     ///
-    /// Local copies of other users' shares are removed, as they were shared with the previous account. Other local models stay.
-    /// They're uploaded to the new account if this device creates its zone (see `bootstrap()`), and otherwise once they change.
+    /// Local copies of other users' shares are removed, as they were shared with the previous account. Other local models stay,
+    /// and keep their record names: a model the new account has a record of, e.g. because the user switches back to an
+    /// account the device synchronized before, gets the record's values instead of becoming a duplicate.
     private func resetForNewAccount() throws {
         let context = self.context
         let sharedRootIds: [String] = context.performAndWait {
@@ -82,9 +110,20 @@ extension SDSSynchronizer {
                 try removeLocalCopy(of: root)
             }
         }
+        
+        // Nothing of this device is in the new account yet. Its data isn't overwritten, see `backfill(onlyUntracked:)`.
+        // Written first, so it's also done if the app is terminated before the reset is saved.
+        updateFileState { state in
+            state = FileState()
+            state.needsFullBackfill = true
+        }
+        heldRecords(sharedDatabase: false).removeAll()
+        heldRecords(sharedDatabase: true).removeAll()
 
         try context.performAndWaitUnchecked {
-            for entityName in ["CloudKitLocalEntity", "CloudKitUpdate", "CloudKitRemoval", "CloudKitShare", "CloudKitZone"] {
+            // Changes of the previous account aren't uploaded over the new account's data, but every model is uploaded
+            // to it once the account is checked
+            for entityName in ["CloudKitUpdate", "CloudKitRemoval", "CloudKitShare", "CloudKitZone"] {
                 let request = NSFetchRequest<NSManagedObject>(entityName: entityName)
                 request.includesPropertyValues = false
                 try context.fetch(request).forEach(context.delete)
@@ -100,6 +139,8 @@ extension SDSSynchronizer {
 
         withAcceptedShareZones { $0 = [:] }
         resetQuarantine()
+        forgetServerRecordsOfConflicts()
+        resumeUploads()
     }
 
     /// Thrown when the zone of the private database is gone, e.g. because it was deleted on another device, or because the
@@ -144,6 +185,11 @@ extension SDSSynchronizer {
         let isDeletedByUser = error.error.code == .userDeletedZone
         logger.error("The zone of the private database is gone\(isDeletedByUser ? ", deleted by the user" : ""): \(error.error)")
 
+        // Every local model is uploaded again, also if another device creates the zone first, which this one then finds.
+        // Records that downloads held belonged to the zone that's gone.
+        updateFileState { $0.needsFullBackfill = true }
+        heldRecords(sharedDatabase: false).removeAll()
+
         let context = self.context
         context.performAndWaitUnchecked {
             accessState { state in
@@ -176,7 +222,7 @@ extension SDSSynchronizer {
     
     private func checkNetwork() throws {
         // TODO(later): Support disabling cellular etc
-        if networkMonitor.currentPath.status != .satisfied {
+        if let networkMonitor, networkMonitor.currentPath.status != .satisfied {
             throw SDSStateError(state: .waitingForNetwork)
         }
     }
@@ -196,7 +242,13 @@ extension SDSSynchronizer {
         // E.g. after a failed adoption, the error state would allow a forced or push-triggered synchronization,
         // whose download would add the existing records as duplicates
         guard isObservingStore, !isStopped else { return }
+        // Only one synchronization runs at a time. One requested meanwhile follows the running one.
+        guard claimSynchronization() else { return }
+        await _synchronize()
+        endActivity()
+    }
 
+    private func _synchronize() async {
         do {
             guard await viewModel.attemptSyncStart() else {
                 // E.g. while CloudKit asks to wait after an error, a retry has to be scheduled, as a pending one might have been used up
@@ -204,6 +256,8 @@ extension SDSSynchronizer {
                 return
             }
             
+            countStartedSynchronization()
+            beginSynchronizationWithCurrentAccount()
             guard syncLease.acquire() else { throw SDSSyncLease.UnavailableError() }
             defer { syncLease.release() }
             
@@ -212,6 +266,7 @@ extension SDSSynchronizer {
             try checkStoresAreReadable()
             
             refreshSharedData()
+            writeFileStateIfNeeded()
             
             await updateUpdatesToSend()
             
@@ -221,6 +276,11 @@ extension SDSSynchronizer {
             
             try await bootstrap()
             try checkNotStopped()
+            
+            // Objects that were saved without the synchronizer, or every object once the zone or account is new, are queued
+            // before the download, which then knows that their values mustn't overwrite what's in iCloud
+            try backfillIfNeeded()
+            await updateUpdatesToSend()
 
             // Pending changes for shares that are gone would fail the upload, so they are cleaned up first.
             // This is best effort: a failure here shouldn't keep the private database from uploading. The download retries it.
@@ -229,18 +289,51 @@ extension SDSSynchronizer {
                 try await refreshSharedZoneIDs()
                 didRefreshSharedZones = true
             } catch {
-                logger.log("Failed to refresh shared zones before uploading: \(error.localizedDescription)")
+                logger.log("Failed to refresh shared zones: \(error.localizedDescription)")
             }
             
-            await set(state: .uploading)
-            let rejectedCount = try await upload()
+            // Downloading first means local changes are uploaded over the newest values, rather than colliding with records
+            // whose values aren't known yet: backfilled values only fill what records lack (see `backfill(onlyUntracked:)`),
+            // and an edit of a record that another device deleted is discarded with the deletion, rather than uploaded as a
+            // partial record. Local changes that weren't uploaded yet still win over downloaded values.
+            await set(state: .downloading)
+            var downloadError: (any Error)?
+            var sharedDownloadError: (any Error)?
+            do {
+                sharedDownloadError = try await download(refreshingSharedZones: !didRefreshSharedZones)
+            } catch let error where Self.allowsUploading(after: error) {
+                // A download that keeps failing mustn't keep the changes from being uploaded. Edits are only uploaded for
+                // records that still exist, as one that was deleted elsewhere would be created again as a partial record.
+                logger.error("Failed to download, uploading anyway: \(error.localizedDescription)")
+                downloadError = error
+            }
             try checkNotStopped()
 
-            // Also after records were rejected, as downloads don't overwrite changes that weren't uploaded yet
-            await set(state: .downloading)
-            try await download(refreshingSharedZones: !didRefreshSharedZones)
+            await set(state: .uploading)
+            let upload = try await upload(
+                includingSharedDatabase: downloadError == nil && sharedDownloadError == nil,
+                checkingRecordsExist: downloadError != nil
+            )
+            try checkNotStopped()
+            if let error = downloadError ?? sharedDownloadError {
+                throw error
+            }
 
-            if rejectedCount > 0 {
+            if let pauseEnd = upload.privateQuotaPauseEnd {
+                // Uploads pause while iCloud is full, but downloads go on
+                await set(state: .error(Self.quotaExceededError))
+                await setRoutineTimer(interval: max(1, pauseEnd.timeIntervalSinceNow))
+                await synchronizeAgainIfRequested()
+                return
+            }
+            if let pauseEnd = upload.sharedQuotaPauseEnd {
+                // The storage of the owner of a share is full, which doesn't keep the user's own data from being uploaded
+                await set(state: .error(SDSSyncError(title: "error.uploadIncomplete")))
+                await setRoutineTimer(interval: max(1, pauseEnd.timeIntervalSinceNow))
+                await synchronizeAgainIfRequested()
+                return
+            }
+            if upload.rejectedCount > 0 {
                 // They're uploaded once they change, or after a while, see `SDSRecordQuarantine`
                 await set(state: .error(SDSSyncError(title: "error.uploadIncomplete")))
                 await setRoutineTimer(interval: SDSRecordQuarantine.duration)
@@ -250,7 +343,7 @@ extension SDSSynchronizer {
             await set(state: .idle)
         }
         catch is ChangesStillPendingError {
-            // Not an error: the changes are uploaded and downloads resume once the app stops changing the records
+            // Not an error: the changes are uploaded later, once the app stops changing the records
             await set(state: .idle)
             await setRoutineTimer(onlyAfterError: false)
             await synchronizeAgainIfRequested()
@@ -264,18 +357,38 @@ extension SDSSynchronizer {
         }
         catch is StoppedError {
             logger.log("Synchronizing was stopped")
-            await set(state: .stopped)
+            // `.stopped`, unless `start()` was called meanwhile
+            await set(state: .idle)
+            return
+        }
+        catch is AccountChangedError {
+            // The account change requested another synchronization, which checks the account
+            logger.log("The iCloud account changed while synchronizing")
+            await set(state: .idle)
+            await synchronizeAgainIfRequested()
             return
         }
         catch let error as PrivateZoneMissingError {
             await handlePrivateZoneMissing(error)
             return
         }
-        catch let error as CKError where error.code == .notAuthenticated {
-            // E.g. signed out of iCloud. The account is checked again with the next synchronization, see `accountChanged(_:)`.
-            logger.log("Not logged in to iCloud anymore: \(error)")
+        catch let error as AccountUnavailableError {
+            accountNeedsCheck = true
             await viewModel.set(loggedIntoiCloud: false)
             await set(state: .notLoggedIntoIcloud)
+            if error.isTemporary {
+                await setRoutineTimer(onlyAfterError: false)
+            }
+            await synchronizeAgainIfRequested()
+            return
+        }
+        catch let error where Self.isNotAuthenticated(error) {
+            // E.g. signed out of iCloud. The account is checked again with the next synchronization, see `accountChanged(_:)`.
+            logger.log("Not logged in to iCloud anymore: \(error)")
+            accountNeedsCheck = true
+            await viewModel.set(loggedIntoiCloud: false)
+            await set(state: .notLoggedIntoIcloud)
+            await synchronizeAgainIfRequested()
             return
         }
         catch {
@@ -284,6 +397,37 @@ extension SDSSynchronizer {
 
         await self.setRoutineTimer()
         await synchronizeAgainIfRequested()
+    }
+    
+    /// Thrown when the iCloud storage of a database is full: the user's, or for the shared database the share owner's.
+    /// Uploads to it pause for a while, or until `start()` or a synchronization the user asks for, so they aren't retried
+    /// over and over. Downloads go on.
+    struct QuotaExceededError: Error {
+        let sharedDatabase: Bool
+    }
+    
+    /// Whether the changes are uploaded although the download failed: not if the account, the zone or the process changed,
+    /// or CloudKit asks to wait.
+    static func allowsUploading(after error: Error) -> Bool {
+        switch error {
+        case is StoppedError, is AccountChangedError, is PrivateZoneMissingError, is SDSSyncLease.UnavailableError, is AccountUnavailableError:
+            return false
+        default:
+            return !isNotAuthenticated(error) && (errorWithLongestRetryDelay(in: error) as? CKError)?.retryAfterSeconds == nil
+        }
+    }
+    
+    /// The state's error while iCloud is full: CloudKit's, so apps can tell it by its code, with a description to show.
+    static var quotaExceededError: CKError {
+        CKError(.quotaExceeded, userInfo: [NSLocalizedDescriptionKey: SDSSyncError.localized("error.quotaExceeded")])
+    }
+    
+    /// Whether an error, or the error of one of its items, says that the user isn't signed into iCloud anymore.
+    static func isNotAuthenticated(_ error: Error) -> Bool {
+        guard let error = error as? CKError else { return false }
+        if error.code == .notAuthenticated { return true }
+        guard error.code == .partialFailure else { return false }
+        return (error.partialErrorsByItemID ?? [:]).values.contains { ($0 as? CKError)?.code == .notAuthenticated }
     }
 
     /// Synchronizes again if that was requested while synchronizing, e.g. by a push for a change the download might have missed.
@@ -307,6 +451,7 @@ extension SDSSynchronizer {
     
     /// Makes changes of other processes using the same synchronization data visible to this process.
     private func refreshSharedData() {
+        loadFileState()
         let context = self.context
         context.performAndWait {
             context.refreshAllObjects()
@@ -351,7 +496,7 @@ extension SDSSynchronizer {
             } else if case .error(let error) = self.viewModel.state, let retryAfterSeconds = (error as? CKError)?.retryAfterSeconds {
                 minInterval = retryAfterSeconds * 1.5
             } else {
-                minInterval = minRoutineDownloadDeltaInterval
+                minInterval = self.timing.routineRetryInterval ?? generalLoadMultiplier(networkMonitor: self.networkMonitor) * 60
             }
             
             try? await Task.sleep(for: .milliseconds(minInterval * 1000))
@@ -366,13 +511,12 @@ extension SDSSynchronizer {
         // Private DB Zone
         if !accessState(\.didCreateZone) {
             logger.log("Zone not created")
-            let isNewZone = try await createZone()
+            // The zone might hold none of the local models, e.g. on the first device that synchronizes, after the zone was
+            // deleted, or after another device created it again. They're backfilled, so they don't overwrite what another
+            // device uploaded. Written before the zone is created, so it's also done if the app is terminated meanwhile.
+            updateFileState { $0.needsFullBackfill = true }
+            _ = try await createZone()
             setState(\.didCreateZone, value: true)
-
-            // It holds none of the local models, e.g. on the first device that synchronizes, or after the zone was deleted
-            if isNewZone {
-                uploadLocalObjects(keysByEntity: (configuration?.entities ?? [:]).mapValues { _ -> [String]? in nil })
-            }
         }
         
         // Private DB Subscription
@@ -433,7 +577,7 @@ extension SDSSynchronizer {
     private func createSubscription(sharedDatabase: Bool = false) async throws {
         if !sharedDatabase {
             // Register for remote notifications so CKSubscriptions work
-            await xPlatform.registerForNotifications()
+            await cloud.registerForRemoteNotifications()
         }
         
         func log(_ text: String) {

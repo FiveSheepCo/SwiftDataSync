@@ -29,7 +29,10 @@ extension SDSSynchronizer {
     }
 
     /// The account is checked again with the next synchronization, which starts over if it's another one, see `checkLoggedIntoIcloud()`.
+    /// A running synchronization ends at its next step, as it could otherwise upload to or download from another account
+    /// with the data of the previous one, see `checkNotStopped()`. Also while stopped, so `start()` checks the account.
     @objc func accountChanged(_ notification: Notification) {
+        noteAccountChange()
         Task {
             await viewModel.set(loggedIntoiCloud: false)
             startSync()
@@ -81,7 +84,7 @@ extension SDSSynchronizer {
         
         var keys: [NSManagedObjectID: Set<String>] = [:]
         for object in context.updatedObjects where !object.objectID.isTemporaryID {
-            guard let container = object.synchronizableContainer else { continue }
+            guard let container = container(for: object) else { continue }
             let synchronizedKeys = Set(container.syncKeys + [container.parentKey].compactMap { $0 })
             let savedKeys = synchronizedKeys.intersection(object.changedValues().keys)
             if !savedKeys.isEmpty {
@@ -103,7 +106,7 @@ extension SDSSynchronizer {
         let updatedObjects = (userInfo[NSUpdatedObjectsKey] as? NSSet ?? []).compactMap { $0 as? NSManagedObject }
         let savedChanges = takeKeysBeingSaved(by: savingContext)
         let updatedChanges = updatedObjects.compactMap { object -> SDSObjectChange? in
-            guard let keys = savedChanges[object.objectID], let container = object.synchronizableContainer else { return nil }
+            guard let keys = savedChanges[object.objectID], let container = container(for: object) else { return nil }
             return identifying(SDSObjectChange(
                 localId: object.objectID.uriRepresentation().absoluteString,
                 sharableRootLocalId: container.sharableRootLocalId,
@@ -149,20 +152,27 @@ extension SDSSynchronizer {
         synchronizeAfterSave()
     }
 
-    /// How long a synchronization waits after a save, so saves in quick succession, e.g. while typing, synchronize once.
-    private static let saveSynchronizationDelay: Duration = .seconds(1)
-
     /// Synchronizes shortly after a save, or once the running synchronization is done.
     /// Saves meanwhile are synchronized by the same synchronization.
     private func synchronizeAfterSave() {
         startTask(at: \.saveSync) {
             // Nothing cancels this task.
+            // While stopped, the changes are only saved, and the state keeps showing that synchronizing is stopped.
+            let isStopped = self.isStopped
             // The state shows that a synchronization follows right away, e.g. to apps that wait for it before being suspended.
-            guard let previousState = try? await self.viewModel.waitForIdle(setting: .processingSaveEvent) else {
-                self.finishTask(at: \.saveSync)
-                return
+            var previousState: SDSSynchronizationViewModel.StateSnapshot?
+            if !isStopped {
+                guard let state = try? await self.viewModel.waitForIdle(setting: .processingSaveEvent) else {
+                    self.finishTask(at: \.saveSync)
+                    return
+                }
+                previousState = state
             }
-            try? await Task.sleep(for: Self.saveSynchronizationDelay)
+            try? await Task.sleep(for: self.timing.saveSynchronizationDelay)
+
+            // A running download keeps the objects it inserted unsaved in the observed update context, which mustn't be
+            // saved without their records, so this waits for it to end, also while synchronizing is stopped
+            try? await self.beginExclusiveActivity()
 
             // E.g. another process using the same synchronization data can keep the store busy, which must not crash
             if let observedUpdateContext = self.observedUpdateContext {
@@ -190,8 +200,13 @@ extension SDSSynchronizer {
             // Saves from now on schedule another synchronization, as the one started now might not include them
             self.finishTask(at: \.saveSync)
 
-            // E.g. an error's retry delay isn't forgotten, which a synchronization started now has to respect
-            await self.viewModel.restore(previousState)
+            if let previousState {
+                // E.g. an error's retry delay isn't forgotten, which a synchronization started now has to respect
+                await self.viewModel.restore(previousState)
+            }
+            // `start()` and `stop()` only change the state they find, which this task could have replaced meanwhile
+            await self.updateStoppedState()
+            self.endActivity()
 
             self.startSync()
         }
@@ -237,45 +252,6 @@ extension SDSSynchronizer {
         }
     }
 
-    /// Uploads keys of every local object of the entities, e.g. once this device created the zone, which holds none of them yet.
-    /// Objects in zones of other users' shares are left alone.
-    /// - Parameter keysByEntity: The keys to upload by entity name, `nil` for every synchronized key.
-    func uploadLocalObjects(keysByEntity: [String: [String]?]) {
-        guard let observedUpdateContext else { return }
-
-        let changes = observedUpdateContext.performAndWaitUnchecked {
-            var changes: [SDSObjectChange] = []
-            for (entityName, keys) in keysByEntity.sorted(by: { $0.key < $1.key }) {
-                let request = NSFetchRequest<NSManagedObject>(entityName: entityName)
-                request.includesSubentities = false
-                request.fetchBatchSize = 200
-
-                let objects: [NSManagedObject]
-                do {
-                    objects = try observedUpdateContext.fetch(request)
-                } catch {
-                    logger.error("Failed to read the local objects of `\(entityName, privacy: .public)` to upload: \(error.localizedDescription)")
-                    continue
-                }
-
-                for var change in self.changes(of: objects.compactMap(onlyIfSyncronizable), inserted: true) {
-                    if let keys {
-                        change.changedKeys = change.changedKeys.filter(keys.contains)
-                    }
-                    if !change.changedKeys.isEmpty {
-                        changes.append(change)
-                    }
-                }
-            }
-            // The objects were only read, and aren't needed anymore
-            observedUpdateContext.refreshAllObjects()
-            return changes
-        }
-
-        logger.log("Uploading \(changes.count) local objects")
-        setUpdates(for: changes, onlyPrivate: true)
-    }
-    
     /// Adds what the identity of the object's entity, if it has one, needs to the change. Has to be called on the queue of the object's context.
     private func identifying(_ change: SDSObjectChange, of container: SDSSynchronizableContainer, inserted: Bool) -> SDSObjectChange {
         guard
@@ -294,39 +270,12 @@ extension SDSSynchronizer {
     ///
     /// They're stored without waiting for `context`, as notifications are often handled on the main thread, which must never wait for it.
     /// Blocks run on its queue in order, so anything that reads the changes on its queue afterwards finds them.
-    /// - Parameter onlyPrivate: Whether changes of objects in zones of other users' shares are left out.
-    func setUpdates(for changes: [SDSObjectChange], onlyPrivate: Bool = false) {
+    func setUpdates(for changes: [SDSObjectChange]) {
         guard !changes.isEmpty else { return }
 
         let context = self.context
         context.perform {
-            for change in changes {
-                // An object without a record, e.g. one that was changed before synchronizing started, is uploaded with every key.
-                // Read first, as looking up the zone gives a root its record.
-                let hasRecord = CloudKitLocalEntity.entry(forLocalId: change.localId, in: context) != nil
-                let (id, previousId) = CloudKitLocalEntity.recordId(
-                    forLocalId: change.localId,
-                    identityRecordName: change.identityRecordName,
-                    renamingToIdentity: change.identityChanged,
-                    isReserved: { self.temporaryObject(for: $0) != nil },
-                    in: context
-                )
-                let zoneId = self.sharedZoneId(forRootLocalId: change.sharableRootLocalId)
-                if onlyPrivate && zoneId != nil {
-                    continue
-                }
-
-                if let previousId {
-                    // An identity value changed: the record of the old values is deleted, and the object uploaded as a new record
-                    self.logger.log("Moving `\(previousId)` to `\(id)`, as its identity changed")
-                    self.setRemoval(id: previousId, zoneId: zoneId)
-                    self.setUpdate(id: id, zoneId: zoneId, entityName: change.entityName, changedKeys: change.allKeys)
-                } else if !hasRecord && !change.allKeys.isEmpty {
-                    self.setUpdate(id: id, zoneId: zoneId, entityName: change.entityName, changedKeys: change.allKeys)
-                } else {
-                    self.setUpdate(id: id, zoneId: zoneId, entityName: change.entityName, changedKeys: change.changedKeys)
-                }
-            }
+            self.storeUpdates(changes)
         }
     }
 
@@ -345,7 +294,8 @@ extension SDSSynchronizer {
         let context = self.context
         context.perform {
             for deletion in deletions {
-                let id = self.recordId(forLocalId: deletion.localId)
+                // An object without a record was never uploaded, so there's nothing to delete
+                guard let id = self.existingRecordId(forLocalId: deletion.localId) else { continue }
                 // Read before the share is deleted, which would send the removal to the private database
                 let zoneId = self.sharedZoneId(forRootLocalId: deletion.sharableRootLocalId)
 

@@ -83,16 +83,18 @@ enum SDSValueCoding {
     /// Records leave out keys without a value, so a missing key was cleared, e.g. on another device. Only optional keys are
     /// cleared, not `excludedKeys`, e.g. ones with local changes, and not the keys of a pending catch-up (`catchUpKeys`,
     /// as entity names or `Entity.key`), which records might leave out only because they were never uploaded.
+    /// `presentKeys` are record keys that have values elsewhere, e.g. in the record's overflow asset (see `SDSOverflow`).
     static func clearedValues(
         of record: CKRecord,
         entity: NSEntityDescription,
         syncedKeys: [String],
         excludedKeys: Set<String>,
-        catchUpKeys: Set<String>
+        catchUpKeys: Set<String>,
+        presentKeys: Set<String> = []
     ) -> [String: Any?] {
         guard let entityName = entity.name, !catchUpKeys.contains(entityName) else { return [:] }
 
-        let recordKeys = Set(record.allKeys())
+        let recordKeys = Set(record.allKeys()).union(presentKeys)
         var values: [String: Any?] = [:]
         for key in syncedKeys where !excludedKeys.contains(key) && !catchUpKeys.contains("\(entityName).\(key)") {
             guard let property = entity.propertiesByName[key], property.isOptional else { continue }

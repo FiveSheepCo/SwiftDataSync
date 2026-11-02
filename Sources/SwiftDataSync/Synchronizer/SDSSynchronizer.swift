@@ -14,7 +14,7 @@ private extension NSManagedObjectContext {
             return state
         }
         
-        let state = SDSSynchronizerSavedState(entity: SDSSynchronizerSavedState.entity(), insertInto: self)
+        let state = SDSSynchronizerSavedState(entity: NSEntityDescription.entity(forEntityName: "SDSSynchronizerSavedState", in: self)!, insertInto: self)
         // If this fails, e.g. while another process keeps the store busy, the state is saved with the context's next save
         try? self.save()
         return state
@@ -60,14 +60,34 @@ public final class SDSSynchronizer: Sendable {
         var isObservingStore = false
         /// Whether `setup` was called, which must only happen once.
         var isSetUp = false
-        /// Whether synchronizing was stopped with `stop()`.
+        /// Whether synchronizing was stopped, with `stop()`, or e.g. after the user deleted the app's data in iCloud.
         var isStopped = false
+        /// Whether `stop()` stopped synchronizing, which the state shows, rather than e.g. the error that stopped it.
+        var showsStopped = false
+        /// Whether objects without records still have to be queued, see `backfillIfNeeded()`.
+        var needsBackfill = false
+        /// Counts the changes of the iCloud account, see `accountChanged(_:)`.
+        var accountChangeCount = 0
+        /// The `accountChangeCount` when the running synchronization started.
+        var synchronizationAccountChangeCount = 0
+        /// Uploads to the private (`false`) and the shared database (`true`) pause until then, as the iCloud storage is
+        /// full, see `QuotaExceededError`.
+        var quotaPauseEnds: [Bool: Date] = [:]
+        /// What runs: a synchronization, or something that mustn't run next to one, see `beginExclusiveActivity()`.
+        var activity = Activity.none
+        /// Whether a synchronization was requested while something else ran, which follows it.
+        var isSynchronizationRequested = false
+        /// Whether the account has to be checked before synchronizing, e.g. after it changed, see `accountChanged(_:)`.
+        var accountNeedsCheck = true
+        /// Counts the stored removals, so a download notices removals stored while it runs.
+        var removalCount = 0
+        var fileState = FileState()
+        /// Whether the file state existed when the synchronizer was made, see `migrateFileStateIfNeeded()`.
+        var hasFileState = false
 
         var defaultZoneID: CKRecordZone.ID?
-        var cloudContainer: CKContainer?
-        var cloudPrivateDatabase: CKDatabase?
-        var cloudSharedDatabase: CKDatabase?
-        
+        var cloud: (any SDSCloudContainer)?
+
         var lastCompletedUpload: Date?
         var lastCompletedDownload: Date?
         
@@ -84,8 +104,8 @@ public final class SDSSynchronizer: Sendable {
         /// The synchronized keys a context is saving to the store, by object. Read when the save starts, and taken when it's done.
         var keysBeingSaved: [ObjectIdentifier: [NSManagedObjectID: Set<String>]] = [:]
         
-        /// Records of entities with an identity that another device saved first, by name. Their next upload saves the
-        /// changed keys over them, see `takeServerRecordOfConflict(named:)`.
+        /// Records that existed already when they were saved, e.g. because another device saved the same identity first, by
+        /// name. Their next upload saves the changed keys over them, see `takeServerRecordOfConflict(named:)`.
         var serverRecordsOfConflicts: [String: CKRecord] = [:]
 
         /// Records CloudKit rejected, which aren't uploaded for a while.
@@ -98,6 +118,7 @@ public final class SDSSynchronizer: Sendable {
         var syncLeaseRetry: Task<Void, Never>?
         /// Saves the synchronization data and synchronizes shortly after the observed store was saved, see `contextSaved`.
         var saveSync: Task<Void, Never>?
+        var startedSynchronizationCount = 0
     }
     private let mutableState = OSAllocatedUnfairLock(initialState: MutableState())
     
@@ -108,9 +129,9 @@ public final class SDSSynchronizer: Sendable {
     var isStopped: Bool { mutableState.withLock { $0.isStopped } }
 
     var defaultZoneID: CKRecordZone.ID! { mutableState.withLock { $0.defaultZoneID } }
-    var cloudContainer: CKContainer! { mutableState.withLock { $0.cloudContainer } }
-    var cloudPrivateDatabase: CKDatabase! { mutableState.withLock { $0.cloudPrivateDatabase } }
-    var cloudSharedDatabase: CKDatabase! { mutableState.withLock { $0.cloudSharedDatabase } }
+    var cloud: (any SDSCloudContainer)! { mutableState.withLock { $0.cloud } }
+    var cloudPrivateDatabase: (any SDSCloudDatabase)! { cloud?.privateDatabase }
+    var cloudSharedDatabase: (any SDSCloudDatabase)! { cloud?.sharedDatabase }
     
     // MARK: States
     
@@ -132,6 +153,238 @@ public final class SDSSynchronizer: Sendable {
     /// Makes sure only one process using the same synchronization data synchronizes at a time.
     let syncLease: SDSSyncLease
     
+    /// What the synchronizer stores in a file next to the synchronization data instead of in it, so its data model doesn't
+    /// change. Processes using the same synchronization data read it again before synchronizing. It's moved with the
+    /// synchronization data, and written before the saves of the synchronization data that rely on it.
+    struct FileState: Codable, Sendable, Equatable {
+        /// The account whose private database was downloaded completely, see `hasDownloadedOnce`.
+        var downloadedOnceUserRecordName: String?
+        /// The record keys in the overflow asset of records, by record name, see `SDSOverflow`.
+        var overflowKeys: [String: [String]] = [:]
+        /// Whether every local object still has to be queued, e.g. after switching accounts, see `backfillIfNeeded()`.
+        /// Stored, so it's also done if the app is terminated before.
+        var needsFullBackfill = false
+        /// Whether objects vanished, and every record is downloaded again, see `backfill(onlyUntracked:)`.
+        var isRecoveringVanishedObjects = false
+        /// What the save of a download's page changes, until it's done, see `repairInterruptedPageSave()`.
+        var interruptedPageSave: PageSave?
+        
+        /// The local entities a page creates for the objects it inserts, by the URIs of the objects, and the records it deletes.
+        struct PageSave: Codable, Sendable, Equatable {
+            var createdLocalIds: [String]
+            var deletedRecordNames: [String]
+        }
+    }
+    
+    /// What runs, see `MutableState.activity`.
+    enum Activity: Sendable {
+        case none
+        case synchronizing
+        /// E.g. saving a share, which a running synchronization's download could interfere with.
+        case exclusive
+    }
+    
+    private var fileStateURL: URL? {
+        container.persistentStoreDescriptions.first?.url?.deletingLastPathComponent().appendingPathComponent("CloudKitSync.state.json")
+    }
+    
+    /// Reads the file state, and returns whether the file exists.
+    @discardableResult
+    func loadFileState() -> Bool {
+        guard
+            let data = fileStateURL.flatMap({ try? Data(contentsOf: $0) }),
+            let state = try? JSONDecoder().decode(FileState.self, from: data)
+        else { return false }
+        mutableState.withLock { $0.fileState = state }
+        return true
+    }
+    
+    /// Changes the file state, and writes it if it changed, or the file doesn't exist yet.
+    func updateFileState(_ update: (inout FileState) -> Void) {
+        let changed: FileState? = mutableState.withLockUnchecked { mutableState in
+            var state = mutableState.fileState
+            update(&state)
+            let previous = mutableState.fileState
+            let wasWritten = mutableState.hasFileState
+            mutableState.fileState = state
+            mutableState.hasFileState = true
+            return previous == state && wasWritten ? nil : state
+        }
+        guard let changed, let url = fileStateURL else { return }
+        do {
+            try JSONEncoder().encode(changed).write(to: url, options: .atomic)
+        } catch {
+            logger.error("Failed to store the synchronization state: \(error.localizedDescription)")
+        }
+    }
+    
+    /// The record keys in a record's overflow asset, empty if it has none, see `SDSOverflow`.
+    func overflowKeys(of recordName: String) -> Set<String> {
+        mutableState.withLock { Set($0.fileState.overflowKeys[recordName] ?? []) }
+    }
+    
+    /// Remembers the keys in the overflow assets of records, by name, empty for records without one.
+    func setOverflowKeys(_ changes: [String: Set<String>]) {
+        guard !changes.isEmpty else { return }
+        updateFileState { state in
+            for (recordName, keys) in changes {
+                state.overflowKeys[recordName] = keys.isEmpty ? nil : keys.sorted()
+            }
+        }
+    }
+    
+    /// See `FileState.interruptedPageSave`.
+    var interruptedPageSave: FileState.PageSave? {
+        mutableState.withLock { $0.fileState.interruptedPageSave }
+    }
+    
+    /// See `FileState.isRecoveringVanishedObjects`.
+    var isRecoveringVanishedObjects: Bool {
+        mutableState.withLock { $0.fileState.isRecoveringVanishedObjects }
+    }
+    
+    /// Remembers that the current account's private database was downloaded completely, see `hasDownloadedOnce`.
+    func markDownloadedOnce() {
+        let userRecordName = accessState(\.userId)?.recordName ?? ""
+        updateFileState { $0.downloadedOnceUserRecordName = userRecordName }
+    }
+    
+    /// See `hasDownloadedOnce`. Not until this launch checked the account, which could have changed while the app wasn't
+    /// running, and not after it changed until it's checked again.
+    var hasDownloadedOnceFlag: Bool {
+        mutableState.withLock { $0.fileState.downloadedOnceUserRecordName != nil && !$0.accountNeedsCheck }
+    }
+    
+    /// Whether the file state existed when the synchronizer was made, or was written since.
+    var hasFileState: Bool {
+        mutableState.withLock { $0.hasFileState }
+    }
+    
+    /// Notes that the iCloud account changed, so a running synchronization ends at its next step (see `checkNotStopped()`),
+    /// and the next one checks the account first. It's noted right away, rather than in a task, so a synchronization that
+    /// starts meanwhile doesn't upload the changes of the previous account to the new one.
+    func noteAccountChange() {
+        mutableState.withLock { state in
+            state.accountChangeCount += 1
+            state.accountNeedsCheck = true
+        }
+    }
+    
+    /// Whether the account has to be checked before synchronizing, see `MutableState.accountNeedsCheck`.
+    var accountNeedsCheck: Bool {
+        get { mutableState.withLock { $0.accountNeedsCheck } }
+        set { mutableState.withLock { $0.accountNeedsCheck = newValue } }
+    }
+    
+    var accountChangeCount: Int {
+        mutableState.withLock { $0.accountChangeCount }
+    }
+    
+    /// Notes that the account was checked, unless it changed since the check began, which is checked again then.
+    func confirmAccount(ifUnchangedSince accountChangeCount: Int) {
+        mutableState.withLock { state in
+            if state.accountChangeCount == accountChangeCount {
+                state.accountNeedsCheck = false
+            }
+        }
+    }
+    
+    /// Notes that a synchronization starts with the current account.
+    func beginSynchronizationWithCurrentAccount() {
+        mutableState.withLock { $0.synchronizationAccountChangeCount = $0.accountChangeCount }
+    }
+    
+    /// Counts the stored removals, see `MutableState.removalCount`.
+    var removalCount: Int {
+        mutableState.withLock { $0.removalCount }
+    }
+    
+    func countRemoval() {
+        mutableState.withLock { $0.removalCount += 1 }
+    }
+    
+    /// When uploads to a database resume, if its iCloud storage was full, see `QuotaExceededError`.
+    func quotaPauseEnd(sharedDatabase: Bool) -> Date? {
+        mutableState.withLock { state in state.quotaPauseEnds[sharedDatabase].flatMap { $0 > .now ? $0 : nil } }
+    }
+    
+    func pauseUploads(sharedDatabase: Bool, until date: Date) {
+        mutableState.withLock { $0.quotaPauseEnds[sharedDatabase] = date }
+    }
+    
+    /// Resumes uploads that paused as iCloud was full, e.g. when the user asks for a synchronization.
+    func resumeUploads() {
+        mutableState.withLock { $0.quotaPauseEnds = [:] }
+    }
+    
+    /// Has another synchronization follow the running one, or whatever else runs, e.g. to download what an upload changed.
+    func requestSynchronization() {
+        mutableState.withLock { $0.isSynchronizationRequested = true }
+    }
+    
+    /// Starts synchronizing, unless something else runs, after which another synchronization follows instead. Two
+    /// synchronizations never run at once: they'd share the observed update context and the objects a download inserted.
+    func claimSynchronization() -> Bool {
+        mutableState.withLock { state in
+            guard state.activity == .none else {
+                state.isSynchronizationRequested = true
+                return false
+            }
+            state.activity = .synchronizing
+            return true
+        }
+    }
+    
+    var isSynchronizing: Bool {
+        mutableState.withLock { $0.activity == .synchronizing }
+    }
+    
+    /// Waits until nothing else runs, e.g. a synchronization, and keeps synchronizations from starting until
+    /// `endExclusiveActivity()`. Throws if the task is cancelled while waiting.
+    func beginExclusiveActivity() async throws {
+        while true {
+            let isClaimed = mutableState.withLock { state in
+                guard state.activity == .none else { return false }
+                state.activity = .exclusive
+                return true
+            }
+            if isClaimed { return }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+    }
+    
+    /// Ends a synchronization or an exclusive activity, and starts a synchronization that was requested meanwhile.
+    func endActivity() {
+        let (isRequested, isStopped) = mutableState.withLock { state in
+            state.activity = .none
+            defer { state.isSynchronizationRequested = false }
+            return (state.isSynchronizationRequested, state.isStopped)
+        }
+        if isStopped {
+            // `stop()` leaves the state of a running synchronization alone
+            Task { await updateStoppedState() }
+        } else if isRequested {
+            startSync()
+        }
+    }
+    
+    /// Shows whether synchronizing is stopped. Read once it runs, so `stop()` and `start()` in quick succession end with the
+    /// state of the last one, and not while a synchronization runs, which shows its own state until it notices.
+    func updateStoppedState() async {
+        await MainActor.run {
+            let (isStopped, showsStopped, isSynchronizing) = mutableState.withLock { ($0.isStopped, $0.showsStopped, $0.activity == .synchronizing) }
+            if !isStopped {
+                viewModel.endStop()
+            } else if showsStopped && !isSynchronizing {
+                viewModel.set(state: .stopped)
+            }
+        }
+    }
+    
+    func forgetServerRecordsOfConflicts() {
+        mutableState.withLock { $0.serverRecordsOfConflicts = [:] }
+    }
+    
     /// Starts `task` unless a task stored at `keyPath` is still pending. The task has to clear it with `finishTask(at:)`.
     func startTask(at keyPath: WritableKeyPath<MutableState, Task<Void, Never>?> & Sendable, _ task: @escaping @Sendable () async -> Void) {
         mutableState.withLock { state in
@@ -149,6 +402,10 @@ public final class SDSSynchronizer: Sendable {
     /// Contexts that merge its changes report its deletions like deletions made in them, which must not be uploaded:
     /// they are deletions downloaded from iCloud, or local copies of shares that were left, whose records belong to someone else.
     func saveObservedUpdateContext(_ observedUpdateContext: NSManagedObjectContext) throws {
+        // E.g. the app removed the store to replace it. Saving would raise an exception instead of throwing.
+        guard observedUpdateContext.persistentStoreCoordinator?.persistentStores.isEmpty == false else {
+            throw CocoaError(.persistentStoreSave)
+        }
         // Deletions only reach related objects, e.g. through cascade rules, once pending changes are processed
         observedUpdateContext.processPendingChanges()
         let deletedIds = Set(observedUpdateContext.deletedObjects.map(\.objectID))
@@ -210,6 +467,11 @@ public final class SDSSynchronizer: Sendable {
         }
     }
 
+    /// How many records CloudKit rejected, see `SDSRecordQuarantine.count`.
+    var quarantinedRecordCount: Int {
+        mutableState.withLock { $0.quarantine.count }
+    }
+
     func resetQuarantine() {
         mutableState.withLock { $0.quarantine = SDSRecordQuarantine() }
     }
@@ -219,8 +481,29 @@ public final class SDSSynchronizer: Sendable {
         mutableState.withLock { body(&$0.acceptedShareZones) }
     }
     
-    let networkMonitor = NWPathMonitor()
-    
+    /// `nil` if the network isn't monitored, e.g. in tests, which then take it as available.
+    let networkMonitor: NWPathMonitor?
+
+    /// Delays the synchronizer waits for. Tests shorten them.
+    struct Timing: Sendable {
+        /// How long a synchronization waits after a save, so saves in quick succession, e.g. while typing, synchronize once.
+        var saveSynchronizationDelay: Duration = .seconds(1)
+        /// How long a synchronization waits after an error that doesn't say how long to wait. `nil` for a delay that
+        /// depends on the battery and network, see `generalLoadMultiplier`.
+        var routineRetryInterval: TimeInterval? = nil
+        /// How long uploads pause once the user's iCloud storage is full, see `QuotaExceededError`.
+        var quotaExceededRetryInterval: TimeInterval = 30 * 60
+    }
+    let timing: Timing
+
+    /// Makes the CloudKit container once `setup` names it. Tests make a fake one.
+    private let makeCloudContainer: @Sendable (String) -> any SDSCloudContainer
+
+    /// Called by downloads right after the downloaded objects were saved, before the change token, and right after their
+    /// records were saved, before the objects. Tests use them to simulate a process that is terminated in between.
+    nonisolated(unsafe) var afterSavingDownloadedObjects: (@Sendable () -> Void)?
+    nonisolated(unsafe) var afterSavingDownloadedRecords: (@Sendable () -> Void)?
+
     /// The record ids of objects that weren't saved yet, e.g. ones a download inserted. They get their `CloudKitLocalEntity`
     /// once they have permanent IDs, see `CKDownloadHandler.fetchOverallCompletion`.
     ///
@@ -249,19 +532,44 @@ public final class SDSSynchronizer: Sendable {
     
     // MARK: - Initializer
     
-    private init() {
-        self.viewModel = SDSSynchronizationViewModel.shared
-        
+    /// The model of the synchronization data, loaded once: several models claiming the same classes would confuse Core Data,
+    /// e.g. when tests make several synchronizers. It isn't changed after it's made.
+    nonisolated(unsafe) static let syncDataModel: NSManagedObjectModel = {
         let model = NSManagedObjectModel.mergedModel(from: [.module])!
         for entity in model.entities {
             entity.managedObjectClassName = "SwiftDataSync.\(entity.name!)"
         }
+        return model
+    }()
+
+    private convenience init() {
+        self.init(viewModel: .shared)
+    }
+
+    /// - Parameters:
+    ///   - syncDataDirectory: Where the synchronization data is stored, rather than the app group or the app's container.
+    ///     Tests give every synchronizer a directory of its own, so several of them act like several devices.
+    ///   - makeCloudContainer: Makes the CloudKit container `setup` names. Tests make a fake one.
+    ///   - monitorsNetwork: Whether synchronizing waits for a network connection.
+    init(
+        syncDataDirectory: URL? = nil,
+        viewModel: SDSSynchronizationViewModel,
+        makeCloudContainer: @escaping @Sendable (String) -> any SDSCloudContainer = { SDSCloudKitContainer(identifier: $0) },
+        monitorsNetwork: Bool = true,
+        timing: Timing = Timing()
+    ) {
+        self.viewModel = viewModel
+        self.makeCloudContainer = makeCloudContainer
+        self.timing = timing
+
         let container = NSPersistentContainer(
             name: "CloudKitSync",
-            managedObjectModel: model
+            managedObjectModel: Self.syncDataModel
         )
-        
-        if
+
+        if let syncDataDirectory {
+            container.persistentStoreDescriptions = [.init(url: syncDataDirectory.appendingPathComponent("CloudKitSync.sqlite"))]
+        } else if
             let appGroup = Self.appGroupToStoreSyncData,
             let containerUrl = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup)
         {
@@ -295,11 +603,22 @@ public final class SDSSynchronizer: Sendable {
         self.syncLease = SDSSyncLease(
             url: container.persistentStoreDescriptions.first?.url?.deletingLastPathComponent().appendingPathComponent("CloudKitSync.lease")
         )
-        
-        self.networkMonitor.pathUpdateHandler = { [weak self] path in
-            self?.networkPathWasUpdated(with: path)
+
+        if monitorsNetwork {
+            let networkMonitor = NWPathMonitor()
+            self.networkMonitor = networkMonitor
+            networkMonitor.pathUpdateHandler = { [weak self] path in
+                self?.networkPathWasUpdated(with: path)
+            }
+            networkMonitor.start(queue: .main)
+        } else {
+            self.networkMonitor = nil
         }
-        self.networkMonitor.start(queue: .main)
+        viewModel.synchronizer = self
+        
+        // It's small, and read right away, so `hasDownloadedOnce` is known from the start
+        let hasFileState = loadFileState()
+        mutableState.withLock { $0.hasFileState = hasFileState }
     }
     
     /// Moves the synchronization data to `url` unless something is stored there already, e.g. into the app group once an app that
@@ -314,14 +633,19 @@ public final class SDSSynchronizer: Sendable {
 
         let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "SwiftDataSync", category: "SDSSynchronizer")
         do {
+            // What was synchronized when everything was caught up on last (see `checkForNewlySynchronizedKeys(_:)`), the
+            // state that belongs to the synchronization data (see `FileState`), and the records downloads held (see
+            // `SDSHeldRecords`). They're moved first: if the app is terminated before the store is moved, the next launch
+            // moves the store, which it wouldn't do anymore for files left behind once the store was moved.
+            for name in ["CloudKitSync.keys.json", "CloudKitSync.state.json", "CloudKitSync.held"] {
+                let fileURL = sourceURL.deletingLastPathComponent().appendingPathComponent(name)
+                let destinationURL = url.deletingLastPathComponent().appendingPathComponent(name)
+                if fileManager.fileExists(atPath: fileURL.path) && !fileManager.fileExists(atPath: destinationURL.path) {
+                    try fileManager.moveItem(at: fileURL, to: destinationURL)
+                }
+            }
             try coordinator.replacePersistentStore(at: url, withPersistentStoreFrom: sourceURL, type: .sqlite)
             try coordinator.destroyPersistentStore(at: sourceURL, type: .sqlite)
-
-            // What was synchronized when everything was caught up on last, see `checkForNewlySynchronizedKeys(_:)`
-            let keysURL = sourceURL.deletingLastPathComponent().appendingPathComponent("CloudKitSync.keys.json")
-            if fileManager.fileExists(atPath: keysURL.path) {
-                try fileManager.moveItem(at: keysURL, to: url.deletingLastPathComponent().appendingPathComponent("CloudKitSync.keys.json"))
-            }
             logger.log("Moved the synchronization data to \(url.path, privacy: .public)")
         } catch {
             logger.error("Failed to move the synchronization data to \(url.path, privacy: .public): \(error)")
@@ -393,7 +717,9 @@ public final class SDSSynchronizer: Sendable {
     /// Should be called when a remote notification was received. It's ignored while synchronizing is stopped.
     public func didReceiveRemoteNotification(userInfo: [AnyHashable : Any]) async {
         // TODO(later): selectively download based on the user info
-        await self.forceDownloadSync()
+        // Unlike `forceDownloadSync()`, uploads that paused as iCloud was full stay paused
+        lastCompletedDownload = nil
+        await synchronize()
     }
 
     /// Stops synchronizing until `start()` is called, e.g. when the app's setting for it is turned off, without relaunching the app.
@@ -405,9 +731,10 @@ public final class SDSSynchronizer: Sendable {
     /// Local changes are still recorded, without contacting iCloud, so they're uploaded once synchronizing starts again.
     public func stop() {
         stopSynchronizing()
+        mutableState.withLock { $0.showsStopped = true }
 
         Task {
-            await viewModel.set(state: .stopped)
+            await updateStoppedState()
         }
     }
 
@@ -424,7 +751,14 @@ public final class SDSSynchronizer: Sendable {
     /// Starts synchronizing again after `stop()`, and synchronizes right away.
     public func start() {
         let wasStopped = mutableState.withLock { state in
-            defer { state.isStopped = false }
+            defer {
+                state.isStopped = false
+                state.showsStopped = false
+            }
+            if state.isStopped {
+                // E.g. the user freed up iCloud storage meanwhile
+                state.quotaPauseEnds = [:]
+            }
             return state.isStopped
         }
         guard wasStopped else { return }
@@ -432,18 +766,50 @@ public final class SDSSynchronizer: Sendable {
         Task {
             // Unless it was never set up, or setting up failed
             guard self.isObservingStore else { return }
-            await viewModel.endStop()
+            await updateStoppedState()
             await synchronize()
         }
+    }
+
+    /// Stops observing and synchronizing for good, like a process that is terminated: nothing is saved, the lease is given up
+    /// and the store isn't observed anymore. Tests use it to launch another synchronizer on the same data.
+    func invalidate() {
+        stopSynchronizing()
+        NotificationCenter.default.removeObserver(self)
+        mutableState.withLock { $0.isObservingStore = false }
+        syncLease.release()
+    }
+
+    /// Whether a save scheduled a synchronization that hasn't started yet, see `synchronizeAfterSave()`.
+    var hasPendingSaveSync: Bool {
+        mutableState.withLock { $0.saveSync != nil }
+    }
+
+    /// How many synchronizations started, e.g. for tests to tell whether one ran.
+    var startedSynchronizationCount: Int {
+        mutableState.withLock { $0.startedSynchronizationCount }
+    }
+
+    func countStartedSynchronization() {
+        mutableState.withLock { $0.startedSynchronizationCount += 1 }
     }
 
     /// Thrown when a running synchronization notices that synchronizing was stopped, see `stop()`.
     struct StoppedError: Error {}
 
-    /// Throws if synchronizing was stopped, so a running synchronization ends at its next step.
+    /// Thrown when a running synchronization notices that the iCloud account changed. Its next step could upload to or
+    /// download from another account with the data of the previous one, so it ends, and the next one checks the account.
+    struct AccountChangedError: Error {}
+
+    /// Throws if synchronizing was stopped, or the account changed since the synchronization started, so a running
+    /// synchronization ends at its next step.
     func checkNotStopped() throws {
+        let (isStopped, accountChanged) = mutableState.withLock { ($0.isStopped, $0.accountChangeCount != $0.synchronizationAccountChangeCount) }
         if isStopped {
             throw StoppedError()
+        }
+        if accountChanged {
+            throw AccountChangedError()
         }
     }
 
@@ -476,12 +842,10 @@ public final class SDSSynchronizer: Sendable {
     }
 
     private func setupCloudKit(containerName: String, defaultZoneID: String) {
-        let cloudContainer = CKContainer(identifier: containerName)
+        let cloud = makeCloudContainer(containerName)
         mutableState.withLock { state in
             state.defaultZoneID = CKRecordZone.ID(zoneName: defaultZoneID)
-            state.cloudContainer = cloudContainer
-            state.cloudPrivateDatabase = cloudContainer.privateCloudDatabase
-            state.cloudSharedDatabase = cloudContainer.sharedCloudDatabase
+            state.cloud = cloud
         }
     }
     
@@ -529,14 +893,47 @@ public final class SDSSynchronizer: Sendable {
             }
         }
         
+        // Saves are observed before the objects without records are looked for, so none fall in between
         setupNotifications()
-        mutableState.withLock { $0.isObservingStore = true }
+        mutableState.withLock { state in
+            state.isObservingStore = true
+            state.needsBackfill = true
+        }
 
         Task {
             // `stop()` can be called before the store is found
             await viewModel.set(state: isStopped ? .stopped : .idle)
             await synchronize()
         }
+    }
+
+    /// Writes the file state if it doesn't exist, e.g. for synchronization data of an earlier version. A missing state isn't
+    /// taken for a complete download, as a saved change token can be the one of a page, so `hasDownloadedOnce` only becomes
+    /// `true` once a download completes.
+    func writeFileStateIfNeeded() {
+        guard !hasFileState else { return }
+        updateFileState { _ in }
+    }
+
+    /// Queues the objects that were saved without the synchronizer, once after setting up, and every object once the zone
+    /// or the account is new, before the next download, see `backfill(onlyUntracked:)`. It's part of a synchronization,
+    /// which runs off the main thread, and no download runs meanwhile. Throws if the store can't be read, e.g. while data
+    /// protection keeps it locked, so it's tried again.
+    func backfillIfNeeded() throws {
+        // Every object includes the ones without records
+        if mutableState.withLock({ $0.fileState.needsFullBackfill }) {
+            try backfill(onlyUntracked: false)
+            updateFileState { $0.needsFullBackfill = false }
+            mutableState.withLock { $0.needsBackfill = false }
+        } else if mutableState.withLock({ $0.needsBackfill }) {
+            try backfill(onlyUntracked: true)
+            mutableState.withLock { $0.needsBackfill = false }
+        }
+    }
+    
+    /// Has the next synchronization look for objects without records, see `backfillIfNeeded()`.
+    func mutableStateNeedsBackfill() {
+        mutableState.withLock { $0.needsBackfill = true }
     }
     
     /// Removes placeholders of downloaded objects that earlier versions could save, e.g. when a download failed.
@@ -627,21 +1024,50 @@ public final class SDSSynchronizer: Sendable {
         mutableState.withLock { $0.catchUp?.retryDate = date }
     }
     
-    /// The keys of a record that changed locally and weren't uploaded yet, and whether it was deleted locally and that wasn't uploaded yet.
-    func pendingLocalChange(of id: String) -> (keys: Set<String>, isRemoved: Bool) {
+    /// A record's changes that weren't uploaded yet: the keys that changed locally, the ones with backfilled values (see
+    /// `CloudKitUpdate.backfilledKeys`), and whether it was deleted locally.
+    func pendingLocalChange(of id: String) -> PendingLocalChange {
         let context = self.context
         return context.performAndWait {
             let request = CloudKitRemoval.fetchRequest()
             request.predicate = NSPredicate(format: "id = %@", id)
             let isRemoved = ((try? context.count(for: request)) ?? 0) > 0
-            return (Set(CloudKitUpdate.find(for: id)?.changedKeys ?? []), isRemoved)
+            let update = CloudKitUpdate.find(for: id)
+            return PendingLocalChange(
+                keys: Set(update?.changedKeys ?? []),
+                backfilledKeys: Set(update?.backfilledKeys ?? []),
+                isLocalInsert: update?.isLocalInsert ?? false,
+                isRemoved: isRemoved
+            )
         }
+    }
+    
+    struct PendingLocalChange: Sendable {
+        var keys: Set<String> = []
+        var backfilledKeys: Set<String> = []
+        /// See `CloudKitUpdate.isLocalInsert`.
+        var isLocalInsert = false
+        var isRemoved = false
+    }
+    
+    /// The records of a database that downloads couldn't store yet, see `SDSHeldRecords`.
+    func heldRecords(sharedDatabase: Bool) -> SDSHeldRecords {
+        let directory = container.persistentStoreDescriptions.first?.url?.deletingLastPathComponent() ?? URL.temporaryDirectory
+        return SDSHeldRecords(directory: directory.appending(component: "CloudKitSync.held/\(sharedDatabase ? "shared" : "private")", directoryHint: .isDirectory))
+    }
+    
+    /// The error of a failed operation, or of the item CloudKit asks to wait for the longest, e.g. for a zone of a download,
+    /// so the next synchronization waits that long.
+    static func errorWithLongestRetryDelay(in error: Error) -> Error {
+        guard let ckError = error as? CKError, ckError.code == .partialFailure else { return error }
+        let itemErrors = (ckError.partialErrorsByItemID ?? [:]).values.compactMap { $0 as? CKError }
+        return itemErrors.filter { $0.retryAfterSeconds != nil }.max { ($0.retryAfterSeconds ?? 0) < ($1.retryAfterSeconds ?? 0) } ?? error
     }
     
     // MARK: - Helper Functions
     
     func onlyIfSyncronizable(object: Any) -> SDSSynchronizableContainer? {
-        (object as? NSManagedObject)?.synchronizableContainer
+        (object as? NSManagedObject).flatMap(container(for:))
     }
     
     private func networkPathWasUpdated(with path: NWPath) {

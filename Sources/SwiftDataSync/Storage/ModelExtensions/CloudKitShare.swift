@@ -7,7 +7,8 @@ extension CloudKitShare {
     // MARK: Initializers
     
     convenience init(id: String, share: CKShare, context: NSManagedObjectContext) {
-        self.init(entity: Self.entity(), insertInto: context)
+        // The entity of the context's model, as the class could belong to several models, e.g. in tests
+        self.init(entity: NSEntityDescription.entity(forEntityName: "CloudKitShare", in: context)!, insertInto: context)
         
         self.id = id
         self.share = share

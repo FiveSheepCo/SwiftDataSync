@@ -8,7 +8,7 @@ extension SDSSynchronizer {
     
     /// The CloudKit container that is synced, for example to present a `UICloudSharingController`.
     public var cloudKitContainer: CKContainer {
-        cloudContainer
+        cloud.ckContainer!
     }
     
     /// Shares the model, or returns the URL of its existing share.
@@ -170,7 +170,12 @@ extension SDSSynchronizer {
         let previousState = try await viewModel.waitForIdle(setting: .savingShare)
         
         let result: Result<T, Error>
+        var isExclusive = false
         do {
+            // A synchronization of this process doesn't run meanwhile, which the state alone wouldn't ensure, e.g. after
+            // `stop()` and `start()` while one runs
+            try await beginExclusiveActivity()
+            isExclusive = true
             // Another process renews the lease while it synchronizes, so this waits until it is done
             while !syncLease.acquire() {
                 try await Task.sleep(for: .seconds(1))
@@ -182,7 +187,11 @@ extension SDSSynchronizer {
             result = .failure(error)
         }
         
-        if await viewModel.endSavingShare(restoring: previousState) {
+        let isRequested = await viewModel.endSavingShare(restoring: previousState)
+        if isExclusive {
+            endActivity()
+        }
+        if isRequested {
             startSync()
         }
         return try result.get()
@@ -201,8 +210,9 @@ extension SDSSynchronizer {
             return hierarchy(of: root.object)
         }
         let rootId = root.id
-        // The root's own metadata is included, as it can be left when its row is already gone
-        let ids = Array(Set(objects.compactMap { container(for: $0)?.id } + [rootId]))
+        // The root's own metadata is included, as it can be left when its row is already gone. Objects without records
+        // have no metadata.
+        let ids = Array(Set(objects.compactMap { existingRecordId(of: $0) } + [rootId]))
         
         let context = self.context
         try context.performAndWait {
@@ -314,7 +324,7 @@ extension SDSSynchronizer {
         // The record ID depends on the object's parents, which have to be read on its context's queue
         let id = sharable.object.managedObjectContext?.performAndWaitUnchecked { sharable.recordId } ?? sharable.recordId
         let record = CKRecord(recordType: sharable.object.entity.name!, recordID: id)
-        let shareId = CKRecord.ID(recordName: "\(id.recordName)\(staticShareExtension)", zoneID: SDSSynchronizer.shared.defaultZoneID)
+        let shareId = CKRecord.ID(recordName: "\(id.recordName)\(staticShareExtension)", zoneID: defaultZoneID)
         let share = CKShare(rootRecord: record, shareID: shareId)
         share.publicPermission = publicPermission
         share[CKShare.SystemFieldKey.title] = title
@@ -410,7 +420,7 @@ extension SDSSynchronizer {
                 }
             }
             
-            cloudContainer.add(acceptSharesOperation)
+            cloud.add(acceptSharesOperation)
         }
         
         try await whileSyncIsIdle {

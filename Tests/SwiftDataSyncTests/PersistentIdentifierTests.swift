@@ -14,7 +14,7 @@ final class TestModel {
 }
 
 /// The synchronizer finds models in the observed store by the URI of their identifier, which needs a store and no CloudKit.
-@Suite
+@Suite(.coreDataReady)
 struct PersistentIdentifierTests {
     
     /// A model container and a coordinator on the same store, like the store the synchronizer observes.

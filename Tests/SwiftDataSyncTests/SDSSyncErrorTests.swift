@@ -2,7 +2,7 @@ import Testing
 @testable import SwiftDataSync
 
 /// Errors are shown to users, so their titles must be the package's translated strings rather than their keys.
-@Suite
+@Suite(.coreDataReady)
 struct SDSSyncErrorTests {
 
     @Test func titleIsLocalized() {

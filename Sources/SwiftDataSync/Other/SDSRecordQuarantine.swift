@@ -25,6 +25,11 @@ struct SDSRecordQuarantine: Sendable {
         return entry.lastChangeDate == lastChangeDate && now < entry.endDate
     }
 
+    /// How many records were rejected, also ones whose time is up.
+    var count: Int {
+        entries.count
+    }
+
     mutating func add(_ recordName: String, lastChangeDate: Date, now: Date = .now) {
         entries[recordName] = Entry(lastChangeDate: lastChangeDate, endDate: now.addingTimeInterval(Self.duration))
     }

@@ -46,8 +46,13 @@ private enum DownloadScope {
 
 extension SDSSynchronizer {
     
-    /// - Parameter refreshingSharedZones: Whether the shared zones have to be refreshed, which `synchronize()` usually did before uploading already.
-    func download(refreshingSharedZones: Bool = true) async throws {
+    /// Downloads the private database, then the shared one.
+    ///
+    /// Returns the error of the shared database's download instead of throwing it, e.g. for a zone of another user that keeps
+    /// failing, as it mustn't keep the private database from being uploaded. Its own changes aren't uploaded then, as they're
+    /// only uploaded after a download.
+    /// - Parameter refreshingSharedZones: Whether the shared zones have to be refreshed, which `synchronize()` usually did already.
+    func download(refreshingSharedZones: Bool = true) async throws -> (any Error)? {
         // Downloads skip models and keys this version doesn't synchronize, e.g. ones a newer version added, while their change
         // tokens move on. Once more is synchronized, they are caught up on by downloading every record once more.
         let catchUp = pendingCatchUp
@@ -56,11 +61,15 @@ extension SDSSynchronizer {
         try await _download(scope: scope)
         try checkNotStopped()
 
-        if refreshingSharedZones {
-            try await refreshSharedZoneIDs()
+        do {
+            if refreshingSharedZones {
+                try await refreshSharedZoneIDs()
+            }
+            try await self._download(sharedDatabase: true, scope: scope)
+        } catch let error where !(error is StoppedError || error is AccountChangedError || error is SDSSyncLease.UnavailableError || Self.isNotAuthenticated(error)) {
+            logger.error("Failed to download the shared database: \(error.localizedDescription)")
+            return error
         }
-
-        try await self._download(sharedDatabase: true, scope: scope)
 
         // Extensions can have little memory and time, so the app catches up
         let isAppExtension = Bundle.main.bundleURL.pathExtension == "appex"
@@ -74,11 +83,9 @@ extension SDSSynchronizer {
 
                 // Local values of the newly synchronized keys were never uploaded, so records leave them out. Once caught up,
                 // a record leaving out a key clears it (see `SDSValueCoding.clearedValues`), so they're uploaded first.
-                // Until then, downloads leave them alone, as they're local changes.
-                uploadLocalObjects(keysByEntity: keysByEntity(catchUp.newKeys))
+                // Until then, downloads leave them alone, as they're local changes. The upload follows this download.
+                try uploadLocalObjects(keysByEntity: keysByEntity(catchUp.newKeys))
                 finishCatchUp(catchUp)
-                // They're uploaded by the next synchronization
-                startSync()
             } catch {
                 // The synchronization itself succeeded
                 logger.log("Failed to catch up, retrying later: \(error.localizedDescription)")
@@ -91,7 +98,7 @@ extension SDSSynchronizer {
                     self.finishTask(at: \.catchUpRetry)
                     self.startSync()
                 }
-                return
+                return nil
             }
 
             // Records were held back if they reference records only the catch-up downloaded.
@@ -99,11 +106,13 @@ extension SDSSynchronizer {
             try await _download(scope: .all(catchUpIsPending: false))
             try await _download(sharedDatabase: true, scope: .all(catchUpIsPending: false))
         }
+        return nil
     }
     
     /// Registers newly shared zones, and cleans up after zones that are no longer shared with the current user.
     ///
-    /// Called before uploading, as pending changes for a zone that is gone can never be uploaded and would fail the upload.
+    /// Called before downloading and uploading, as pending changes for a zone that is gone can never be uploaded and would
+    /// fail the upload.
     func refreshSharedZoneIDs() async throws {
         // CloudKit shared zones always have the zoneName of the private zone that originally shared it. That said, all shared zones should always have the name of the default zone.
         let ids = try await cloudSharedDatabase.allRecordZones().map(\.zoneID).filter({ $0.zoneName == defaultZoneID.zoneName })
@@ -249,8 +258,19 @@ extension SDSSynchronizer {
         )
         operation.fetchAllChanges = true
         
+        let handler = CKDownloadHandler(synchronizer: self, forSharedDatabase: sharedDatabase, scope: scope)
+        if sharedDatabase {
+            // Records of zones that are no longer shared mustn't be stored
+            handler.forgetHeldRecords(outside: Set(configurations.keys))
+        }
+        // Records that failed to download before are downloaded again, rather than holding back the change token
+        let failedRecordIDs = handler.recordIDsToDownloadAgain
+        if !failedRecordIDs.isEmpty, let results = try? await (sharedDatabase ? cloudSharedDatabase : cloudPrivateDatabase).records(for: failedRecordIDs, desiredKeys: nil) {
+            handler.addDownloadedAgain(results)
+        }
+        
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let handler = CKDownloadHandler(synchronizer: self, forSharedDatabase: sharedDatabase, scope: scope) { [weak self] error in
+            handler.completionHandler = { [weak self] error in
                 guard let self else { return }
                 
                 if let error = error {
@@ -262,9 +282,17 @@ extension SDSSynchronizer {
                 logger.log("Download completed")
                 
                 self.lastCompletedDownload = Date()
+                // Also if records were held back, e.g. as their references are missing. They might never be resolved.
+                if !sharedDatabase, case .all = scope {
+                    self.markDownloadedOnce()
+                    if self.isRecoveringVanishedObjects {
+                        self.finishRecoveringVanishedObjects()
+                    }
+                }
                 
                 continuation.resume()
             }
+            handler.operation = operation
             
             operation.recordWasChangedBlock = handler.changed
             operation.recordWithIDWasDeletedBlock = handler.deleted
@@ -306,64 +334,218 @@ extension SDSSynchronizer {
     fileprivate func cloudKeys(for keys: Set<String>) -> [CKRecord.FieldKey] {
         guard let model = observedStore?.managedObjectModel, let configuration else { return [] }
         
-        return keys.flatMap { key -> [CKRecord.FieldKey] in
+        let cloudKeys = keys.flatMap { key -> [CKRecord.FieldKey] in
             let parts = key.split(separator: ".", maxSplits: 1).map(String.init)
             guard let entity = model.entitiesByName[parts[0]] else { return [] }
             let propertyNames = parts.count == 2 ? [parts[1]] : configuration.entities[parts[0]]?.syncedProperties ?? []
-            return propertyNames.map { entity.propertiesByName[$0]?.renamingIdentifier ?? $0 }
+            // Large values can be in the record's overflow asset, see `SDSOverflow`
+            let overflows = configuration.entities[parts[0]].map { SDSOverflow.keys(of: $0, description: entity).contains(where: propertyNames.contains) } ?? false
+            return propertyNames.map { entity.propertiesByName[$0]?.renamingIdentifier ?? $0 } + (overflows ? [SDSOverflow.key] : [])
         }
+        return Array(Set(cloudKeys))
     }
 }
 
+/// Stores the records of a download.
+///
+/// What's downloaded is saved at every change token update, together with the token. A long first download thus doesn't
+/// keep every record in memory, and continues where it was if the app is suspended or terminated meanwhile. Records that
+/// can't be stored yet, e.g. as their references weren't downloaded yet, are held in files (see `SDSHeldRecords`), so they
+/// don't keep the token from moving on. What wasn't saved yet is discarded if storing fails, so it's downloaded again.
+///
+/// The operation's callbacks run one after another, like the other accesses of the handler's state.
 private final class CKDownloadHandler {
     
+    /// Records that can't be stored yet, e.g. as their references weren't downloaded yet, which are tried again once the
+    /// records they wait for arrived, and kept for later downloads otherwise.
     var recordsToAddLater: [CKRecord] = []
-    var objectsToEnsureParentReferencesFor: [(container: SDSSynchronizableContainer, reference: CKRecord.Reference)] = []
+    /// The name of the record each held record waits for, so it's only tried again once that arrived. Unknown for records
+    /// held by an earlier download.
+    private var heldBlockers: [CKRecord.ID: String] = [:]
+    /// Names of the records stored since held records were tried last.
+    private var storedSinceRetry: Set<String> = []
+    /// Records that couldn't be stored as they are, e.g. as their overflow asset is corrupt, or their values are invalid.
+    /// They're kept for later downloads, rather than discarding the download over and over.
+    private var setAsideRecords: [CKRecord] = []
+    /// The held records whose files exist, with the change tags of the versions in the files, see `SDSHeldRecords`.
+    private var persistedHeld: [CKRecord.ID: String] = [:]
+    private var persistedHeldIDs: Set<CKRecord.ID> { Set(persistedHeld.keys) }
+    
+    /// What tells versions of a record apart.
+    private static func version(of record: CKRecord) -> String {
+        record.recordChangeTag ?? record.modificationDate.map { "\($0.timeIntervalSince1970)" } ?? UUID().uuidString
+    }
+    /// Records that failed to download, which later downloads download again.
+    private var failedRecordIDs: Set<CKRecord.ID> = []
+    private var persistedFailedRecordIDs: Set<CKRecord.ID> = []
+    /// Keeps the held records of the database, `nil` for a catch-up, whose records only have some keys.
+    private let heldRecords: SDSHeldRecords?
+    /// The records stored since the last save, by name, to set aside one that turns out to be invalid when saving.
+    private var pageRecords: [String: CKRecord] = [:]
+    
+    /// An object whose parent is set once every record of the download is stored, as the parent might be downloaded later.
+    /// This also restores the parent of an object that a parent's ordered relationship lost when two devices added an
+    /// object at the same time.
+    private struct ParentReference {
+        /// The object until it's saved, its ID afterwards, so saved objects aren't kept in memory.
+        var object: NSManagedObject?
+        var objectID: NSManagedObjectID?
+        let parentKey: String
+        let record: CKRecord
+        var parentRecordID: CKRecord.ID { record.parent!.recordID }
+        /// Whether the parent was found already.
+        var isResolved = false
+    }
+    private var parentReferences: [ParentReference] = []
     
     weak var synchronizer: SDSSynchronizer!
     weak var context: NSManagedObjectContext!
+    /// The download's operation, which is cancelled once the download can't go on.
+    weak var operation: CKOperation?
     private var tokensToUpdate: [CKRecordZone.ID?: CKServerChangeToken] = [:]
     /// Records this download deletes. Their metadata is only removed once the download is saved, as discarding it restores their objects.
     private var deletedRecordIds: Set<String> = []
-    /// Keeps a record from being stored incompletely. The download is discarded, so the record is downloaded again.
+    /// Keeps a record from being stored incompletely, e.g. as the store can't be read. The download is discarded, so the
+    /// record is downloaded again.
     private var applyError: (any Error)?
+    /// Ends the download, e.g. after storing a page failed, or synchronizing was stopped. What wasn't saved was discarded,
+    /// and later changes of the operation are ignored.
+    private var failure: (any Error)?
     let isForSharedDatabase: Bool
     /// The models and keys that are stored.
     let scope: DownloadScope
     /// Whether the change tokens are saved, which a catch-up doesn't do, as it doesn't include deletions.
     var savesChangeTokens: Bool { !scope.isCatchingUp }
-    /// Zones whose change tokens aren't saved, as their records with missing references are downloaded again later.
-    private var zonesWithHeldRecords: Set<CKRecordZone.ID> = []
     /// Zones whose change tokens expired. Their tokens are reset once the download is saved, see `SDSSynchronizer.ChangeTokenExpiredError`.
     private var zonesWithExpiredTokens: Set<CKRecordZone.ID> = []
     /// The error if the zone of the private database is gone, see `SDSSynchronizer.PrivateZoneMissingError`.
     private var privateZoneError: CKError?
+    /// The errors of zones that failed, which CloudKit only reports for each zone: the operation's result is a success
+    /// although some zones failed.
+    private var zoneErrors: [CKRecordZone.ID: any Error] = [:]
     /// The local entities of the downloaded objects, which are removed if the download is discarded.
     private var createdLocalEntities: [CloudKitLocalEntity] = []
-    let completionHandler: (Error?) -> Void
+    /// Whether objects changed locally while downloading, whose downloaded values were discarded, see `save()`.
+    private var hadLocalChanges = false
+    /// Records with pending updates that turned out to exist, see `CloudKitUpdate.recordExists()`.
+    private var existingRecords: Set<String> = []
+    /// The keys in the overflow asset of records, by name, see `SDSOverflow`.
+    private var overflowChanges: [String: Set<String>] = [:]
+    /// Saved local objects by their identity, for records that aren't known yet.
+    private let identityIndex: SDSIdentityIndex
+    /// Local objects without records by their values, while vanished objects are recovered, see `SDSContentIndex`.
+    private var contentIndex: SDSContentIndex?
+    /// The records with pending updates or removals when the download started, so records without any don't need a fetch.
+    /// Changes saved while downloading are noticed when saving, see `save()`, and removals are read again once they change.
+    private let pendingUpdateIds: Set<String>
+    private var pendingRemovalIds: Set<String>
+    private var removalCount: Int
+    var completionHandler: (Error?) -> Void = { _ in }
     
-    init(synchronizer: SDSSynchronizer, forSharedDatabase: Bool, scope: DownloadScope, completionHandler: @escaping (Error?) -> Void) {
+    init(synchronizer: SDSSynchronizer, forSharedDatabase: Bool, scope: DownloadScope) {
         self.synchronizer = synchronizer
         self.context = synchronizer.observedUpdateContext
+        self.identityIndex = SDSIdentityIndex(context: synchronizer.observedUpdateContext!)
         
         self.isForSharedDatabase = forSharedDatabase
         self.scope = scope
-        self.completionHandler = completionHandler
+        
+        self.removalCount = synchronizer.removalCount
+        self.pendingUpdateIds = Self.ids(of: "CloudKitUpdate", in: synchronizer.context)
+        self.pendingRemovalIds = Self.ids(of: "CloudKitRemoval", in: synchronizer.context)
+        
+        if case .all = scope {
+            let heldRecords = synchronizer.heldRecords(sharedDatabase: forSharedDatabase)
+            self.heldRecords = heldRecords
+            // Tried again at the first page or at the end
+            recordsToAddLater = heldRecords.load()
+            persistedHeld = Dictionary(recordsToAddLater.map { ($0.recordID, Self.version(of: $0)) }, uniquingKeysWith: { $1 })
+            failedRecordIDs = heldRecords.loadFailedIDs()
+            persistedFailedRecordIDs = failedRecordIDs
+            if !forSharedDatabase && synchronizer.isRecoveringVanishedObjects {
+                contentIndex = SDSContentIndex(synchronizer: synchronizer, context: synchronizer.observedUpdateContext!, trackedLocalIds: Self.ids(of: "CloudKitLocalEntity", key: "localId", in: synchronizer.context))
+            }
+        } else {
+            heldRecords = nil
+        }
+    }
+    
+    /// Forgets the held records of zones that are no longer shared with the user.
+    func forgetHeldRecords(outside zoneIDs: Set<CKRecordZone.ID>) {
+        recordsToAddLater.removeAll { !zoneIDs.contains($0.recordID.zoneID) }
+        failedRecordIDs = failedRecordIDs.filter { zoneIDs.contains($0.zoneID) }
+    }
+    
+    /// The records that failed to download before, which are downloaded again before the zone's changes.
+    var recordIDsToDownloadAgain: [CKRecord.ID] {
+        Array(failedRecordIDs)
+    }
+    
+    /// Adds records that were downloaded again, see `recordIDsToDownloadAgain`. Records that are gone aren't downloaded again.
+    func addDownloadedAgain(_ results: [CKRecord.ID: Result<CKRecord, any Error>]) {
+        for (recordID, result) in results {
+            switch result {
+            case .success(let record):
+                failedRecordIDs.remove(recordID)
+                recordsToAddLater.append(record)
+            case .failure(let error as CKError) where error.code == .unknownItem:
+                failedRecordIDs.remove(recordID)
+            case .failure:
+                break
+            }
+        }
+    }
+    
+    private static func ids(of entityName: String, key: String = "id", in context: NSManagedObjectContext) -> Set<String> {
+        context.performAndWait {
+            // Saved first, as dictionaries are only read from the store
+            try? context.save()
+            let request = NSFetchRequest<NSDictionary>(entityName: entityName)
+            request.resultType = .dictionaryResultType
+            request.propertiesToFetch = [key]
+            return Set(((try? context.fetch(request)) ?? []).compactMap { $0[key] as? String })
+        }
+    }
+    
+    /// The record's changes that weren't uploaded yet, see `SDSSynchronizer.pendingLocalChange(of:)`.
+    private func pendingLocalChange(of id: String) -> SDSSynchronizer.PendingLocalChange {
+        // E.g. a record that this download replaced with another one of the same identity
+        if synchronizer.removalCount != removalCount {
+            removalCount = synchronizer.removalCount
+            pendingRemovalIds = Self.ids(of: "CloudKitRemoval", in: synchronizer.context)
+        }
+        guard pendingUpdateIds.contains(id) || pendingRemovalIds.contains(id) else { return .init() }
+        return synchronizer.pendingLocalChange(of: id)
     }
     
     func changed(recordId: CKRecord.ID, result: Result<CKRecord, any Error>) {
+        guard failure == nil else { return }
         guard case .success(let record) = result else {
-            // E.g. an asset of the record couldn't be downloaded. Saving the zone's change token would skip the record
-            // until it changes again, so the token is kept and the zone's changes are downloaded again later.
-            // The operation's callbacks run one after another, like the other accesses of the handler's state.
+            // E.g. an asset of the record couldn't be downloaded. It's downloaded again by the next download, rather than
+            // holding back the change token, which would skip the record until it changes again.
             synchronizer.logger.error("Failed to download `\(recordId.recordName)`, downloading it again later: \(String(describing: result))")
-            zonesWithHeldRecords.insert(recordId.zoneID)
+            if heldRecords != nil {
+                failedRecordIDs.insert(recordId)
+            }
             return
         }
 
         synchronizer.logger.log("[Download] Changed: \(record)")
         context.performAndWaitUnchecked {
+            // A newer version replaces the one that was held
+            recordsToAddLater.removeAll { $0.recordID == record.recordID }
+            setAsideRecords.removeAll { $0.recordID == record.recordID }
+            failedRecordIDs.remove(record.recordID)
             self._changed(record: record)
+        }
+        failIfNotApplied()
+    }
+    
+    /// Ends the download right away once a record couldn't be stored, e.g. as the store can't be read, rather than keeping
+    /// every later record in memory only to discard it.
+    private func failIfNotApplied() {
+        if let applyError {
+            fail(with: applyError)
         }
     }
 
@@ -397,27 +579,60 @@ private final class CKDownloadHandler {
             synchronizer.logger.log("Skipping record of `\(record.recordType, privacy: .public)`, which isn't synchronized")
             return
         }
+        let recordName = record.recordID.recordName
+
+        // Large values can be in an asset, see `SDSOverflow`. They're values like the record's own. Assets are read before
+        // anything is stored, so a record whose asset can't be read is set aside rather than stored partially.
+        let overflowValues: [String: Any]
+        var assetData: [String: Data] = [:]
+        do {
+            overflowValues = try SDSOverflow.values(in: record) ?? [:]
+            for key in record.allKeys() where key != SDSOverflow.key {
+                guard let asset = record[key] as? CKAsset else { continue }
+                assetData[key] = try asset.fileURL.map { try Data(contentsOf: $0) }
+            }
+        } catch let error as CocoaError where error.isFileError {
+            // E.g. the file was removed meanwhile. The record is downloaded again by the next download.
+            synchronizer.logger.error("Failed reading an asset of `\(recordName)`, downloading it again later: \(error.localizedDescription)")
+            if heldRecords != nil {
+                failedRecordIDs.insert(record.recordID)
+            }
+            return
+        } catch {
+            synchronizer.logger.error("Failed reading an asset of `\(recordName)`, setting it aside: \(error.localizedDescription)")
+            setAside(record)
+            return
+        }
 
         // Make sure dependent objects exist, and prefill all values if they do
         guard var kVPs = self.valuesIfAllReferencesExist(for: record, entity: entity, syncedKeys: entityConfiguration.syncedProperties) else {
             self.recordsToAddLater.append(record)
             return
         }
+        // Values of the record win over the asset's, e.g. ones a version without overflow assets saved
+        for (rawKey, value) in overflowValues where record[rawKey] == nil && isStored(rawKey, entity: entity, syncedKeys: entityConfiguration.syncedProperties) {
+            kVPs[rawKey] = value
+        }
 
         // Local changes that weren't uploaded yet win, as they are uploaded over the record next. E.g. a change saved after
-        // the upload this download follows would otherwise be overwritten with the uploaded value, which is then uploaded again.
+        // the last upload would otherwise be overwritten with the downloaded value.
         // A catch-up also downloads every record rather than the ones that changed since, with values older than local changes.
-        let pendingChange = synchronizer.pendingLocalChange(of: record.recordID.recordName)
+        // Backfilled values are of unknown age, so they're dropped once the record exists, see `CloudKitUpdate.backfilledKeys`.
+        let pendingChange = pendingLocalChange(of: recordName)
         guard !pendingChange.isRemoved else {
             // The object was deleted locally, which is uploaded next
-            synchronizer.logger.log("Skipping record `\(record.recordID.recordName)`, which was deleted locally")
+            synchronizer.logger.log("Skipping record `\(recordName)`, which was deleted locally")
             return
         }
         if !pendingChange.keys.isEmpty {
             kVPs = kVPs.filter { rawKey, _ in !pendingChange.keys.contains(findCorrespondingKey(entity: entity, rawKey: rawKey)) }
         }
         if case .all = scope {
-            kVPs.merge(clearedValues(of: record, entity: entity, syncedKeys: entityConfiguration.syncedProperties, pendingKeys: pendingChange.keys)) { current, _ in current }
+            kVPs.merge(clearedValues(of: record, entity: entity, syncedKeys: entityConfiguration.syncedProperties, pendingKeys: pendingChange.keys, presentKeys: Set(overflowValues.keys))) { current, _ in current }
+            overflowChanges[recordName] = Set(overflowValues.keys)
+            if !pendingChange.backfilledKeys.isEmpty || pendingChange.isLocalInsert {
+                existingRecords.insert(recordName)
+            }
         }
 
         let insertsObject = scope.insertsObjects(of: record.recordType)
@@ -425,10 +640,12 @@ private final class CKDownloadHandler {
             guard !kVPs.isEmpty || insertsObject else { return }
         }
 
-        guard let container = retrieveObject(for: record, insertingIfMissing: insertsObject, preliminaryUpdateHandler: { container in
+        guard let container = retrieveObject(for: record, entity: entity, configuration: entityConfiguration, overflowValues: overflowValues, insertingIfMissing: insertsObject, preliminaryUpdateHandler: { container, movedPendingKeys in
             guard let container else { return }
 
             let object = container.object
+            // Local changes of an object that got this record, see `SDSSynchronizer.retrieve`
+            let kVPs = movedPendingKeys.isEmpty ? kVPs : kVPs.filter { rawKey, _ in !movedPendingKeys.contains(findCorrespondingKey(entity: entity, rawKey: rawKey)) }
             for (rawKey, value) in kVPs {
                 guard rawKey != SDSSynchronizer.Constants.parentWorkaroundKey else { continue }
 
@@ -440,93 +657,111 @@ private final class CKDownloadHandler {
                 let type = attribute?.type
                 if let value = value as? SDSSynchronizableContainer {
                     object.setValue(value.object, forKey: key)
-                } else if let asset = value as? CKAsset {
-                    let data: Data?
-                    do {
-                        data = try asset.fileURL.map { try Data(contentsOf: $0) }
-                    } catch {
-                        // Storing the record without it would lose the value, or fail the save of a new object
-                        synchronizer.logger.error("Failed reading asset for key `\(object.entity.name ?? "")`.`\(key)`: \(error.localizedDescription)")
-                        applyError = error
-                        continue
-                    }
-                    object.setValue(data, forKey: key)
+                } else if value is CKAsset {
+                    set(assetData[rawKey], forKey: key, of: object)
                 } else if let attribute, value is Data || value is String {
                     // E.g. transformed values, `Codable` values, URLs and UUIDs, see `SDSValueCoding`
                     do {
-                        object.setValue(try SDSValueCoding.localValue(for: value, attribute: attribute), forKey: key)
+                        set(try SDSValueCoding.localValue(for: value, attribute: attribute), forKey: key, of: object)
                     } catch {
                         synchronizer.logger.error("Failed setting the value of `\(object.entity.name ?? "")`.`\(key)`: \(String(describing: error))")
                     }
+                } else if attribute == nil {
+                    // Relationships
+                    object.setValue(value, forKey: key)
                 } else {
                     // Also apply some sanity checks
                     if let attribute, type == .boolean {
                         let possibleValues: [Int?] = attribute.isOptional ? [nil, 0, 1] : [0, 1]
                         if !possibleValues.contains(value as? Int) {
-                            object.setValue(attribute.defaultValue, forKey: key)
+                            set(attribute.defaultValue, forKey: key, of: object)
                             continue
                         }
                     }
                     
-                    object.setValue(value, forKey: key)
+                    set(value, forKey: key, of: object)
                 }
             }
 
             synchronizer.logger.log("Object updated: \(object)")
         }) else { return }
+        
+        pageRecords[recordName] = record
+        storedSinceRetry.insert(recordName)
 
         if
-            let reference = record.parent,
-            container.parentKey.map({ scope.includes(entity: record.recordType, key: $0) && !pendingChange.keys.contains($0) }) ?? true
+            record.parent != nil,
+            let parentKey = container.parentKey,
+            scope.includes(entity: record.recordType, key: parentKey),
+            !pendingChange.keys.contains(parentKey)
         {
-            // The parent is set once every record of the download is stored, as it might be downloaded after this record.
-            // This also restores the parent of an object that a parent's ordered relationship lost when two devices added
-            // an object at the same time.
-            objectsToEnsureParentReferencesFor.append((container, reference))
+            // The parent is set once every record of the download is stored, as it might be downloaded after this record
+            parentReferences.append(ParentReference(object: container.object, parentKey: parentKey, record: record))
+        }
+    }
+    
+    /// Keeps a record that can't be stored as it is for later downloads, see `setAsideRecords`.
+    private func setAside(_ record: CKRecord) {
+        guard heldRecords != nil else { return }
+        setAsideRecords.removeAll { $0.recordID == record.recordID }
+        setAsideRecords.append(record)
+    }
+    
+    /// Sets an attribute's value unless it has it already, so records that didn't change, e.g. when every record is
+    /// downloaded again, don't change the objects for the app's contexts.
+    private func set(_ value: Any?, forKey key: String, of object: NSManagedObject) {
+        let current = object.value(forKey: key)
+        switch (current, value) {
+        case (nil, nil):
+            return
+        case (let current as NSObject, let value as NSObject) where current.isEqual(value):
+            return
+        default:
+            object.setValue(value, forKey: key)
         }
     }
 
-    /// See `SDSValueCoding.clearedValues(of:entity:syncedKeys:excludedKeys:catchUpKeys:)`.
-    private func clearedValues(of record: CKRecord, entity: NSEntityDescription, syncedKeys: [String], pendingKeys: Set<String>) -> [String: Any?] {
+    /// See `SDSValueCoding.clearedValues(of:entity:syncedKeys:excludedKeys:catchUpKeys:presentKeys:)`.
+    private func clearedValues(of record: CKRecord, entity: NSEntityDescription, syncedKeys: [String], pendingKeys: Set<String>, presentKeys: Set<String>) -> [String: Any?] {
         SDSValueCoding.clearedValues(
             of: record,
             entity: entity,
             syncedKeys: syncedKeys,
             excludedKeys: pendingKeys,
-            catchUpKeys: synchronizer.pendingCatchUp?.newKeys ?? []
+            catchUpKeys: synchronizer.pendingCatchUp?.newKeys ?? [],
+            presentKeys: presentKeys
         )
     }
 
     private func findCorrespondingKey(entity: NSEntityDescription, rawKey: String) -> String {
+        if let name = propertyName(entity: entity, rawKey: rawKey) {
+            return name
+        }
+        assertionFailure()
+        return rawKey
+    }
+    
+    /// The name of the property a record stores under `rawKey`, its renaming identifier, if the entity has one.
+    private func propertyName(entity: NSEntityDescription, rawKey: String) -> String? {
         if entity.propertiesByName[rawKey] != nil {
             return rawKey
         }
-
-        for property in entity.properties where property.renamingIdentifier == rawKey {
-            return property.name
-        }
-
-        assertionFailure()
-        return rawKey
+        return entity.properties.first { $0.renamingIdentifier == rawKey }?.name
+    }
+    
+    /// Whether a record key is stored: keys added by a newer version of the app aren't stored by this one, and neither are
+    /// keys this process doesn't synchronize, e.g. a relationship to a model that an extension doesn't synchronize, whose
+    /// objects it would never find. Keys outside of the download's scope are stored by another download.
+    private func isStored(_ rawKey: String, entity: NSEntityDescription, syncedKeys: [String]) -> Bool {
+        guard rawKey != SDSSynchronizer.Constants.parentWorkaroundKey, let key = propertyName(entity: entity, rawKey: rawKey) else { return false }
+        return syncedKeys.contains(key) && scope.includes(entity: entity.name ?? "", key: key)
     }
 
     private func valuesIfAllReferencesExist(for record: CKRecord, entity: NSEntityDescription, syncedKeys: [String]) -> [String: Any?]? {
         var values = [String: Any?]()
 
-        // Keys added by a newer version of the app aren't stored by this one. Their references might never be found,
-        // which would keep the record from being stored.
-        let isKnownKey = { (key: String) in
-            entity.propertiesByName[key] != nil || entity.properties.contains { $0.renamingIdentifier == key }
-        }
-        // Keys that this process doesn't synchronize aren't stored either, e.g. a relationship to a model that an extension
-        // doesn't synchronize, whose objects it would never find.
-        // Keys outside of the download's scope are stored by another download, so their references don't have to exist yet
-        let isStored = { (key: String) in
-            let correspondingKey = self.findCorrespondingKey(entity: entity, rawKey: key)
-            return syncedKeys.contains(correspondingKey) && self.scope.includes(entity: entity.name ?? "", key: correspondingKey)
-        }
-
-        for key in record.allKeys() where key != SDSSynchronizer.Constants.parentWorkaroundKey && isKnownKey(key) && isStored(key) {
+        // References of keys that aren't stored might never be found, which would keep the record from being stored
+        for key in record.allKeys() where isStored(key, entity: entity, syncedKeys: syncedKeys) {
             let value = record[key]
             
             if let reference = value as? CKRecord.Reference {
@@ -534,6 +769,7 @@ private final class CKDownloadHandler {
                     values[key] = object
                 } else {
                     synchronizer.logger.log("noObject1: \(reference.recordID) for \(key)")
+                    heldBlockers[record.recordID] = reference.recordID.recordName
                     return nil
                 }
             } else if let references = value as? [CKRecord.Reference] {
@@ -543,10 +779,11 @@ private final class CKDownloadHandler {
                         objects.append(container)
                     } else {
                         synchronizer.logger.log("noObject2: \(reference.recordID)")
+                        heldBlockers[record.recordID] = reference.recordID.recordName
                         return nil
                     }
                 }
-                values[key] = NSOrderedSet(array: objects)
+                values[key] = NSOrderedSet(array: objects.map(\.object))
             } else {
                 values[key] = value
             }
@@ -569,34 +806,51 @@ private final class CKDownloadHandler {
     
     private func retrieveObject(
         for record: CKRecord,
+        entity: NSEntityDescription,
+        configuration: SDSInternalConfiguration.Entity,
+        overflowValues: [String: Any],
         insertingIfMissing: Bool,
-        preliminaryUpdateHandler: (SDSSynchronizableContainer?) -> Void
+        preliminaryUpdateHandler: (SDSSynchronizableContainer?, _ movedPendingKeys: Set<String>) -> Void
     ) -> SDSSynchronizableContainer? {
         guard insertingIfMissing else {
             // An object with only some of its keys would be incomplete
             let container = findObject(for: record.recordID)
-            preliminaryUpdateHandler(container)
+            preliminaryUpdateHandler(container, [])
             return container
         }
         
-        // A record of an entity with an identity can belong to a local object that has no record yet
-        var identityValues: [Any?]?
-        if
-            let identity = synchronizer.configuration?.entities[record.recordType]?.identity,
-            !identity.isEmpty,
-            let entity = context.persistentStoreCoordinator?.managedObjectModel.entitiesByName[record.recordType]
-        {
-            identityValues = SDSIdentity.values(in: record, entity: entity, keys: identity)
+        // A record of an entity with an identity can belong to a local object that has no record yet. After objects
+        // vanished, one without an identity can belong to a copy of its object without a record, see `SDSContentIndex`.
+        let entityName = record.recordType
+        let identity = configuration.identity
+        var identityRecordName: String?
+        var matchingObject: (() throws -> NSManagedObject?)?
+        if !identity.isEmpty {
+            let name = SDSIdentity.recordName(entityName: entityName, values: SDSIdentity.values(in: record, entity: entity, keys: identity))
+            identityRecordName = name
+            matchingObject = { [identityIndex] in
+                try identityIndex.object(entityName: entityName, keys: identity, recordName: name)
+            }
+        } else if let contentIndex {
+            matchingObject = {
+                contentIndex.object(matching: record, overflowValues: overflowValues, entity: entity, keys: configuration.syncedProperties)
+            }
         }
         
         do {
-            return try synchronizer.retrieve(
+            let container = try synchronizer.retrieve(
                 for: record.recordID.recordName,
-                entityName: record.recordType,
-                identityValues: identityValues,
+                entityName: entityName,
+                identityRecordName: identityRecordName,
+                matchingObject: matchingObject,
                 context: context,
                 preliminaryUpdateHandler: preliminaryUpdateHandler
             )
+            // Objects this download inserts can be matched once they're saved, e.g. by a record of the same identity in a later page
+            if let container, let identityRecordName, container.object.isInserted {
+                identityIndex.add(container.object, entityName: entityName, recordName: identityRecordName)
+            }
+            return container
         } catch {
             synchronizer.logger.error("Failed to look up `\(record.recordID.recordName)`: \(error.localizedDescription)")
             applyError = error
@@ -604,10 +858,12 @@ private final class CKDownloadHandler {
         }
     }
     
-    func deleted(recordID: CKRecord.ID, recordType:String) {
+    func deleted(recordID: CKRecord.ID, recordType: String) {
+        guard failure == nil else { return }
         context.performAndWaitUnchecked {
             self._deleted(recordID: recordID, recordType: recordType)
         }
+        failIfNotApplied()
     }
     
     func _deleted(recordID: CKRecord.ID, recordType:String) {
@@ -620,6 +876,20 @@ private final class CKDownloadHandler {
                     CloudKitShare.updateShare(nil, for: rootId, context: syncContext)
                 }
             }
+            return
+        }
+        
+        // Earlier versions that were held are gone too
+        recordsToAddLater.removeAll { $0.recordID == recordID }
+        setAsideRecords.removeAll { $0.recordID == recordID }
+        failedRecordIDs.remove(recordID)
+        overflowChanges[recordID.recordName] = []
+        
+        // A model that was created here with the record's name, e.g. when the user subscribes again after unsubscribing,
+        // stays: its record is uploaded again next. Edits of a record that was deleted elsewhere don't keep it. Read for
+        // each deletion, as the model can be created while downloading, after the download looked at what's pending.
+        if synchronizer.pendingLocalChange(of: recordID.recordName).isLocalInsert {
+            synchronizer.logger.log("Keeping `\(recordID.recordName)`, which was created here again after it was deleted")
             return
         }
         
@@ -638,8 +908,76 @@ private final class CKDownloadHandler {
         changeToken: CKServerChangeToken?,
         userToken: Data?
     ) {
+        guard failure == nil else { return }
         context.performAndWaitUnchecked {
             self._tokensUpdate(for: zoneID, changeToken: changeToken, userToken: userToken)
+        }
+        failIfNotApplied()
+        guard failure == nil else { return }
+        
+        // A page ends here. What was downloaded is saved with the token.
+        guard canSavePage() else { return }
+        if let error = save() {
+            fail(with: error)
+            return
+        }
+        do {
+            // The pages so far are kept
+            try synchronizer.checkNotStopped()
+        } catch {
+            fail(with: error)
+        }
+    }
+    
+    /// Whether the downloaded records can be saved: objects whose parents weren't downloaded yet are held, like records whose
+    /// references weren't, so they don't keep the token from moving on.
+    private func canSavePage() -> Bool {
+        guard applyError == nil else { return false }
+        for index in parentReferences.indices where !parentReferences[index].isResolved {
+            if findObject(for: parentReferences[index].parentRecordID) != nil {
+                parentReferences[index].isResolved = true
+            } else if heldRecords != nil {
+                let record = parentReferences[index].record
+                recordsToAddLater.append(record)
+                heldBlockers[record.recordID] = parentReferences[index].parentRecordID.recordName
+            }
+        }
+        if heldRecords != nil {
+            parentReferences.removeAll { !$0.isResolved }
+        }
+        return applyError == nil && parentReferences.allSatisfy(\.isResolved)
+    }
+    
+    /// Ends the download: what wasn't saved is discarded, and the operation is cancelled.
+    private func fail(with error: any Error) {
+        synchronizer.logger.log("Ending the download: \(error.localizedDescription)")
+        failure = error
+        if let observedContext = synchronizer.observedUpdateContext {
+            discardDownload(observedContext: observedContext)
+        }
+        operation?.cancel()
+    }
+    
+    /// Tries held records again: at the end of a zone all of them, and otherwise the ones whose references arrived since.
+    private func retryHeldRecords(all: Bool) {
+        var tryingAll = all
+        while true {
+            let candidates = recordsToAddLater.filter { record in
+                guard !tryingAll, let blocker = heldBlockers[record.recordID] else { return true }
+                return storedSinceRetry.contains(blocker)
+            }
+            storedSinceRetry = []
+            guard !candidates.isEmpty else { return }
+            let candidateIDs = Set(candidates.map(\.recordID))
+            recordsToAddLater.removeAll { candidateIDs.contains($0.recordID) }
+            let heldBefore = recordsToAddLater.count + candidates.count
+            for record in candidates {
+                heldBlockers[record.recordID] = nil
+                _changed(record: record)
+            }
+            // Records that are stored can resolve others
+            if recordsToAddLater.count == heldBefore { return }
+            tryingAll = false
         }
     }
     
@@ -650,58 +988,36 @@ private final class CKDownloadHandler {
         finalCompletion: Bool = false,
         fetchFailed: Bool = false
     ) {
-        var lastNumberOfRecords: Int = 0
-        while lastNumberOfRecords != recordsToAddLater.count {
-            lastNumberOfRecords = recordsToAddLater.count
-            
-            let recordsToAddLater = self.recordsToAddLater
-            self.recordsToAddLater = []
-                
-            for record in recordsToAddLater {
-                self._changed(record: record)
-            }
-        }
+        retryHeldRecords(all: finalCompletion)
         
         if finalCompletion {
-            // The problem this solves is described in a huge comment above.
-            for (container, reference) in objectsToEnsureParentReferencesFor {
-                if let parent = findObject(for: reference.recordID)?.object,
-                   !container.object.isDeleted,
-                   container.parent != parent {
-                    container.parent = parent
-                }
+            for reference in parentReferences {
+                guard
+                    let object = reference.object ?? reference.objectID.flatMap({ try? context.existingObject(with: $0) }),
+                    !object.isDeleted,
+                    let parent = findObject(for: reference.parentRecordID)?.object,
+                    object.value(forKey: reference.parentKey) as? NSManagedObject != parent
+                else { continue }
+                object.setValue(parent, forKey: reference.parentKey)
             }
-            objectsToEnsureParentReferencesFor = []
+            parentReferences = []
             
             let unresolvedRecords = recordsToAddLater.filter { isRecord($0, in: zoneID) }
-            recordsToAddLater.removeAll { isRecord($0, in: zoneID) }
-            
             if unresolvedRecords.isEmpty {
                 synchronizer.logger.log("All current records added.")
-            } else if fetchFailed {
-                // The change token was not advanced past these records, so the next download fetches them again
-                synchronizer.logger.log("Fetch failed with \(unresolvedRecords.count) unresolved records, retrying them with the next download")
-            } else if !savesChangeTokens {
+            } else if heldRecords != nil {
+                // E.g. they reference a record that was deleted, or one only a pending catch-up downloads. They're kept, and
+                // tried again by later downloads. They stay in iCloud: deleting them would delete them on every device.
+                synchronizer.logger.log("Keeping \(unresolvedRecords.count) records with unresolved references for later: \(unresolvedRecords.map(\.recordID.recordName))")
+            } else {
                 // A catch-up downloads every record, also ones whose references were deleted long ago. They stay as they are.
                 synchronizer.logger.log("Leaving \(unresolvedRecords.count) records with unresolved references alone while catching up")
-            } else if case .all(catchUpIsPending: true) = scope {
-                // They might reference records of newly synchronized models, which only the pending catch-up downloads.
-                // The change token isn't saved, so they are downloaded again.
-                synchronizer.logger.log("Retrying \(unresolvedRecords.count) unresolved records once newly synchronized models are caught up on")
-                zonesWithHeldRecords.insert(zoneID)
-            } else if applyError != nil {
-                // Their references might only be missing because they couldn't be read, and the download is discarded
-                synchronizer.logger.log("Failed to apply records, retrying \(unresolvedRecords.count) unresolved records with the next download")
-            } else {
-                // E.g. they reference a record that was deleted. They are stored once they change again.
-                // They stay in iCloud: deleting them would delete them on every device, also where they are complete.
-                synchronizer.logger.error("Leaving \(unresolvedRecords.count) records with unresolved references alone: \(unresolvedRecords.map(\.recordID.recordName))")
+                recordsToAddLater.removeAll { isRecord($0, in: zoneID) }
             }
         }
         
-        // Records that still wait for their references were received before this token.
-        // If the token was saved and the fetch failed before the references arrived, they would never be fetched again.
-        if let changeToken = changeToken, savesChangeTokens, !zonesWithHeldRecords.contains(zoneID), !recordsToAddLater.contains(where: { isRecord($0, in: zoneID) }) {
+        // Held records are kept in files once the page is saved, so they don't keep the token from moving on
+        if let changeToken, savesChangeTokens {
             if isForSharedDatabase {
                 tokensToUpdate[zoneID] = changeToken
             } else {
@@ -720,6 +1036,7 @@ private final class CKDownloadHandler {
         for zoneID: CKRecordZone.ID,
         result: Result<(serverChangeToken: CKServerChangeToken, clientChangeTokenData: Data?, moreComing: Bool), any Error>
     ) {
+        guard failure == nil else { return }
         switch result {
         case .success((let changeToken, let userToken, _)):
             synchronizer.logger.log("Zone \(zoneID.zoneName) fetch completed successfully")
@@ -737,9 +1054,11 @@ private final class CKDownloadHandler {
                 // Zones of the shared database disappear when they are no longer shared, see `refreshSharedZoneIDs()`
                 if !isForSharedDatabase {
                     privateZoneError = error as? CKError
+                } else {
+                    zoneErrors[zoneID] = error
                 }
             default:
-                break
+                zoneErrors[zoneID] = error
             }
 
             context.performAndWaitUnchecked {
@@ -754,144 +1073,36 @@ private final class CKDownloadHandler {
         
         synchronizer.logger.log("Fetch Overall Completion")
         
-        guard let observedContext = synchronizer.observedUpdateContext else {
-            synchronizer.logger.log("No observed context")
-            completionHandler(SDSSyncError(title: "error.noObservedContext"))
+        if let failure {
+            completionHandler(failure)
             return
         }
-        
-        // Another process could have taken over while this one was suspended and downloaded the same records.
-        // Saving them as well would duplicate them, so they are discarded and downloaded again later if needed.
-        guard synchronizer.syncLease.renew() else {
-            synchronizer.logger.log("Sync lease lost, discarding download")
-            
-            discardDownload(observedContext: observedContext)
-            completionHandler(SDSSyncLease.UnavailableError())
-            return
-        }
-        
-        if let applyError {
-            synchronizer.logger.log("Failed to apply downloaded records, discarding download: \(applyError.localizedDescription)")
-            discardDownload(observedContext: observedContext)
-            completionHandler(applyError)
-            return
-        }
-        
-        // Objects that were changed locally while downloading keep their changes, which would otherwise be overwritten with
-        // the downloaded values. They're uploaded next, and the next download brings the record's other values again.
-        // A catch-up downloads every record, which can take long, and it's done again later, after they're uploaded.
-        let hasLocalChanges = observedContext.performAndWaitUnchecked {
-            var hasLocalChanges = false
-            for object in observedContext.updatedObjects {
-                guard let id = synchronizer.container(for: object)?.id else { continue }
-                if !synchronizer.pendingLocalChange(of: id).keys.isDisjoint(with: object.changedValues().keys) {
-                    observedContext.refresh(object, mergeChanges: false)
-                    hasLocalChanges = true
-                }
-            }
-            return hasLocalChanges
-        }
-
-        // Inserted objects get their permanent IDs before they are saved, so their local entities know them once other contexts
-        // can change the objects. Otherwise a change could find no record id for an object, and give it a second one.
-        let permanentIdError: (any Error)? = observedContext.performAndWait {
-            do {
-                try observedContext.obtainPermanentIDs(for: Array(observedContext.insertedObjects))
-                return nil
-            } catch {
-                return error
-            }
-        }
-        if let permanentIdError {
-            synchronizer.logger.log("Failed to get permanent IDs, discarding download: \(permanentIdError.localizedDescription)")
-            discardDownload(observedContext: observedContext)
-            completionHandler(permanentIdError)
-            return
-        }
-        syncContext.performAndWaitUnchecked {
-            // Saving again after a fixed save, the entities exist already
-            var createdLocalIds = Set(createdLocalEntities.map(\.localId))
-            for (object, id) in synchronizer.temporaryObjectIds where !object.objectID.isTemporaryID {
-                let localId = object.objectID.uriRepresentation().absoluteString
-                guard !createdLocalIds.contains(localId) else { continue }
-                // Objects of the app's contexts got their entities when they were saved
-                if object.managedObjectContext !== observedContext, CloudKitLocalEntity.entry(forLocalId: localId, in: syncContext) != nil {
-                    continue
-                }
-                createdLocalIds.insert(localId)
-                createdLocalEntities.append(CloudKitLocalEntity(id: id, localId: localId, context: syncContext))
-            }
-        }
-        
-        let saveError: (any Error)? = observedContext.performAndWait {
-            do {
-                try synchronizer.saveObservedUpdateContext(observedContext)
-                return nil
-            } catch {
-                return error
-            }
-        }
-        if let saveError {
-            synchronizer.logger.log("Observed Context save error: \(saveError)")
-            
-            let isFixed = observedContext.performAndWaitUnchecked {
-                tryFixingObservedContext(error: saveError)
-            }
-            if isFixed {
-                synchronizer.logger.log("Succeeded trying to fix save errors. Trying to save again.")
-                fetchOverallCompletion(result: result)
-            } else {
-                // The unsaved objects would fail every later save of the context, and their placeholders must not be saved.
-                // The change tokens weren't saved either, so the records are downloaded again.
-                synchronizer.logger.log("Failed fixing the save errors, discarding download")
-                discardDownload(observedContext: observedContext)
-                completionHandler(saveError)
-            }
-            
-            return
-        }
-        
-        let tokensToUpdate = self.tokensToUpdate
-        self.tokensToUpdate = [:]
-        let deletedRecordIds = Array(self.deletedRecordIds)
-        self.deletedRecordIds = []
-        
-        let zonesWithExpiredTokens = self.zonesWithExpiredTokens
-        let isForSharedDatabase = self.isForSharedDatabase
-
-        do {
-            try syncContext.performAndWaitUnchecked {
-                // The downloaded objects' local entities were made before saving them
-                synchronizer.removeAllTemporaryObjects()
-                createdLocalEntities = []
-
-                for entityName in ["CloudKitUpdate", "CloudKitRemoval", "CloudKitLocalEntity"] {
-                    syncContext.metadataEntries(of: entityName, withIds: deletedRecordIds).forEach(syncContext.delete)
-                }
-
-                for (zoneID, changeToken) in tokensToUpdate {
-                    if let zoneID {
-                        CloudKitZone.getZone(with: zoneID, context: syncContext).changeToken = changeToken
-                    } else {
-                        synchronizer.setState(\.changeToken, value: changeToken)
-                    }
-                }
-
-                // These zones are downloaded completely next, see `SDSSynchronizer.ChangeTokenExpiredError`
-                for zoneID in zonesWithExpiredTokens {
-                    if isForSharedDatabase {
-                        CloudKitZone.retrieveZone(for: zoneID)?.changeToken = nil
-                    } else {
-                        synchronizer.setState(\.changeToken, value: nil)
-                    }
-                }
-
-                try syncContext.save()
-            }
-        } catch {
-            synchronizer.logger.log("Sync Context save error: \(error)")
+        // What was downloaded is saved, also after an error, with the change tokens of the pages that were complete
+        if let error = save() {
             completionHandler(error)
             return
+        }
+        
+        // These zones are downloaded completely next, see `SDSSynchronizer.ChangeTokenExpiredError`
+        let zonesWithExpiredTokens = self.zonesWithExpiredTokens
+        let isForSharedDatabase = self.isForSharedDatabase
+        if !zonesWithExpiredTokens.isEmpty {
+            do {
+                try syncContext.performAndWaitUnchecked {
+                    for zoneID in zonesWithExpiredTokens {
+                        if isForSharedDatabase {
+                            CloudKitZone.retrieveZone(for: zoneID)?.changeToken = nil
+                        } else {
+                            synchronizer.setState(\.changeToken, value: nil)
+                        }
+                    }
+                    try syncContext.save()
+                }
+            } catch {
+                synchronizer.logger.log("Sync Context save error: \(error)")
+                completionHandler(error)
+                return
+            }
         }
 
         if let privateZoneError {
@@ -904,7 +1115,11 @@ private final class CKDownloadHandler {
         }
 
         switch result {
-        case .success where hasLocalChanges && scope.isCatchingUp:
+        case .success where !zoneErrors.isEmpty:
+            // E.g. zones CloudKit asks to wait for, which the next synchronization waits for, see `SDSSynchronizationViewModel.attemptSyncStart()`
+            synchronizer.logger.log("Database fetch completed, but zones failed: \(self.zoneErrors)")
+            completionHandler(SDSSynchronizer.errorWithLongestRetryDelay(in: CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: zoneErrors])))
+        case .success where hadLocalChanges && scope.isCatchingUp:
             synchronizer.logger.log("Database fetch completed, but objects changed locally meanwhile")
             completionHandler(SDSSyncError(title: "error.changedWhileCatchingUp"))
         case .success:
@@ -912,11 +1127,236 @@ private final class CKDownloadHandler {
             completionHandler(nil)
         case .failure(let error):
             synchronizer.logger.log("Database fetch completed with error: \(error)")
-            completionHandler(error)
+            // E.g. zones CloudKit asks to wait for, which the next synchronization waits for, see `SDSSynchronizationViewModel.attemptSyncStart()`
+            completionHandler(SDSSynchronizer.errorWithLongestRetryDelay(in: error))
         }
     }
     
-    /// Discards the downloaded objects and their placeholders, and doesn't save the change tokens, so the records are downloaded again.
+    /// Saves the downloaded objects with their local entities, and the change tokens received so far. Returns the error that
+    /// made it discard what wasn't saved, so it's downloaded again.
+    ///
+    /// The local entities are saved before the objects, and the change tokens after them. If the app is terminated in
+    /// between, objects never exist without their records, which would upload them as new records and download them again
+    /// as duplicates. Entities without objects are taken care of, see `SDSSynchronizer.backfill(onlyUntracked:)`.
+    private func save() -> (any Error)? {
+        let synchronizer = self.synchronizer!
+        let syncContext = synchronizer.context
+        
+        guard let observedContext = synchronizer.observedUpdateContext else {
+            synchronizer.logger.log("No observed context")
+            return SDSSyncError(title: "error.noObservedContext")
+        }
+        
+        // Another process could have taken over while this one was suspended and downloaded the same records.
+        // Saving them as well would duplicate them, so they are discarded and downloaded again later if needed.
+        guard synchronizer.syncLease.renew() else {
+            synchronizer.logger.log("Sync lease lost, discarding download")
+            discardDownload(observedContext: observedContext)
+            return SDSSyncLease.UnavailableError()
+        }
+        
+        if let applyError {
+            synchronizer.logger.log("Failed to apply downloaded records, discarding download: \(applyError.localizedDescription)")
+            discardDownload(observedContext: observedContext)
+            return applyError
+        }
+        
+        // The records could be another account's, which mustn't end up in the previous one's data
+        do {
+            try synchronizer.checkNotStopped()
+        } catch let error as SDSSynchronizer.AccountChangedError {
+            discardDownload(observedContext: observedContext)
+            return error
+        } catch {
+            // Once stopped, what was downloaded is still saved
+        }
+        
+        while true {
+            // Objects that were changed locally while downloading keep their changes, which would otherwise be overwritten with
+            // the downloaded values. They're uploaded next, and the next download brings the record's other values again.
+            // A catch-up downloads every record, which can take long, and it's done again later, after they're uploaded.
+            let hasLocalChanges = observedContext.performAndWaitUnchecked {
+                var hasLocalChanges = false
+                for object in observedContext.updatedObjects {
+                    guard let id = synchronizer.existingRecordId(of: object) else { continue }
+                    if !synchronizer.pendingLocalChange(of: id).keys.isDisjoint(with: object.changedValues().keys) {
+                        observedContext.refresh(object, mergeChanges: false)
+                        hasLocalChanges = true
+                    }
+                }
+                return hasLocalChanges
+            }
+            hadLocalChanges = hadLocalChanges || hasLocalChanges
+
+            // Inserted objects get their permanent IDs before they are saved, so their local entities know them once other contexts
+            // can change the objects. Otherwise a change could find no record id for an object, and give it a second one.
+            let permanentIdError: (any Error)? = observedContext.performAndWait {
+                do {
+                    try observedContext.obtainPermanentIDs(for: Array(observedContext.insertedObjects))
+                    return nil
+                } catch {
+                    return error
+                }
+            }
+            if let permanentIdError {
+                synchronizer.logger.log("Failed to get permanent IDs, discarding download: \(permanentIdError.localizedDescription)")
+                discardDownload(observedContext: observedContext)
+                return permanentIdError
+            }
+            let entitiesError: (any Error)? = syncContext.performAndWaitUnchecked {
+                // Saving again after a fixed save, the entities exist already
+                var createdLocalIds = Set(createdLocalEntities.map(\.localId))
+                for (object, id) in synchronizer.temporaryObjectIds where !object.objectID.isTemporaryID {
+                    let localId = object.objectID.uriRepresentation().absoluteString
+                    guard !createdLocalIds.contains(localId) else { continue }
+                    // Objects of the app's contexts got their entities when they were saved
+                    if object.managedObjectContext !== observedContext, CloudKitLocalEntity.entry(forLocalId: localId, in: syncContext) != nil {
+                        continue
+                    }
+                    createdLocalIds.insert(localId)
+                    createdLocalEntities.append(CloudKitLocalEntity(id: id, localId: localId, context: syncContext))
+                }
+                // Written before anything of the page is saved, so a save that's interrupted is repaired with the next launch,
+                // rather than its entities without objects being taken for objects that vanished
+                let pageSave = SDSSynchronizer.FileState.PageSave(createdLocalIds: createdLocalEntities.map(\.localId), deletedRecordNames: Array(deletedRecordIds))
+                synchronizer.updateFileState { $0.interruptedPageSave = pageSave }
+                // Before the objects, see above
+                do {
+                    try syncContext.save()
+                    return nil
+                } catch {
+                    return error
+                }
+            }
+            if let entitiesError {
+                synchronizer.logger.log("Failed to save the downloaded objects' records, discarding download: \(entitiesError.localizedDescription)")
+                discardDownload(observedContext: observedContext)
+                return entitiesError
+            }
+            synchronizer.afterSavingDownloadedRecords?()
+            
+            let saveError: (any Error)? = observedContext.performAndWait {
+                do {
+                    try synchronizer.saveObservedUpdateContext(observedContext)
+                    return nil
+                } catch {
+                    return error
+                }
+            }
+            guard let saveError else {
+                synchronizer.afterSavingDownloadedObjects?()
+                break
+            }
+            synchronizer.logger.log("Observed Context save error: \(saveError)")
+            
+            let isFixed = observedContext.performAndWaitUnchecked {
+                tryFixingObservedContext(error: saveError)
+            }
+            guard isFixed else {
+                // The unsaved objects would fail every later save of the context, and their placeholders must not be saved.
+                // The change tokens weren't saved either, so the records are downloaded again.
+                synchronizer.logger.log("Failed fixing the save errors, discarding download")
+                discardDownload(observedContext: observedContext)
+                return saveError
+            }
+            synchronizer.logger.log("Succeeded trying to fix save errors. Trying to save again.")
+        }
+        pageRecords = [:]
+        
+        // Held records are kept in files before the token moves past them. Files of records that were stored meanwhile are
+        // only removed now that the objects are saved.
+        if let heldRecords {
+            // Also newer versions of records that were held already
+            for record in recordsToAddLater + setAsideRecords where persistedHeld[record.recordID] != Self.version(of: record) {
+                do {
+                    try heldRecords.hold(record)
+                    persistedHeld[record.recordID] = Self.version(of: record)
+                } catch {
+                    // E.g. its asset can't be copied. It's downloaded again instead.
+                    synchronizer.logger.error("Failed to keep `\(record.recordID.recordName)`, downloading it again later: \(error.localizedDescription)")
+                    recordsToAddLater.removeAll { $0.recordID == record.recordID }
+                    setAsideRecords.removeAll { $0.recordID == record.recordID }
+                    failedRecordIDs.insert(record.recordID)
+                }
+            }
+            do {
+                try heldRecords.storeFailedIDs(failedRecordIDs)
+            } catch {
+                synchronizer.logger.error("Failed to keep the records that failed to download: \(error.localizedDescription)")
+                return error
+            }
+            let heldIDs = Set((recordsToAddLater + setAsideRecords).map(\.recordID))
+            for recordID in persistedHeldIDs.subtracting(heldIDs) {
+                heldRecords.release(recordID)
+                persistedHeld[recordID] = nil
+            }
+            persistedFailedRecordIDs = failedRecordIDs
+        }
+        
+        // Written before the token moves past the records it describes
+        synchronizer.setOverflowKeys(overflowChanges)
+        overflowChanges = [:]
+        
+        let tokensToUpdate = self.tokensToUpdate
+        self.tokensToUpdate = [:]
+        let deletedRecordIds = Array(self.deletedRecordIds)
+        self.deletedRecordIds = []
+        let existingRecords = self.existingRecords
+        self.existingRecords = []
+
+        do {
+            try syncContext.performAndWaitUnchecked {
+                // The downloaded objects' local entities were saved before them
+                synchronizer.removeAllTemporaryObjects()
+                createdLocalEntities = []
+
+                // Models created again since their deletions were downloaded keep their records, see `_deleted`
+                let createdAgain = Set(CloudKitUpdate.find(ids: deletedRecordIds, in: syncContext).values.filter(\.isLocalInsert).map(\.id))
+                let deletedRecordIds = deletedRecordIds.filter { !createdAgain.contains($0) }
+                for entityName in ["CloudKitUpdate", "CloudKitRemoval", "CloudKitLocalEntity"] {
+                    syncContext.metadataEntries(of: entityName, withIds: deletedRecordIds).forEach(syncContext.delete)
+                }
+                
+                // The records exist, so their values win over backfilled ones, and they're no local inserts anymore
+                for update in CloudKitUpdate.find(ids: Array(existingRecords), in: syncContext).values {
+                    update.recordExists()
+                    if update.keysToUpload.isEmpty {
+                        syncContext.delete(update)
+                    }
+                }
+
+                for (zoneID, changeToken) in tokensToUpdate {
+                    if let zoneID {
+                        CloudKitZone.getZone(with: zoneID, context: syncContext).changeToken = changeToken
+                    } else {
+                        synchronizer.setState(\.changeToken, value: changeToken)
+                    }
+                }
+
+                try syncContext.save()
+            }
+        } catch {
+            synchronizer.logger.log("Sync Context save error: \(error)")
+            return error
+        }
+        synchronizer.updateFileState { $0.interruptedPageSave = nil }
+        
+        // The saved objects are turned into faults, so a long download doesn't keep them in memory
+        identityIndex.objectsWereSaved()
+        for index in parentReferences.indices {
+            if let object = parentReferences[index].object {
+                parentReferences[index].objectID = object.objectID
+                parentReferences[index].object = nil
+            }
+        }
+        observedContext.performAndWait {
+            observedContext.refreshAllObjects()
+        }
+        return nil
+    }
+    
+    /// Discards the downloaded objects and their placeholders that weren't saved, and doesn't save the change tokens, so the
+    /// records are downloaded again.
     private func discardDownload(observedContext: NSManagedObjectContext) {
         let synchronizer = self.synchronizer!
         let syncContext = synchronizer.context
@@ -926,26 +1366,43 @@ private final class CKDownloadHandler {
         }
         let createdLocalEntities = self.createdLocalEntities
         self.createdLocalEntities = []
-        syncContext.performAndWaitUnchecked {
+        let isRemoved = syncContext.performAndWaitUnchecked {
             synchronizer.removeAllTemporaryObjects()
             // They can be saved already, e.g. with changes that were stored meanwhile
-            guard !createdLocalEntities.isEmpty else { return }
+            guard !createdLocalEntities.isEmpty else { return true }
             createdLocalEntities.forEach(syncContext.delete)
             do {
                 try syncContext.save()
+                return true
             } catch {
                 synchronizer.logger.error("Failed to remove the local entities of a discarded download: \(error.localizedDescription)")
+                return false
             }
+        }
+        if isRemoved {
+            synchronizer.updateFileState { $0.interruptedPageSave = nil }
         }
         tokensToUpdate = [:]
         deletedRecordIds = []
+        existingRecords = []
+        overflowChanges = [:]
+        pageRecords = [:]
         applyError = nil
-        objectsToEnsureParentReferencesFor = []
-        recordsToAddLater = []
+        // Objects of saved pages keep their parents
+        parentReferences.removeAll { $0.objectID == nil }
+        // The records are downloaded again, also ones that were held since the last save
+        recordsToAddLater.removeAll { !persistedHeldIDs.contains($0.recordID) }
+        setAsideRecords.removeAll { !persistedHeldIDs.contains($0.recordID) }
+        failedRecordIDs = persistedFailedRecordIDs
+        identityIndex.discardInsertedObjects()
     }
     
     /// Tries fixing the given error and returns whether the context should try to save again or a fix was not possible.
     /// Has to be called on `context`'s queue.
+    ///
+    /// Downloaded values that the store rejects, e.g. a missing required value, or one that's too long, are set aside with
+    /// their records (see `setAsideRecords`), rather than discarding the download over and over, which would also keep
+    /// every upload from running.
     private func tryFixingObservedContext(error: any Error) -> Bool {
         synchronizer.logger.log("tryFixingObservedContext starting: \(error.localizedDescription, privacy: .public)")
         let nsError = error as NSError
@@ -976,7 +1433,7 @@ private final class CKDownloadHandler {
             return fixed // Return whether any of the errors were fixed
         }
         
-        guard nsError.code == NSValidationMissingMandatoryPropertyError else {
+        guard (NSValidationErrorMinimum...NSValidationErrorMaximum).contains(nsError.code) else {
             synchronizer.logger.log("tryFixingObservedContext: Code not correct: \(nsError.code, privacy: .public)")
             return false
         }
@@ -987,22 +1444,33 @@ private final class CKDownloadHandler {
             return false
         }
         
-        guard let container = object.synchronizableContainer else {
+        guard let container = synchronizer.container(for: object) else {
             synchronizer.logger.log("tryFixingObservedContext: Object is not a synchronizable object: \(object.entity.name ?? "Unknown")")
             return false
         }
         
         // The record stays in iCloud, as deleting it would delete it on every device. A required value is missing e.g. because
         // it isn't synchronized (see `makeConfiguration`), or a newer version of the app made it required.
-        if object.isInserted {
-            // The object isn't stored, nor its local entity once the download is saved. It's stored once its record changes again.
+        let recordName = synchronizer.existingRecordId(of: object)
+        if let recordName, let record = pageRecords[recordName] {
+            setAside(record)
+        }
+        if object.isDeleted {
+            // E.g. a delete rule denies deleting it. It stays, and the deletion isn't stored.
+            context.refresh(object, mergeChanges: false)
+            if let recordName {
+                deletedRecordIds.remove(recordName)
+            }
+            synchronizer.logger.error("tryFixingObservedContext: Not deleting a `\(object.entity.name ?? "Unknown")` that can't be deleted")
+        } else if object.isInserted {
+            // The object isn't stored, nor its local entity once the download is saved
             context.delete(object)
             deletedRecordIds.insert(container.id)
-            synchronizer.logger.error("tryFixingObservedContext: Not storing a downloaded `\(object.entity.name ?? "Unknown")` without required values")
+            synchronizer.logger.error("tryFixingObservedContext: Not storing a downloaded `\(object.entity.name ?? "Unknown")` with invalid values")
         } else {
             // The object keeps its saved values instead of the downloaded ones
             context.refresh(object, mergeChanges: false)
-            synchronizer.logger.error("tryFixingObservedContext: Not storing downloaded values without required values of `\(object.entity.name ?? "Unknown")`")
+            synchronizer.logger.error("tryFixingObservedContext: Not storing invalid downloaded values of `\(object.entity.name ?? "Unknown")`")
         }
 
         return true
