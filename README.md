@@ -106,6 +106,19 @@ SDSSynchronizer.shared.stop()
 SDSSynchronizer.shared.start()
 ```
 
+To start over instead, `resetSyncData()` forgets everything the synchronizer stored about iCloud's data: which objects
+have records, the changes that weren't uploaded, change tokens and whether everything was downloaded. iCloud's data stays
+as it is. Synchronizing stops, and the next `start()` downloads everything and uploads the local objects iCloud doesn't
+have, like a new device. Changes made in `beforeForgetting`, which runs once no synchronization runs anymore, aren't
+uploaded, so an app can empty its store there, to look at iCloud's data before deciding what to do with its own:
+
+```swift
+await SDSSynchronizer.shared.resetSyncData {
+    // E.g. delete the local objects, so iCloud's data is downloaded into an empty store
+}
+SDSSynchronizer.shared.start()
+```
+
 ### iCloud Accounts and Errors
 
 - Signing out and back into the same account keeps the changes made meanwhile, and uploads only those. While the account

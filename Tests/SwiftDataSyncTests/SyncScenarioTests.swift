@@ -686,4 +686,34 @@ struct SyncScenarioTests {
         #expect(await device.state.error == nil)
         device.terminate()
     }
+
+    /// A reset forgets what the synchronizer knew about iCloud, without changing iCloud. Starting again downloads
+    /// everything, finds the local objects iCloud has without duplicating them, and doesn't upload what changed before.
+    @Test func resetStartsOverWithoutChangingICloud() async throws {
+        let server = FakeCloudServer()
+        let device = TestDevice("A", server: server)
+        try await device.launch()
+        try device.insertSubscriptions(["s1", "s2", "s3"])
+        await device.settle()
+        #expect(device.serverSubscriptions().count == 3)
+
+        device.synchronizer.stop()
+        try device.deleteSubscription("s1")
+        try device.editSubscription("s2") { $0.title = "Changed before the reset" }
+        let saves = server.events(of: "A", .modifyRecords).count
+        await device.synchronizer.resetSyncData()
+        #expect(!device.synchronizer.hasDownloadedOnce)
+        #expect(server.events(of: "A", .modifyRecords).count == saves)
+
+        device.synchronizer.start()
+        await device.settle()
+        #expect(device.synchronizer.hasDownloadedOnce)
+        #expect(device.serverSubscriptions().map(\.feedLink).sorted() == ["s1", "s2", "s3"])
+        #expect(device.serverSubscriptions().first { $0.feedLink == "s2" }?.title == "Title of s2")
+        // The device has iCloud's data again, once each
+        #expect(try device.subscriptions().map(\.feedLink).sorted() == ["s1", "s2", "s3"])
+        #expect(try device.subscription("s2")?.title == "Title of s2")
+        #expect(await device.state.error == nil)
+        device.terminate()
+    }
 }
