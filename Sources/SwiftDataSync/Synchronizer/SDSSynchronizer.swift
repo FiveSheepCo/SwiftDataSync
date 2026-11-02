@@ -782,6 +782,52 @@ public final class SDSSynchronizer: Sendable {
         }
     }
 
+    /// Forgets everything the synchronizer stored about iCloud's data, as if it never synchronized: which objects have
+    /// records, the changes that weren't uploaded yet, the change tokens, zones and shares, whether everything was
+    /// downloaded, and the records that were held or set aside. iCloud's data stays as it is.
+    ///
+    /// Synchronizing stops (like `stop()`, without showing it), and starts again with `start()`. That synchronization
+    /// downloads everything, and uploads the local objects iCloud doesn't have, like a new device would (see
+    /// `backfill(onlyUntracked:)`), so `hasDownloadedOnce` is `false` until it's done.
+    /// - Parameter beforeForgetting: Runs once no synchronization runs anymore, before the data is forgotten. Its changes
+    ///   aren't uploaded, e.g. an app can empty the observed store there, and start again to download iCloud's data into it.
+    public func resetSyncData(beforeForgetting: @MainActor @Sendable () async -> Void = {}) async {
+        stopSynchronizing()
+        // Waits until a running synchronization, or a save's, noticed it's stopped. None starts until the reset is done.
+        try? await beginExclusiveActivity()
+        defer { endActivity() }
+        await beforeForgetting()
+
+        let context = self.context
+        context.performAndWaitUnchecked {
+            for entityName in ["CloudKitLocalEntity", "CloudKitUpdate", "CloudKitRemoval", "CloudKitZone", "CloudKitShare", "SDSSynchronizerSavedState"] {
+                ((try? context.fetch(NSFetchRequest<NSManagedObject>(entityName: entityName))) ?? []).forEach(context.delete)
+            }
+            do {
+                try context.save()
+            } catch {
+                logger.error("Failed to reset the synchronization data: \(error.localizedDescription)")
+                context.rollback()
+            }
+        }
+        heldRecords(sharedDatabase: false).removeAll()
+        heldRecords(sharedDatabase: true).removeAll()
+        updateFileState { $0 = FileState() }
+        mutableState.withLock { state in
+            state.needsBackfill = false
+            state.quotaPauseEnds = [:]
+            state.accountNeedsCheck = true
+            state.lastCompletedUpload = nil
+            state.lastCompletedDownload = nil
+            state.acceptedShareZones = [:]
+            state.catchUp = nil
+            state.serverRecordsOfConflicts = [:]
+            state.quarantine = SDSRecordQuarantine()
+            state.lastRecordFailure = nil
+        }
+        logger.log("Reset the synchronization data")
+    }
+
     /// Stops observing and synchronizing for good, like a process that is terminated: nothing is saved, the lease is given up
     /// and the store isn't observed anymore. Tests use it to launch another synchronizer on the same data.
     func invalidate() {
