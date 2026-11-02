@@ -11,10 +11,17 @@ struct SDSRecordQuarantine: Sendable {
     /// How long a rejected record isn't uploaded, unless it changes.
     static let duration: TimeInterval = 60 * 60
 
+    /// A record CloudKit rejected: when its update last changed, and CloudKit's error.
+    struct Rejection: Sendable {
+        let lastChangeDate: Date
+        let error: (any Error)?
+    }
+
     private struct Entry: Sendable {
         /// When the record's update last changed when it was rejected.
         let lastChangeDate: Date
         let endDate: Date
+        let error: (any Error)?
     }
 
     private var entries: [String: Entry] = [:]
@@ -30,8 +37,13 @@ struct SDSRecordQuarantine: Sendable {
         entries.count
     }
 
-    mutating func add(_ recordName: String, lastChangeDate: Date, now: Date = .now) {
-        entries[recordName] = Entry(lastChangeDate: lastChangeDate, endDate: now.addingTimeInterval(Self.duration))
+    /// Why CloudKit rejected the record it rejected last, which later uploads that leave the records out still report.
+    var latestError: (any Error)? {
+        entries.values.filter { $0.error != nil }.max { $0.endDate < $1.endDate }?.error
+    }
+
+    mutating func add(_ recordName: String, lastChangeDate: Date, error: (any Error)? = nil, now: Date = .now) {
+        entries[recordName] = Entry(lastChangeDate: lastChangeDate, endDate: now.addingTimeInterval(Self.duration), error: error)
     }
 
     /// Whether CloudKit rejected a record for a reason that retrying it unchanged doesn't fix.

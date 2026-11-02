@@ -8,17 +8,19 @@ private let bootstrapFailedError: SDSSyncError = SDSSyncError(title: "ckerror.bo
 extension SDSSynchronizer {
     
     /// Synchronizes now, e.g. when the user asks for it. Uploads that paused as iCloud was full are tried again, e.g. after
-    /// the user freed up storage, see `QuotaExceededError`.
+    /// the user freed up storage, see `QuotaExceededError`, and so are records CloudKit rejected, see `SDSRecordQuarantine`.
     public func forceDownload() {
         lastCompletedDownload = nil
         resumeUploads()
+        resetQuarantine()
         startSync()
     }
-    
+
     /// Like `forceDownload()`, and returns once the synchronization is done.
     public func forceDownloadSync() async {
         lastCompletedDownload = nil
         resumeUploads()
+        resetQuarantine()
         await synchronize()
     }
     
@@ -334,8 +336,9 @@ extension SDSSynchronizer {
                 return
             }
             if upload.rejectedCount > 0 {
-                // They're uploaded once they change, or after a while, see `SDSRecordQuarantine`
-                await set(state: .error(SDSSyncError(title: "error.uploadIncomplete", underlyingError: lastRecordFailure)))
+                // They're uploaded once they change, or after a while, see `SDSRecordQuarantine`. Uploads that leave them out
+                // still say why they were rejected.
+                await set(state: .error(SDSSyncError(title: "error.uploadIncomplete", underlyingError: latestRejectionError ?? lastRecordFailure)))
                 await setRoutineTimer(interval: SDSRecordQuarantine.duration)
                 await synchronizeAgainIfRequested()
                 return

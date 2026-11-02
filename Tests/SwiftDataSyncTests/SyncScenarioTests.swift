@@ -664,9 +664,26 @@ struct SyncScenarioTests {
         await device.settle()
 
         let error = try #require(await device.state.error as? SDSSyncError)
+        #expect(error.isIncompleteUpload)
         let reason = try #require(error.underlyingError as? CKError)
         #expect(reason.code == .invalidArguments)
         #expect(reason.localizedDescription == "Cannot create new type ScenarioSubscription in production schema")
+
+        // Later synchronizations leave the record out for a while, and still say why
+        await device.sync()
+        let again = try #require(await device.state.error as? SDSSyncError)
+        #expect((again.underlyingError as? CKError)?.code == .invalidArguments)
+
+        // Nothing synchronizes again by itself until the record's time is up
+        let fetches = server.events(of: "A", .fetchChanges).count
+        try await Task.sleep(for: .seconds(2))
+        #expect(server.events(of: "A", .fetchChanges).count == fetches)
+
+        // When the user asks for it, the record is tried again, which succeeds once the schema has the type
+        server.isProduction = false
+        await device.synchronizer.forceDownloadSync()
+        #expect(device.serverSubscriptions().map(\.feedLink) == ["s1"])
+        #expect(await device.state.error == nil)
         device.terminate()
     }
 }

@@ -88,8 +88,9 @@ rather than becoming duplicates. Only the ones without such a record are uploade
   It saves a record of every synchronized entity with every field set, in a zone of its own that it deletes again, so other
   devices never see them. Call it once `setup` found the store and the user is signed into iCloud.
 
-  Records CloudKit rejects, e.g. as production doesn't have their type yet, put the synchronizer into an error state with an
-  `SDSSyncError` whose `underlyingError` is CloudKit's error, to show or log why.
+  Records CloudKit rejects, e.g. as production doesn't have their type yet, are set aside for an hour or until they change,
+  and the synchronizer's state is an `SDSSyncError` whose `isIncompleteUpload` is true and whose `underlyingError` is
+  CloudKit's error, to show or log why. `forceDownload()`, e.g. a "Sync Now" button, tries them again right away.
 - **App groups**, to synchronize from app extensions too: set `SDSSynchronizer.appGroupToStoreSyncData` to an app group in
   the entitlements of the app and its extensions, before `SDSSynchronizer.shared` is used the first time. Synchronization data
   that an earlier version stored in the app's container is moved there.
