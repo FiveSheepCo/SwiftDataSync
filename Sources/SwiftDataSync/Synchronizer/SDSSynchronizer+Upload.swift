@@ -70,8 +70,8 @@ extension SDSSynchronizer {
         var doneDeletes: [CKRecord.ID] = []
         /// Records that existed already, by name, whose changed keys are saved over them next.
         var conflicts: [String: CKRecord] = [:]
-        /// Records CloudKit rejected, with when their updates last changed, see `SDSRecordQuarantine`.
-        var rejected: [String: Date] = [:]
+        /// Records CloudKit rejected, by name, see `SDSRecordQuarantine`.
+        var rejected: [String: SDSRecordQuarantine.Rejection] = [:]
         /// The error of records CloudKit asked to retry later, with the longest delay.
         var throttle: CKError?
         var isQuotaExceeded = false
@@ -236,7 +236,7 @@ extension SDSSynchronizer {
             // A single record that is too large on its own is left for later, see `SDSRecordQuarantine`
             guard let record = records.first, let lastChangeDate = lastChangeDates[record.recordID.recordName] else { throw error }
             lastRecordFailure = error
-            _ = quarantineRejectedRecords([record.recordID.recordName: lastChangeDate])
+            _ = quarantineRejectedRecords([record.recordID.recordName: .init(lastChangeDate: lastChangeDate, error: error)])
             return try await _upload(sharedDatabase: sharedDatabase, checkingRecordsExist: checkingRecordsExist, roundsOfChangedRecords: roundsOfChangedRecords)
         }
 
@@ -255,7 +255,7 @@ extension SDSSynchronizer {
         } else {
             // E.g. records that keep failing, or keep differing from what was uploaded. They are uploaded with a later synchronization.
             logger.log("No changes completed, uploading the remaining ones later")
-            throw SDSSyncError(title: "error.uploadIncomplete", underlyingError: lastRecordFailure)
+            throw SDSSyncError(title: "error.uploadIncomplete", underlyingError: lastRecordFailure ?? latestRejectionError)
         }
     }
 
@@ -277,7 +277,7 @@ extension SDSSynchronizer {
                 outcome.throttle = ckError
             }
         } else if SDSRecordQuarantine.isPermanentRejection(error), let lastChangeDate = lastChangeDates[recordName] {
-            outcome.rejected[recordName] = lastChangeDate
+            outcome.rejected[recordName] = .init(lastChangeDate: lastChangeDate, error: error)
             lastRecordFailure = error
         } else {
             lastRecordFailure = error
@@ -326,7 +326,7 @@ extension SDSSynchronizer {
     }
 
     /// Leaves records that CloudKit rejected out of uploads for a while, and returns how many.
-    private func quarantineRejectedRecords(_ records: [String: Date]) -> Int {
+    private func quarantineRejectedRecords(_ records: [String: SDSRecordQuarantine.Rejection]) -> Int {
         guard !records.isEmpty else { return 0 }
         logger.error("Uploading \(records.count) records that CloudKit rejected later: \(records.keys.sorted())")
         quarantine(records)
