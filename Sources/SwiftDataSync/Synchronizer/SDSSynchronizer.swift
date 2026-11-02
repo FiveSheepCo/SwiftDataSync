@@ -110,6 +110,8 @@ public final class SDSSynchronizer: Sendable {
 
         /// Records CloudKit rejected, which aren't uploaded for a while.
         var quarantine = SDSRecordQuarantine()
+        /// Why a record of the current upload failed last, which the state of an incomplete upload carries, see `SDSSyncError.underlyingError`.
+        var lastRecordFailure: (any Error)?
 
         fileprivate var containerFinder: _ContainerFinder?
 
@@ -127,6 +129,10 @@ public final class SDSSynchronizer: Sendable {
     var configuration: SDSInternalConfiguration? { mutableState.withLock { $0.configuration } }
     var isObservingStore: Bool { mutableState.withLock { $0.isObservingStore } }
     var isStopped: Bool { mutableState.withLock { $0.isStopped } }
+    var lastRecordFailure: (any Error)? {
+        get { mutableState.withLock { $0.lastRecordFailure } }
+        set { mutableState.withLock { $0.lastRecordFailure = newValue } }
+    }
 
     var defaultZoneID: CKRecordZone.ID! { mutableState.withLock { $0.defaultZoneID } }
     var cloud: (any SDSCloudContainer)! { mutableState.withLock { $0.cloud } }

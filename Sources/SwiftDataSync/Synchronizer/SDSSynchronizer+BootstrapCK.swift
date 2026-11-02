@@ -335,7 +335,7 @@ extension SDSSynchronizer {
             }
             if upload.rejectedCount > 0 {
                 // They're uploaded once they change, or after a while, see `SDSRecordQuarantine`
-                await set(state: .error(SDSSyncError(title: "error.uploadIncomplete")))
+                await set(state: .error(SDSSyncError(title: "error.uploadIncomplete", underlyingError: lastRecordFailure)))
                 await setRoutineTimer(interval: SDSRecordQuarantine.duration)
                 await synchronizeAgainIfRequested()
                 return

@@ -23,6 +23,7 @@ extension SDSSynchronizer {
         var changesStillPending: ChangesStillPendingError?
         var summary = UploadSummary()
         let context = self.context
+        lastRecordFailure = nil
         do {
             for sharedDatabase in includingSharedDatabase ? [false, true] : [false] {
                 do {
@@ -234,6 +235,7 @@ extension SDSSynchronizer {
             }
             // A single record that is too large on its own is left for later, see `SDSRecordQuarantine`
             guard let record = records.first, let lastChangeDate = lastChangeDates[record.recordID.recordName] else { throw error }
+            lastRecordFailure = error
             _ = quarantineRejectedRecords([record.recordID.recordName: lastChangeDate])
             return try await _upload(sharedDatabase: sharedDatabase, checkingRecordsExist: checkingRecordsExist, roundsOfChangedRecords: roundsOfChangedRecords)
         }
@@ -253,7 +255,7 @@ extension SDSSynchronizer {
         } else {
             // E.g. records that keep failing, or keep differing from what was uploaded. They are uploaded with a later synchronization.
             logger.log("No changes completed, uploading the remaining ones later")
-            throw SDSSyncError(title: "error.uploadIncomplete")
+            throw SDSSyncError(title: "error.uploadIncomplete", underlyingError: lastRecordFailure)
         }
     }
 
@@ -276,6 +278,9 @@ extension SDSSynchronizer {
             }
         } else if SDSRecordQuarantine.isPermanentRejection(error), let lastChangeDate = lastChangeDates[recordName] {
             outcome.rejected[recordName] = lastChangeDate
+            lastRecordFailure = error
+        } else {
+            lastRecordFailure = error
         }
         logger.log("Error while uploading single record: \(error, privacy: .public)")
     }

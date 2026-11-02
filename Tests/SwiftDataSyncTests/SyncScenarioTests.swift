@@ -653,4 +653,20 @@ struct SyncScenarioTests {
         #expect(await device.state.error == nil)
         device.terminate()
     }
+
+    /// A production schema without a record type rejects its records. The state says why, so the app can show it.
+    @Test func rejectedRecordsTellWhy() async throws {
+        let server = FakeCloudServer()
+        server.isProduction = true
+        let device = TestDevice("A", server: server)
+        try await device.launch()
+        try device.insertSubscriptions(["s1"])
+        await device.settle()
+
+        let error = try #require(await device.state.error as? SDSSyncError)
+        let reason = try #require(error.underlyingError as? CKError)
+        #expect(reason.code == .invalidArguments)
+        #expect(reason.localizedDescription == "Cannot create new type ScenarioSubscription in production schema")
+        device.terminate()
+    }
 }
