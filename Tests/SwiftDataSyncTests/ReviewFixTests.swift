@@ -80,7 +80,7 @@ private struct ValueStore {
 }
 
 /// Values of attributes that records can't store directly are converted, both ways, rather than crashing the upload.
-@Suite
+@Suite(.coreDataReady)
 struct ValueCodingTests {
 
     @Test func valuesSurviveTheRoundTrip() throws {
@@ -227,7 +227,7 @@ struct ValueCodingTests {
 }
 
 /// How the configuration is made from the model.
-@Suite
+@Suite(.coreDataReady)
 struct ConfigurationTests {
 
     /// The inverse relationship's settings are read for the inverse. In the sorted order, `FolderModel.notes` is decided
@@ -254,7 +254,7 @@ struct ConfigurationTests {
 }
 
 /// Records CloudKit rejects don't keep the other changes from being uploaded.
-@Suite
+@Suite(.coreDataReady)
 struct QuarantineTests {
 
     @Test func rejectedRecordsWaitUntilTheyChange() {
@@ -305,7 +305,7 @@ struct QuarantineTests {
 
 /// Once an app that synchronized before stores the synchronization data in an app group, its data is moved there.
 /// Starting over would download every record again as new models.
-@Suite
+@Suite(.coreDataReady)
 struct SyncDataLocationTests {
 
     /// It isn't changed after it's made.
@@ -364,7 +364,7 @@ struct SyncDataLocationTests {
 }
 
 /// The view model's state decides which synchronizations start. It's shared, so these run one after another.
-@Suite(.serialized)
+@Suite(.coreDataReady, .serialized)
 @MainActor
 struct SynchronizationStateTests {
 

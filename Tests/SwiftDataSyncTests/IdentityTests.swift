@@ -34,7 +34,7 @@ nonisolated(unsafe) private let syncDataModel: NSManagedObjectModel = {
 /// Entities with an identity name their records after it, so models that several devices create for the same thing share
 /// one record. Everything but CloudKit itself is checked here: naming, finding local models for downloaded records, giving
 /// them the records, and saving over a record another device saved first.
-@Suite
+@Suite(.coreDataReady)
 struct IdentityTests {
 
     /// A model container and a coordinator on the same store, like the store the synchronizer observes.

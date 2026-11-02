@@ -1,12 +1,24 @@
 import Foundation
 import OSLog
+import os
 import CloudKit
 
 /// A model which contains the current sync state.
 @Observable @MainActor
 public final class SDSSynchronizationViewModel {
-    /// The shared instance of the view model.
+    /// The shared instance of the view model, the one of `SDSSynchronizer.shared`.
     nonisolated public static let shared = SDSSynchronizationViewModel()
+
+    /// The synchronizer whose state this is. Set once, when the synchronizer is made, possibly off the main actor.
+    nonisolated var synchronizer: SDSSynchronizer? {
+        get { synchronizerReference.withLock { $0.value } }
+        set { synchronizerReference.withLock { $0.value = newValue } }
+    }
+    @ObservationIgnored
+    private nonisolated let synchronizerReference = OSAllocatedUnfairLock(initialState: WeakSynchronizer())
+    private struct WeakSynchronizer: @unchecked Sendable {
+        weak var value: SDSSynchronizer?
+    }
     
     public enum State: Sendable {
         case waitingForSetup
@@ -55,7 +67,8 @@ public final class SDSSynchronizationViewModel {
     
     // MARK: Initializer
     
-    private nonisolated init() {}
+    /// Tests make a view model for each of their synchronizers.
+    nonisolated init() {}
     
     // MARK: Functions
     
@@ -169,7 +182,7 @@ public final class SDSSynchronizationViewModel {
     }
     
     func forceSync() {
-        SDSSynchronizer.shared.forceSyncEverything()
+        synchronizer?.forceSyncEverything()
     }
     
     var forceSyncDisabled: Bool {

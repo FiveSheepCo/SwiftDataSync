@@ -71,6 +71,22 @@
         }
       }
     },
+    "error.quotaExceeded" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dein iCloud-Speicher ist voll"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Your iCloud storage is full"
+          }
+        }
+      }
+    },
     "error.uploadIncomplete" : {
       "localizations" : {
         "en" : {

@@ -2,7 +2,7 @@ import Foundation
 import CoreData
 import CloudKit
 
-// All of this should be run on `observedUpdateContext`, but `lastObjectChange`
+/// A synchronized object with what its entity's configuration says about it. Has to be used on the queue of the object's context.
 class SDSSynchronizableContainer {
     lazy var id: String = idBlock()
     let object: NSManagedObject
@@ -10,6 +10,9 @@ class SDSSynchronizableContainer {
     let parentKey: String?
     let syncKeys: [String]
     let assetKeys: [String]
+    /// The synchronizer that made the container, which knows the records of related objects and the zones.
+    /// `nil` for containers made outside of one, e.g. in tests of the values.
+    weak var synchronizer: SDSSynchronizer?
     
     private let idBlock: () -> String
     
@@ -18,42 +21,29 @@ class SDSSynchronizableContainer {
         object: NSManagedObject,
         parentKey: String? = nil,
         syncKeys: [String] = [],
-        assetKeys: [String]
+        assetKeys: [String],
+        synchronizer: SDSSynchronizer? = nil
     ) {
         self.idBlock = id
         self.object = object
         self.parentKey = parentKey
         self.syncKeys = syncKeys
         self.assetKeys = assetKeys
+        self.synchronizer = synchronizer
     }
     
     var parent: NSManagedObject? {
         get { parentKey.map { object.value(forKey: $0) } as? NSManagedObject }
         set { parentKey.map { object.setValue(newValue, forKey: $0) } }
     }
-    
-    func delete() {
-        guard let context = object.managedObjectContext else { return }
-        
-        context.performAndWaitUnchecked {
-            context.delete(object)
-        }
-        
-        let id = self.id
-        let sync = SDSSynchronizer.shared
-        sync.context.performAndWait {
-            sync.existingLocalEntity(for: id)?.delete()
-        }
+
+    /// The container of a related object, made by the same synchronizer.
+    func container(for object: NSManagedObject) -> SDSSynchronizableContainer? {
+        synchronizer?.container(for: object)
     }
 }
 
 extension SDSSynchronizableContainer {
-    var lastObjectChange: Date? {
-        let id = self.id
-        return SDSSynchronizer.shared.context.performAndWait {
-            CloudKitUpdate.find(for: id)?.lastChangeDate
-        }
-    }
     
     var recordId: CKRecord.ID {
         .init(recordName: id, zoneID: zoneId)
@@ -70,12 +60,12 @@ extension SDSSynchronizableContainer {
             let value = object.value(forKey: key)
 
             let cloudValue: CKRecordValue?
-            if let referenceObjectContainer = (value as? NSManagedObject)?.synchronizableContainer {
+            if let referenceObject = value as? NSManagedObject, let referenceObjectContainer = container(for: referenceObject) {
                 cloudValue = referenceObjectContainer.cloudReference
             } else if let referenceObjectList = value as? NSOrderedSet {
                 // Records leave out empty lists, so an empty relationship is stored as no value
                 cloudValue = referenceObjectList.count == 0 ? nil : (referenceObjectList.array as! [NSManagedObject]).compactMap { synchronizable in
-                    synchronizable.synchronizableContainer?.cloudReference
+                    self.container(for: synchronizable)?.cloudReference
                 } as CKRecordValue
             } else if let set = value as? NSSet {
                 guard set.count == 0 else {
@@ -105,12 +95,12 @@ extension SDSSynchronizableContainer {
     var sharedZoneId: CKRecordZone.ID? {
         var parent: SDSSynchronizableContainer = self
         
-        while let newParent = parent.parent?.synchronizableContainer {
+        while let newParent = parent.parent.flatMap(container(for:)) {
             parent = newParent
         }
         
         // A root that wasn't saved yet isn't shared, and must not get an id now, as saving it gives it another one
-        if parent.object.objectID.isTemporaryID && !SDSSynchronizer.shared.isDownloadedObject(parent.object) {
+        if parent.object.objectID.isTemporaryID && synchronizer?.isDownloadedObject(parent.object) != true {
             return nil
         }
         
@@ -128,7 +118,7 @@ extension SDSSynchronizableContainer {
     var sharableRootLocalId: String? {
         var root: SDSSynchronizableContainer = self
 
-        while let newParent = root.parent?.synchronizableContainer {
+        while let newParent = root.parent.flatMap(container(for:)) {
             root = newParent
         }
 
@@ -138,6 +128,6 @@ extension SDSSynchronizableContainer {
     }
 
     var zoneId: CKRecordZone.ID {
-        sharedZoneId ?? SDSSynchronizer.shared.defaultZoneID
+        sharedZoneId ?? synchronizer?.defaultZoneID ?? CKRecordZone.ID(zoneName: "CoreData")
     }
 }

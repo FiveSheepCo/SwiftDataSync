@@ -72,10 +72,96 @@ enum SDSIdentity {
             server[key] = local[key]
         }
         // The parent is only set when it changed, which also sets this key, see `record(for:)`
-        if local.parent != nil || changedKeys.contains(SDSSynchronizer.Constants.parentWorkaroundKey) {
+        if changedKeys.contains(SDSSynchronizer.Constants.parentWorkaroundKey) {
             server.parent = local.parent
         }
         return server
+    }
+}
+
+/// Saved local objects of entities with an identity by the record name their identity values give them, so a download finds
+/// the object for a record it doesn't know yet without a fetch for each record.
+///
+/// It's built for an entity once a download needs it, with a fetch of the identity values only, and kept up to date with
+/// the objects the download inserts, which can be found once they're saved. Has to be used on the queue of its context.
+final class SDSIdentityIndex {
+    private let context: NSManagedObjectContext
+    private var objectIDs: [String: [String: NSManagedObjectID]] = [:]
+    /// Objects the download inserted, which only have permanent IDs once they're saved.
+    private var insertedObjects: [String: [String: NSManagedObject]] = [:]
+
+    init(context: NSManagedObjectContext) {
+        self.context = context
+    }
+
+    /// A saved object of the entity whose identity values give `recordName`, like `SDSIdentity.matchingObject`.
+    func object(entityName: String, keys: [String], recordName: String) throws -> NSManagedObject? {
+        if objectIDs[entityName] == nil {
+            try build(entityName: entityName, keys: keys)
+        }
+
+        let candidate: NSManagedObject?
+        if let object = insertedObjects[entityName]?[recordName] {
+            candidate = object
+        } else if let objectID = objectIDs[entityName]?[recordName] {
+            // A deleted object's row is gone
+            candidate = try? context.existingObject(with: objectID)
+        } else {
+            candidate = nil
+        }
+        // Models that aren't saved yet have no record that could be replaced. The values could have changed since.
+        guard
+            let candidate,
+            !candidate.isDeleted,
+            !candidate.objectID.isTemporaryID,
+            SDSIdentity.recordName(entityName: entityName, values: SDSIdentity.values(of: candidate, keys: keys)) == recordName
+        else { return nil }
+        return candidate
+    }
+
+    /// Adds an object the download inserted, under the name its identity values give it.
+    func add(_ object: NSManagedObject, entityName: String, recordName: String) {
+        if insertedObjects[entityName]?[recordName] == nil {
+            insertedObjects[entityName, default: [:]][recordName] = object
+        }
+    }
+
+    /// The inserted objects were saved, so they're kept by their permanent IDs from now on, rather than in memory.
+    func objectsWereSaved() {
+        for (entityName, objects) in insertedObjects where objectIDs[entityName] != nil {
+            for (recordName, object) in objects where !object.objectID.isTemporaryID && objectIDs[entityName]?[recordName] == nil {
+                objectIDs[entityName]?[recordName] = object.objectID
+            }
+        }
+        insertedObjects = [:]
+    }
+
+    /// The inserted objects weren't saved, as the download was discarded.
+    func discardInsertedObjects() {
+        insertedObjects = [:]
+    }
+
+    private func build(entityName: String, keys: [String]) throws {
+        let objectID = NSExpressionDescription()
+        objectID.name = "objectID"
+        objectID.expression = NSExpression.expressionForEvaluatedObject()
+        objectID.expressionResultType = .objectIDAttributeType
+
+        let request = NSFetchRequest<NSDictionary>(entityName: entityName)
+        request.resultType = .dictionaryResultType
+        request.propertiesToFetch = keys + [objectID]
+        // Only saved objects
+        request.includesPendingChanges = false
+
+        var index: [String: NSManagedObjectID] = [:]
+        for row in try context.fetch(request) {
+            guard let id = row["objectID"] as? NSManagedObjectID else { continue }
+            let recordName = SDSIdentity.recordName(entityName: entityName, values: keys.map { row[$0] })
+            if index[recordName] == nil {
+                index[recordName] = id
+            }
+        }
+        objectIDs[entityName] = index
     }
 }
 
@@ -137,11 +223,78 @@ extension CloudKitLocalEntity {
         return (true, previousId)
     }
 
-    private static func entry(forId id: String, in context: NSManagedObjectContext) -> CloudKitLocalEntity? {
-        let request = fetchRequest()
-        request.sortDescriptors = []
-        request.fetchLimit = 1
-        request.predicate = NSPredicate(format: "id = %@", id)
-        return try? context.fetch(request).first
+}
+
+/// Local objects of entities without an identity that have no records, by their synchronized values, so a download can give
+/// them the records they're copies of, rather than inserting the records as duplicates.
+///
+/// Used after objects vanished from the store, e.g. because it was rebuilt and its objects got new URIs, see
+/// `SDSSynchronizer.backfill(onlyUntracked:)`: the same data then looks like new objects, which would be uploaded again as
+/// new records, while every record is downloaded again. Objects whose values differ from every record's stay new objects.
+/// Has to be used on the queue of its context.
+final class SDSContentIndex {
+    private weak var synchronizer: SDSSynchronizer?
+    private let context: NSManagedObjectContext
+    /// The URIs of the objects that have records.
+    private let trackedLocalIds: Set<String>
+    private var objectIDs: [String: [String: [NSManagedObjectID]]] = [:]
+
+    init(synchronizer: SDSSynchronizer, context: NSManagedObjectContext, trackedLocalIds: Set<String>) {
+        self.synchronizer = synchronizer
+        self.context = context
+        self.trackedLocalIds = trackedLocalIds
+    }
+
+    /// An object without a record whose synchronized attributes have the record's values, which isn't matched again.
+    /// - Parameter overflowValues: The values of the record's overflow asset, see `SDSOverflow`.
+    func object(matching record: CKRecord, overflowValues: [String: Any], entity: NSEntityDescription, keys: [String]) -> NSManagedObject? {
+        guard let entityName = entity.name else { return nil }
+        let attributeKeys = keys.filter { entity.attributesByName[$0] != nil }.sorted()
+        if objectIDs[entityName] == nil {
+            build(entity: entity, keys: attributeKeys)
+        }
+        let recordKey = { (key: String) in entity.propertiesByName[key]?.renamingIdentifier ?? key }
+        let content = Self.content(attributeKeys.map { key -> Any? in
+            let rawKey = recordKey(key)
+            let value = record[rawKey] ?? overflowValues[rawKey]
+            if let asset = value as? CKAsset {
+                return asset.fileURL.flatMap { try? Data(contentsOf: $0) }
+            }
+            return value
+        })
+        guard var candidates = objectIDs[entityName]?[content], !candidates.isEmpty else { return nil }
+        let objectID = candidates.removeFirst()
+        objectIDs[entityName]?[content] = candidates
+        return try? context.existingObject(with: objectID)
+    }
+
+    private static func content(_ values: [Any?]) -> String {
+        values.map { SDSIdentity.canonicalString($0).map { "\($0.utf8.count):\($0)" } ?? "-" }.joined(separator: ",")
+    }
+
+    private func build(entity: NSEntityDescription, keys: [String]) {
+        guard let entityName = entity.name, let synchronizer else { return }
+        var index: [String: [NSManagedObjectID]] = [:]
+        let request = NSFetchRequest<NSManagedObject>(entityName: entityName)
+        request.includesSubentities = false
+        request.fetchBatchSize = 200
+        let objects = (try? context.fetch(request)) ?? []
+        for object in objects where !trackedLocalIds.contains(object.objectID.uriRepresentation().absoluteString) {
+            guard let container = synchronizer.container(for: object) else { continue }
+            let assetKeys = Set(container.assetKeys)
+            // The values as records store them, e.g. strings for URLs, without writing assets
+            let values = (try? container.changeDictionary(for: keys.filter { !assetKeys.contains($0) })) ?? [:]
+            let content = Self.content(keys.map { key -> Any? in
+                if assetKeys.contains(key) {
+                    return object.value(forKey: key)
+                }
+                return values[entity.propertiesByName[key]?.renamingIdentifier ?? key] ?? nil
+            })
+            index[content, default: []].append(object.objectID)
+            if !object.hasChanges {
+                context.refresh(object, mergeChanges: false)
+            }
+        }
+        objectIDs[entityName] = index
     }
 }

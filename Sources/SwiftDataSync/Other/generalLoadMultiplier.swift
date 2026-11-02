@@ -4,8 +4,9 @@ import Network
 import UIKit
 #endif
 
+/// How much longer than usual routine synchronizations wait, e.g. on battery or a cellular connection.
 @MainActor
-var generalLoadMultiplier: TimeInterval {
+func generalLoadMultiplier(networkMonitor: NWPathMonitor?) -> TimeInterval {
     var multiplier: TimeInterval = 1
     
     #if os(macOS)
@@ -20,7 +21,7 @@ var generalLoadMultiplier: TimeInterval {
     #endif
     multiplier *= isUnplugged ? 1/max(0.01, sqrt(batteryLevel)) : 1
     multiplier *= ProcessInfo.processInfo.isLowPowerModeEnabled ? 3 : 1
-    multiplier *= SDSSynchronizer.shared.networkMonitor.currentPath.usesInterfaceType(.cellular) ? 3 : 1
+    multiplier *= networkMonitor?.currentPath.usesInterfaceType(.cellular) == true ? 3 : 1
     
     return multiplier
 }

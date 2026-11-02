@@ -7,7 +7,8 @@ extension CloudKitZone {
     // MARK: Initializers
     
     convenience init(name: String, owner: String, context: NSManagedObjectContext) {
-        self.init(entity: Self.entity(), insertInto: context)
+        // The entity of the context's model, as the class could belong to several models, e.g. in tests
+        self.init(entity: NSEntityDescription.entity(forEntityName: "CloudKitZone", in: context)!, insertInto: context)
         
         self.name = name
         self.owner = owner
