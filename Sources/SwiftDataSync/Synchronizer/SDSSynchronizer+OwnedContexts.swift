@@ -68,6 +68,8 @@ extension SDSSynchronizer {
         // The names models moved away from, which are deleted once every batch is stored, unless another model of these
         // changes took them, also one of another batch
         var vacatedIds: [(id: String, zoneId: CKRecordZone.ID?)] = []
+        // The names models were given in these changes, rather than had already. A model's change can come twice, e.g.
+        // as it references another one whose identity changed, once before its own move.
         var assignedIds: Set<String> = []
 
         for start in stride(from: 0, to: changes.count, by: batchSize) {
@@ -105,6 +107,8 @@ extension SDSSynchronizer {
 
                 let id: String
                 var previousId: String?
+                // Whether the model had the record already, rather than being given it here
+                var hadId = false
                 if change.identityChanged {
                     if
                         let name = change.identityRecordName,
@@ -128,6 +132,8 @@ extension SDSSynchronizer {
                         vacating: vacating,
                         in: context
                     )
+                    // Kept its record, e.g. as the name its identity gives it is taken
+                    hadId = previousId == nil && entries[change.localId] != nil
                     entries[change.localId] = CloudKitLocalEntity.entry(forLocalId: change.localId, in: context)
                     if previousId != nil && removedIds.contains(id) {
                         // E.g. the identity changed back before its move was uploaded. The record is kept, rather than deleted,
@@ -138,6 +144,7 @@ extension SDSSynchronizer {
                     }
                 } else if let entry = entries[change.localId] {
                     id = entry.id
+                    hadId = true
                 } else if
                     let name = change.identityRecordName,
                     removedIds.contains(name),
@@ -169,8 +176,10 @@ extension SDSSynchronizer {
                     }
                 }
                 takenIds.insert(id)
-                vacating.remove(id)
-                assignedIds.insert(id)
+                if !hadId {
+                    vacating.remove(id)
+                    assignedIds.insert(id)
+                }
 
                 stored.append((change, id, previousId, zoneId))
             }

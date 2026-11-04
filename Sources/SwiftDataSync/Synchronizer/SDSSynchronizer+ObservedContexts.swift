@@ -24,6 +24,9 @@ struct SDSObjectChange: Sendable {
 struct SDSObjectDeletion: Sendable {
     /// The URI of the object's ID.
     let localId: String
+    /// The record of the object when its save started. A download can forget the object's local entity before the deletion
+    /// is stored, e.g. as it downloads the record, see `storeRemovals(_:)`.
+    var recordId: String? = nil
     /// See `SDSSynchronizableContainer.sharableRootLocalId`.
     let sharableRootLocalId: String?
     let isSharable: Bool
@@ -110,6 +113,15 @@ extension SDSSynchronizer {
                 sharableRootLocalId: deleted.sharableRootLocalId,
                 isSharable: deleted is SDSSharableContainer
             )
+        }
+        if !deletions.isEmpty {
+            let syncContext = self.context
+            let recordIds = syncContext.performAndWait {
+                CloudKitLocalEntity.entries(forLocalIds: deletions.values.map(\.localId), in: syncContext).mapValues(\.id)
+            }
+            for (objectID, deletion) in deletions {
+                deletions[objectID]?.recordId = recordIds[deletion.localId]
+            }
         }
         rememberDeletionsBeingSaved(deletions, by: context)
     }
@@ -381,7 +393,7 @@ extension SDSSynchronizer {
         context.perform {
             for deletion in deletions {
                 // An object without a record was never uploaded, so there's nothing to delete
-                guard let id = self.existingRecordId(forLocalId: deletion.localId) else { continue }
+                guard let id = self.existingRecordId(forLocalId: deletion.localId) ?? deletion.recordId else { continue }
                 // Read before the share is deleted, which would send the removal to the private database
                 let zoneId = self.sharedZoneId(forRootLocalId: deletion.sharableRootLocalId)
 

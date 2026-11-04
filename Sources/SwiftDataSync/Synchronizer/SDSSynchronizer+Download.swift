@@ -520,8 +520,9 @@ private final class CKDownloadHandler {
         }
     }
     
-    /// The URIs of the objects whose records are known to exist. Objects whose records were only named here, e.g. ones changed
-    /// while every record is downloaded again, can still be copies of the records' objects, see `SDSContentIndex`.
+    /// The URIs of the objects whose records are known to exist. Objects whose records were only named here, and that were
+    /// saved before, as some values are of unknown age, e.g. ones changed while every record is downloaded again, can still
+    /// be copies of the records' objects, see `SDSContentIndex`. Objects created since can't.
     private static func localIdsOfConfirmedRecords(in context: NSManagedObjectContext) -> Set<String> {
         context.performAndWait {
             // Saved first, as dictionaries are only read from the store
@@ -529,7 +530,7 @@ private final class CKDownloadHandler {
             let inserts = NSFetchRequest<NSDictionary>(entityName: "CloudKitUpdate")
             inserts.resultType = .dictionaryResultType
             inserts.propertiesToFetch = ["id"]
-            inserts.predicate = NSPredicate(format: "rawChangedKeys BEGINSWITH %@", CloudKitUpdate.insertMarker)
+            inserts.predicate = NSPredicate(format: "rawChangedKeys BEGINSWITH %@ AND rawChangedKeys CONTAINS %@", CloudKitUpdate.insertMarker, CloudKitUpdate.backfillMarker)
             let unconfirmed = Set(((try? context.fetch(inserts)) ?? []).compactMap { $0["id"] as? String })
             let entities = NSFetchRequest<NSDictionary>(entityName: "CloudKitLocalEntity")
             entities.resultType = .dictionaryResultType
