@@ -11,6 +11,10 @@ struct SDSRecordQuarantine: Sendable {
     /// How long a rejected record isn't uploaded, unless it changes.
     static let duration: TimeInterval = 60 * 60
 
+    /// When the removal of a record last changed, as removals don't change, e.g. one CloudKit rejects as the user may only
+    /// read a share. It's retried once the time is up.
+    static let removalChangeDate = Date.distantPast
+
     /// A record CloudKit rejected: when its update last changed, and CloudKit's error.
     struct Rejection: Sendable {
         let lastChangeDate: Date

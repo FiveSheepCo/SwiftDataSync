@@ -240,10 +240,15 @@ struct IdentityTests {
             #expect(moved.id == newName && moved.previousId == oldName)
             #expect(CloudKitLocalEntity.entry(forLocalId: localId, in: context)?.id == newName)
 
-            // Another model has the record of the new identity already, so this one keeps its record
+            // Another model has the record of the new identity already, so this one moves to a random name, rather than keeping
+            // the name of identity values it doesn't have anymore
             _ = CloudKitLocalEntity(id: oldName, localId: "x-coredata://store/IdentityModel/p2", context: context)
             let blocked = CloudKitLocalEntity.recordId(forLocalId: localId, identityRecordName: oldName, renamingToIdentity: true, in: context)
-            #expect(blocked.id == newName && blocked.previousId == nil)
+            #expect(UUID(uuidString: blocked.id) != nil && blocked.previousId == newName)
+
+            // A random name is kept
+            let random = CloudKitLocalEntity.recordId(forLocalId: localId, identityRecordName: oldName, renamingToIdentity: true, in: context)
+            #expect(random.id == blocked.id && random.previousId == nil)
         }
     }
 

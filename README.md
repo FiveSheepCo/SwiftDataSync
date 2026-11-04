@@ -54,7 +54,8 @@ the same identity (see below), the record wins completely, also over values it l
 cleared. Only models whose records don't exist are uploaded with their values. If such a model is edited before it's
 uploaded, the edited keys are uploaded like any change.
 
-Deletions are only recorded when models are deleted through a context, e.g. `ModelContext.delete(_:)`. Batch deletes, like
+Deletions are only recorded when models are deleted through a context, e.g. `ModelContext.delete(_:)`, once the deletion is
+saved: one that's discarded before, e.g. by a rollback, isn't uploaded. Batch deletes, like
 `ModelContext.delete(model:where:)`, change the store directly. Their records stay in iCloud, and models whose records
 are known but that are gone from the store aren't taken for deletions: a lost or replaced store would otherwise delete the
 data on every device. Every record is downloaded again with the next launch's first synchronization instead. If the store
@@ -109,11 +110,14 @@ SDSSynchronizer.shared.start()
 To start over instead, `resetSyncData()` forgets everything the synchronizer stored about iCloud's data: which objects
 have records, the changes that weren't uploaded, change tokens and whether everything was downloaded. iCloud's data stays
 as it is. Synchronizing stops, and the next `start()` downloads everything and uploads the local objects iCloud doesn't
-have, like a new device. Changes made in `beforeForgetting`, which runs once no synchronization runs anymore, aren't
-uploaded, so an app can empty its store there, to look at iCloud's data before deciding what to do with its own:
+have, like a new device. Local models without an identity are first matched with the records that have their values, so
+they aren't duplicated, and local copies of other users' shares are removed, and downloaded again. Changes made in
+`beforeForgetting`, which runs once no synchronization runs anymore, aren't recorded, so they're never uploaded: an app can
+empty its store there, to look at iCloud's data before deciding what to do with its own. If the data can't be forgotten,
+e.g. as the disk is full, the reset throws, the data stays as it is, and synchronizing stays stopped until `start()`:
 
 ```swift
-await SDSSynchronizer.shared.resetSyncData {
+try await SDSSynchronizer.shared.resetSyncData {
     // E.g. delete the local objects, so iCloud's data is downloaded into an empty store
 }
 SDSSynchronizer.shared.start()
@@ -185,16 +189,20 @@ SDSConfiguration(swiftDataEntities: [
 
 For these entities:
 
-- The record is named `<Entity>.<SHA-256 of the identity values>`, the same on every device. Strings, numbers, booleans,
-  dates (to the millisecond, the precision of CloudKit), URLs and data can be identity values.
+- The record is named `<Entity>.<SHA-256 of the identity values>`, the same on every device. Strings, integers, doubles,
+  booleans, dates (to the millisecond, the precision of CloudKit), UUIDs, URLs and data can be identity values. A model
+  without all of its identity values gets a randomly named record, like one without an identity.
 - A downloaded record whose name isn't known yet is first matched to a saved local model with the same identity values.
   The model gets the record and its values instead of a duplicate being inserted.
 - When another device uploaded the same identity first, the upload saves the changed keys over its record: as with any
   record, the last upload of a key wins. Models that were saved before synchronizing started are the exception: the record's
   values win, see above.
-- Changing an identity value deletes the record of the old values once the change is saved, and uploads the model as a new
-  record. Records that reference the model are uploaded again, so they reference the new record.
-- Two local models with the same identity values keep separate, randomly named records.
+- Changing an identity value deletes the record of the old values once the change is saved, unless another model takes
+  them in the same save, and uploads the model as a new record. Records that reference the model are uploaded again, so they reference the new record. Until they are, a
+  relationship that cascades deletions from the model deletes their models on devices that download in between, which get
+  them back with the new records: avoid cascading deletions to synchronized models from entities with an identity.
+- Two local models with the same identity values keep separate, randomly named records. A model that changes to an identity
+  another model has moves to a randomly named record too.
 - Identity values have to be stored in the record, so they can't be `assetProperties`.
 - Entities with an identity can't be sharable, below a sharable entity, or the parent of other entities: different users'
   shares could have records of the same identity, and deleting a parent's record would delete its children's records.

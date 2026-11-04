@@ -110,8 +110,9 @@ extension SDSSynchronizer {
 
         // Deletes are retrieved first. The maximum applies to saved and deleted records combined.
         // While iCloud is full, only removals are uploaded, which free up storage.
-        let deletes = synchronizableDeletes(sharedDatabase: sharedDatabase, maximum: maximumRecords)
+        let (deletes, quarantinedDeleteCount) = synchronizableDeletes(sharedDatabase: sharedDatabase, maximum: maximumRecords)
         var round = try synchronizableUpdates(sharedDatabase: sharedDatabase, maximum: quotaPauseEnd(sharedDatabase: sharedDatabase) == nil ? maximumRecords - deletes.count : 0)
+        round.quarantinedCount += quarantinedDeleteCount
         if checkingRecordsExist && !round.insertsBackfilledValues {
             let deleted = try await recordsDeletedElsewhere(in: round, database: database)
             if !deleted.isEmpty {
@@ -126,6 +127,8 @@ extension SDSSynchronizer {
         }
         let records = round.records
         let lastChangeDates = round.lastChangeDates
+        // Removals CloudKit rejects are set aside like records, see `SDSRecordQuarantine.removalChangeDate`
+        let removalChangeDates = Dictionary(deletes.map { ($0.recordName, SDSRecordQuarantine.removalChangeDate) }, uniquingKeysWith: { date, _ in date })
 
         guard records.count + deletes.count > 0 else {
             self.lastCompletedUpload = Date()
@@ -158,7 +161,7 @@ extension SDSSynchronizer {
                     // The record is already gone, e.g. because it was deleted on another device too
                     case .failure(let error as CKError) where error.code == .unknownItem: outcome.doneDeletes.append(recordId)
                     // E.g. CloudKit asks to wait, or the zone is gone, like for saved records
-                    case .failure(let error): self.classify(error, of: recordId, lastChangeDates: [:], into: &outcome)
+                    case .failure(let error): self.classify(error, of: recordId, lastChangeDates: removalChangeDates, into: &outcome)
                     }
                 }
                 operation.modifyRecordsResultBlock = { operationResult in
@@ -173,6 +176,8 @@ extension SDSSynchronizer {
                         }
                         guard let ckError = error as? CKError, ckError.code == .partialFailure else {
                             self.logger.log("Error while uploading records: \(error)")
+                            // Records and removals CloudKit confirmed before aren't uploaded again
+                            _ = self.deleteObjects(for: outcome.doneRecords, deletes: outcome.doneDeletes, round: round)
                             continuation.resume(throwing: (error as? CKError)?.code == .quotaExceeded ? QuotaExceededError(sharedDatabase: sharedDatabase) : error)
                             return
                         }
@@ -188,7 +193,7 @@ extension SDSSynchronizer {
                                         outcome.doneDeletes.append(recordId)
                                     }
                                 } else {
-                                    self.classify(itemError, of: recordId, lastChangeDates: [:], into: &outcome)
+                                    self.classify(itemError, of: recordId, lastChangeDates: removalChangeDates, into: &outcome)
                                 }
                             } else {
                                 self.classify(itemError, of: recordId, lastChangeDates: lastChangeDates, into: &outcome)
@@ -197,7 +202,9 @@ extension SDSSynchronizer {
                     }
 
                     var progress = self.deleteObjects(for: outcome.doneRecords, deletes: outcome.doneDeletes, round: round)
-                    progress.conflictCount = self.retryConflicts(outcome.conflicts, ofBackfilledValues: round.insertsBackfilledValues)
+                    let conflicts = self.retryConflicts(outcome.conflicts, ofBackfilledValues: round.insertsBackfilledValues)
+                    progress.conflictCount = conflicts.retried
+                    progress.completedCount += conflicts.completed
                     progress.rejectedCount = self.quarantineRejectedRecords(outcome.rejected)
                     self.logger.log("Operation completed: \(outcome.doneRecords.count) \(outcome.doneDeletes.count)")
 
@@ -292,14 +299,14 @@ extension SDSSynchronizer {
         return error.serverRecord
     }
 
-    /// Remembers the records that existed already, so the next upload saves the changed keys over them, and returns how many.
+    /// Remembers the records that existed already, so the next upload saves the changed keys over them. Returns how many
+    /// are saved over, and how many are done, as nothing changed locally.
     /// - Parameter ofBackfilledValues: Whether they were inserted with backfilled values. Their records win over those
     ///   completely (see `CloudKitUpdate.recordExists()`), and are downloaded with another synchronization. Only the keys
     ///   that changed locally are saved over them.
-    private func retryConflicts(_ conflicts: [String: CKRecord], ofBackfilledValues: Bool) -> Int {
-        guard !conflicts.isEmpty else { return 0 }
+    private func retryConflicts(_ conflicts: [String: CKRecord], ofBackfilledValues: Bool) -> (retried: Int, completed: Int) {
+        guard !conflicts.isEmpty else { return (0, 0) }
         logger.log("Saving \(conflicts.count) records over the ones that existed already")
-        // Also records whose updates are done now, which counts as progress
         let count = conflicts.count
         var conflicts = conflicts
         if ofBackfilledValues {
@@ -322,7 +329,7 @@ extension SDSSynchronizer {
             requestSynchronization()
         }
         rememberServerRecordsOfConflicts(conflicts)
-        return count
+        return (conflicts.count, count - conflicts.count)
     }
 
     /// Leaves records that CloudKit rejected out of uploads for a while, and returns how many.
@@ -370,66 +377,95 @@ extension SDSSynchronizer {
 
         return try context.performAndWaitUnchecked {
             var skippedCount = 0
-            // A record's references are uploaded before it, also if only one of them has backfilled values
-            for depthPredicate in depthPredicates {
-                for insertsBackfilledValues in [true, false] {
-                    var round = UploadRound(insertsBackfilledValues: insertsBackfilledValues)
-                    let kindPredicate = insertsBackfilledValues ? backfilledPredicate : NSCompoundPredicate(notPredicateWithSubpredicate: backfilledPredicate)
+            // Whether records were left for a later round, as the objects they reference only got records now
+            var deferred = false
+            // Each pass selects the records the previous one queued first, e.g. one for each level of a chain of references
+            for _ in 0..<Self.maximumSelectionPasses {
+                skippedCount = 0
+                // Records built once an object was queued in this pass might reference it, so they wait too
+                let queuedReferencedObjectCount = self.queuedReferencedObjectCount
+                // A record's references are uploaded before it, also if only one of them has backfilled values
+                for depthPredicate in depthPredicates {
+                    for insertsBackfilledValues in [true, false] {
+                        var round = UploadRound(insertsBackfilledValues: insertsBackfilledValues)
+                        let kindPredicate = insertsBackfilledValues ? backfilledPredicate : NSCompoundPredicate(notPredicateWithSubpredicate: backfilledPredicate)
+                        // Updates that were looked at already, which the next fetch leaves out, as CloudKit rejects saving a record twice
+                        var seen: [NSManagedObjectID] = []
+                        // Also another update of the same record, e.g. as two processes stored one at once
+                        var names: Set<String> = []
 
-                    while round.records.count < maximum {
-                        // Quarantined updates are fetched again each time, so as many more are fetched
-                        let limit = maximum - round.records.count + quarantinedCount
-                        let request = CloudKitUpdate.fetchRequest()
-                        request.sortDescriptors = []
-                        request.fetchLimit = limit
-                        request.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [zonePredicate, kindPredicate, depthPredicate])
-                        let updates = try context.fetch(request)
+                        while round.records.count < maximum {
+                            // Quarantined updates are fetched again each time, so as many more are fetched
+                            let limit = maximum - round.records.count + quarantinedCount
+                            let request = CloudKitUpdate.fetchRequest()
+                            request.sortDescriptors = []
+                            request.fetchLimit = limit
+                            request.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [zonePredicate, kindPredicate, depthPredicate]
+                                + (seen.isEmpty ? [] : [NSPredicate(format: "NOT (self IN %@)", seen)]))
+                            let updates = try context.fetch(request)
 
-                        // CloudKit rejects saving and deleting the same record in a single operation. An update can still
-                        // end up next to a removal, e.g. when an inserted object is deleted before its insertion was handled,
-                        // so the removal wins, just like `setRemoval` deletes the pending update.
-                        let removedIds = Set(context.metadataEntries(of: "CloudKitRemoval", withIds: updates.map(\.id)).compactMap { $0.value(forKey: "id") as? String })
+                            // CloudKit rejects saving and deleting the same record in a single operation. An update can still
+                            // end up next to a removal, e.g. when an inserted object is deleted before its insertion was handled,
+                            // so the removal wins, just like `setRemoval` deletes the pending update.
+                            let removedIds = Set(context.metadataEntries(of: "CloudKitRemoval", withIds: updates.map(\.id)).compactMap { $0.value(forKey: "id") as? String })
 
-                        var discardedCount = 0
-                        var quarantined = 0
-                        for update in updates where round.records.count < maximum {
-                            if removedIds.contains(update.id) {
-                                logger.log("[Upload] Discarding update for `\(update.id)` as it is also removed")
-                                update.delete()
-                                discardedCount += 1
-                                continue
-                            }
-                            let lastChangeDate = update.lastChangeDate
-                            guard !isQuarantined(update.id, lastChangeDate: lastChangeDate) else {
-                                quarantined += 1
-                                continue
-                            }
-                            let isLocalInsert = update.isLocalInsert
-                            if let record = try record(for: update, overflowKeys: &round.overflowKeys) {
-                                round.records.append(record)
-                                round.lastChangeDates[record.recordID.recordName] = lastChangeDate
-                                if isLocalInsert {
-                                    round.localInserts.insert(record.recordID.recordName)
+                            var discardedCount = 0
+                            var quarantined = 0
+                            for update in updates where round.records.count < maximum {
+                                seen.append(update.objectID)
+                                guard names.insert(update.id).inserted else { continue }
+                                if removedIds.contains(update.id) {
+                                    logger.log("[Upload] Discarding update for `\(update.id)` as it is also removed")
+                                    update.delete()
+                                    discardedCount += 1
+                                    continue
                                 }
-                            } else {
-                                discardedCount += 1
+                                let lastChangeDate = update.lastChangeDate
+                                guard !isQuarantined(update.id, lastChangeDate: lastChangeDate) else {
+                                    quarantined += 1
+                                    continue
+                                }
+                                let isLocalInsert = update.isLocalInsert
+                                if let record = try record(for: update, overflowKeys: &round.overflowKeys) {
+                                    guard self.queuedReferencedObjectCount == queuedReferencedObjectCount else {
+                                        // It might reference an object that only got its record now, which is uploaded first, so
+                                        // the reference's target exists. The update stays for a later round.
+                                        CKAsset.removeTemporaryFiles(of: [record])
+                                        round.overflowKeys[record.recordID.recordName] = nil
+                                        deferred = true
+                                        continue
+                                    }
+                                    round.records.append(record)
+                                    round.lastChangeDates[record.recordID.recordName] = lastChangeDate
+                                    if isLocalInsert {
+                                        round.localInserts.insert(record.recordID.recordName)
+                                    }
+                                } else {
+                                    discardedCount += 1
+                                }
+                            }
+                            round.quarantinedCount = max(round.quarantinedCount, quarantined)
+                            // Discarded updates are deleted, so the next fetch finds others
+                            if updates.count < limit || discardedCount == 0 {
+                                break
                             }
                         }
-                        round.quarantinedCount = max(round.quarantinedCount, quarantined)
-                        // Discarded updates are deleted, so the next fetch finds others
-                        if updates.count < limit || discardedCount == 0 {
-                            break
+                        skippedCount += round.quarantinedCount
+                        if !round.records.isEmpty {
+                            return round
                         }
-                    }
-                    skippedCount += round.quarantinedCount
-                    if !round.records.isEmpty {
-                        return round
                     }
                 }
+                // Once more if every record was left for later, for the records of the objects they reference
+                guard deferred else { break }
+                deferred = false
             }
             return UploadRound(quarantinedCount: skippedCount)
         }
     }
+
+    /// How often the records of an upload round are selected, see `synchronizableUpdates(sharedDatabase:maximum:)`.
+    private static let maximumSelectionPasses = 10
 
     /// - Parameter overflowKeys: Gets the record keys of the record's overflow asset, if it sends them, see `SDSOverflow`.
     private func record(for update: CloudKitUpdate, overflowKeys: inout [String: Set<String>]) throws -> CKRecord? {
@@ -545,12 +581,25 @@ extension SDSSynchronizer {
         return SDSIdentity.merging(newRecord, into: serverRecord)
     }
     
-    private func synchronizableDeletes(sharedDatabase: Bool, maximum: Int) -> [CKRecord.ID] {
+    /// Up to `maximum` removals to upload, and how many are left out as CloudKit rejected them, see `SDSRecordQuarantine`.
+    private func synchronizableDeletes(sharedDatabase: Bool, maximum: Int) -> (ids: [CKRecord.ID], quarantinedCount: Int) {
         let defaultZoneID = self.defaultZoneID!
+        // Quarantined removals are fetched too, so as many more are fetched
+        let quarantinedCount = quarantinedRecordCount
         return context.performAndWait {
-            CloudKitRemoval.retrieve(sharedDatabase: sharedDatabase, maximum: maximum).map { removal in
-                removal.recordId(defaultZoneID: defaultZoneID)
+            var ids: [CKRecord.ID] = []
+            var names: Set<String> = []
+            var quarantined = 0
+            for removal in CloudKitRemoval.retrieve(sharedDatabase: sharedDatabase, maximum: maximum + quarantinedCount) {
+                guard !isQuarantined(removal.id, lastChangeDate: SDSRecordQuarantine.removalChangeDate) else {
+                    quarantined += 1
+                    continue
+                }
+                // E.g. two processes stored the same removal at once. CloudKit rejects deleting a record twice in an operation.
+                guard ids.count < maximum, names.insert(removal.id).inserted else { continue }
+                ids.append(removal.recordId(defaultZoneID: defaultZoneID))
             }
+            return (ids, quarantined)
         }
     }
 
@@ -663,6 +712,13 @@ extension SDSSynchronizer {
                         entity.delete()
                     }
                 }
+            }
+
+            // Saved right away, so what was uploaded isn't uploaded again if the app is terminated before the upload ends
+            do {
+                try context.save()
+            } catch {
+                logger.error("[Upload] Failed to save what was uploaded: \(error.localizedDescription)")
             }
             return progress
         }

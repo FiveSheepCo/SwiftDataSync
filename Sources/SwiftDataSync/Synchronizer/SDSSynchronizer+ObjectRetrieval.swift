@@ -11,7 +11,8 @@ extension SDSSynchronizer {
         CloudKitLocalEntity.entry(forLocalId: localId, in: context)?.id
     }
     
-    /// The record name the identity values of the object give it, `nil` if its entity has no identity.
+    /// The record name the identity values of the object give it, `nil` if its entity has no identity, or the object lacks
+    /// one of its values, see `SDSIdentity.identityRecordName(entityName:values:)`.
     /// Has to be called on the queue of the object's context.
     func identityRecordName(for object: NSManagedObject) -> String? {
         guard
@@ -19,7 +20,7 @@ extension SDSSynchronizer {
             let identity = configuration?.entities[entityName]?.identity,
             !identity.isEmpty
         else { return nil }
-        return SDSIdentity.recordName(entityName: entityName, values: SDSIdentity.values(of: object, keys: identity))
+        return SDSIdentity.identityRecordName(entityName: entityName, values: SDSIdentity.values(of: object, keys: identity))
     }
 
     /// The zone of a record whose root is shared by someone else, like `SDSSynchronizableContainer.sharedZoneId`.
@@ -228,6 +229,7 @@ extension SDSSynchronizer {
                 if let change {
                     self.logger.log("Queueing `\(change.entityName, privacy: .public)` without a record, as another record references it")
                     self.storeUpdates([change], backfilled: true)
+                    self.countQueuedReferencedObject()
                 }
                 return self.existingRecordId(forLocalId: objectId) ?? self.recordIdWithoutValues(forLocalId: objectId)
             }

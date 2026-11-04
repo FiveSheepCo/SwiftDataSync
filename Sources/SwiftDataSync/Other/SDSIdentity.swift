@@ -15,7 +15,23 @@ enum SDSIdentity {
             canonicalString(value).map { "\($0.utf8.count):\($0)" } ?? "-"
         }.joined(separator: ",")
         let digest = SHA256.hash(data: Data(text.utf8))
-        return entityName + "." + digest.map { String(format: "%02x", $0) }.joined()
+        // Without `String(format:)` for each byte, as downloads name every model of an entity at once
+        let hexDigits = Array("0123456789abcdef".utf8)
+        var hex: [UInt8] = []
+        hex.reserveCapacity(SHA256.byteCount * 2)
+        for byte in digest {
+            hex.append(hexDigits[Int(byte >> 4)])
+            hex.append(hexDigits[Int(byte & 0x0f)])
+        }
+        return entityName + "." + String(decoding: hex, as: UTF8.self)
+    }
+
+    /// The record name of a model with the identity values, `nil` if one of them has no value: models without all of their
+    /// identity values aren't identified by them, but get records of their own, like models without an identity, rather
+    /// than unrelated models sharing a record.
+    static func identityRecordName(entityName: String, values: [Any?]) -> String? {
+        guard values.allSatisfy({ canonicalString($0) != nil }) else { return nil }
+        return recordName(entityName: entityName, values: values)
     }
 
     /// The text of a value, the same for the value of a model and the one its record returns: CloudKit stores booleans as
@@ -24,7 +40,8 @@ enum SDSIdentity {
         switch value {
         case nil, is NSNull: nil
         case let string as String: string
-        case let date as Date: String(Int64((date.timeIntervalSince1970 * 1000).rounded()))
+        // Dates too far away for milliseconds as an integer can't be in records anyway
+        case let date as Date: Int64(exactly: (date.timeIntervalSince1970 * 1000).rounded()).map(String.init) ?? String(date.timeIntervalSince1970)
         case let number as NSNumber: number.stringValue
         case let url as URL: url.absoluteString
         case let uuid as UUID: uuid.uuidString
@@ -116,7 +133,7 @@ final class SDSIdentityIndex {
             let candidate,
             !candidate.isDeleted,
             !candidate.objectID.isTemporaryID,
-            SDSIdentity.recordName(entityName: entityName, values: SDSIdentity.values(of: candidate, keys: keys)) == recordName
+            SDSIdentity.identityRecordName(entityName: entityName, values: SDSIdentity.values(of: candidate, keys: keys)) == recordName
         else { return nil }
         return candidate
     }
@@ -159,8 +176,10 @@ final class SDSIdentityIndex {
 
         var index: [String: NSManagedObjectID] = [:]
         for row in try context.fetch(request) {
-            guard let id = row["objectID"] as? NSManagedObjectID else { continue }
-            let recordName = SDSIdentity.recordName(entityName: entityName, values: keys.map { row[$0] })
+            guard
+                let id = row["objectID"] as? NSManagedObjectID,
+                let recordName = SDSIdentity.identityRecordName(entityName: entityName, values: keys.map { row[$0] })
+            else { continue }
             if index[recordName] == nil {
                 index[recordName] = id
             }
@@ -175,7 +194,9 @@ extension CloudKitLocalEntity {
     /// (`identityRecordName`), or a random one if it has no identity or another object has that record already.
     ///
     /// With `renamingToIdentity`, e.g. because an identity value changed, an object whose record has another name than
-    /// its identity gives it is given that record, and its previous record id is returned to delete that record.
+    /// its identity gives it is given that record, and its previous record id is returned to delete that record. If another
+    /// object has that record, or the object lacks identity values, a record named after previous identity values is
+    /// replaced with a randomly named one, as another object can take those values.
     /// `isReserved` tells about record ids of objects that get their entities later, e.g. ones a running download inserted.
     /// Has to be called on `context`'s queue.
     static func recordId(
@@ -188,16 +209,21 @@ extension CloudKitLocalEntity {
         let isAvailable = { (id: String) in !isReserved(id) && entry(forId: id, in: context) == nil }
 
         if let entry = entry(forLocalId: localId, in: context) {
-            guard
-                renamingToIdentity,
-                let identityRecordName,
-                entry.id != identityRecordName,
-                isAvailable(identityRecordName)
-            else { return (entry.id, nil) }
+            guard renamingToIdentity, entry.id != identityRecordName else { return (entry.id, nil) }
 
+            let id: String
+            if let identityRecordName, isAvailable(identityRecordName) {
+                id = identityRecordName
+            } else if UUID(uuidString: entry.id) == nil {
+                // The record is named after identity values the object doesn't have anymore, which another object can take.
+                // It moves to a random name, like a model whose identity is taken, or that lacks identity values.
+                id = UUID().uuidString
+            } else {
+                return (entry.id, nil)
+            }
             let previousId = entry.id
-            entry.id = identityRecordName
-            return (identityRecordName, previousId)
+            entry.id = id
+            return (id, previousId)
         }
 
         // Another local model with the same identity keeps its own record, as two models can't share one
@@ -216,12 +242,16 @@ extension CloudKitLocalEntity {
         isNamedAfterIdentity: Bool,
         in context: NSManagedObjectContext
     ) -> (adopted: Bool, previousId: String?) {
+        // An entity whose object is gone (see `SDSSynchronizer.lookUp(for:)`) would keep the record from being found again
+        let stale = context.metadataEntries(of: "CloudKitLocalEntity", withIds: [recordName]).filter { ($0 as? CloudKitLocalEntity)?.localId != localId }
         guard let entry = entry(forLocalId: localId, in: context) else {
+            stale.forEach(context.delete)
             _ = CloudKitLocalEntity(id: recordName, localId: localId, context: context)
             return (true, nil)
         }
         guard isNamedAfterIdentity, entry.id != recordName else { return (entry.id == recordName, nil) }
 
+        stale.forEach(context.delete)
         let previousId = entry.id
         entry.id = recordName
         return (true, previousId)
