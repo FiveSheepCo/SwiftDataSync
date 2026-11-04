@@ -15,6 +15,46 @@ struct SDSInternalConfiguration {
         }.map(\.name).sorted()
     }
 
+    /// Why identities of the entities can't name their records, empty if they can. See `SDSConfiguration.Entity.sync`.
+    static func identityProblems(of entities: [String: Entity], descriptions: [String: NSEntityDescription]) -> [String] {
+        // The entities the parent keys point to, by entity name
+        var parents: [String: NSEntityDescription] = [:]
+        for (name, entity) in entities {
+            if let parentKey = entity.parentKey, let parent = descriptions[name]?.relationshipsByName[parentKey]?.destinationEntity {
+                parents[name] = parent
+            }
+        }
+        let sharableEntities = entities.filter(\.value.isSharable).compactMap { descriptions[$0.key] }
+
+        var problems: [String] = []
+        for (name, entity) in entities.sorted(by: { $0.key < $1.key }) where !entity.identity.isEmpty {
+            guard let description = descriptions[name] else { continue }
+
+            // Downloads match records to models by these values, so the records have to contain them, rather than assets
+            for key in entity.identity where description.attributesByName[key] == nil || !entity.syncedProperties.contains(key) || entity.assetProperties.contains(key) {
+                problems.append("`\(name).\(key)`: An identity has to consist of synchronized attributes that aren't asset properties.")
+            }
+
+            // The zones of different users' shares can have records of the same identity, which a model can't tell apart
+            var visited: Set<String> = []
+            var ancestor: NSEntityDescription? = description
+            while let current = ancestor, let currentName = current.name, visited.insert(currentName).inserted {
+                if sharableEntities.contains(where: { $0.isKindOf(entity: current) }) {
+                    problems.append("`\(name)`: Entities with an identity can't be sharable, or below a sharable entity.")
+                    break
+                }
+                ancestor = parents[currentName]
+            }
+
+            // Changing an identity value deletes the record, which would delete the records of its children with it, see
+            // `CKRecord.Reference.Action.deleteSelf`
+            if parents.values.contains(where: { description.isKindOf(entity: $0) }) {
+                problems.append("`\(name)`: Entities with an identity can't be the parent of other entities.")
+            }
+        }
+        return problems
+    }
+
     struct Entity {
         let syncedProperties: [String]
         let assetProperties: [String]

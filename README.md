@@ -192,9 +192,13 @@ For these entities:
 - When another device uploaded the same identity first, the upload saves the changed keys over its record: as with any
   record, the last upload of a key wins. Models that were saved before synchronizing started are the exception: the record's
   values win, see above.
-- Changing an identity value deletes the record of the old values, and uploads the model as a new record.
+- Changing an identity value deletes the record of the old values once the change is saved, and uploads the model as a new
+  record. Records that reference the model are uploaded again, so they reference the new record.
 - Two local models with the same identity values keep separate, randomly named records.
-- Models with an identity can't be sharable. Records that were uploaded before the identity was configured keep their names.
+- Identity values have to be stored in the record, so they can't be `assetProperties`.
+- Entities with an identity can't be sharable, below a sharable entity, or the parent of other entities: different users'
+  shares could have records of the same identity, and deleting a parent's record would delete its children's records.
+- Records that were uploaded before the identity was configured keep their names.
 
 ## Contributing
 

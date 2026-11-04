@@ -76,16 +76,18 @@ public struct SDSConfiguration: Sendable {
         
         /// Indicates synchronization with specified properties.
         ///
-        /// `identity` names synchronized attributes (not relationships) whose values identify a model on every device.
-        /// Without it, every model gets a random record name, so models that several devices create for the same thing
-        /// become duplicate records. With it:
+        /// `identity` names synchronized attributes (not relationships or `assetProperties`) whose values identify a model
+        /// on every device. Without it, every model gets a random record name, so models that several devices create for
+        /// the same thing become duplicate records. With it:
         /// - The record is named `<Entity>.<SHA-256 of the values>`, the same on every device.
         /// - A downloaded record whose name isn't known yet is matched to a local model with the same values, which is
         ///   updated instead of inserting another one.
         /// - Uploading a record that another device created already updates it with the changed keys.
-        /// - Changing an identity value deletes the record of the old values and uploads the model as a new record.
+        /// - Saving a changed identity value deletes the record of the old values and uploads the model as a new record.
+        ///   Records that reference the model are uploaded again, so they reference the new one.
         ///
-        /// Models with an identity can't be shared, as their records have to be in the private database.
+        /// Models with an identity can't be shared, be below a sharable entity, or be the parent of other models: their
+        /// records have to be in the private database, and deleting a parent's record would delete its children's records.
         case sync(PropertiesSync, assetProperties: [String] = [], parentKey: String? = nil, isSharable: Bool = false, identity: [String] = [])
     }
     

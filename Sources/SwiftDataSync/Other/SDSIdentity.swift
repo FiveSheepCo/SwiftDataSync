@@ -50,6 +50,8 @@ enum SDSIdentity {
     static func matchingObject(in context: NSManagedObjectContext, entityName: String, keys: [String], values: [Any?]) throws -> NSManagedObject? {
         let request = NSFetchRequest<NSManagedObject>(entityName: entityName)
         request.sortDescriptors = []
+        // Records of subentities have their own record type
+        request.includesSubentities = false
         request.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: zip(keys, values).map { key, value in
             switch value {
             case nil, is NSNull:
@@ -150,6 +152,8 @@ final class SDSIdentityIndex {
         let request = NSFetchRequest<NSDictionary>(entityName: entityName)
         request.resultType = .dictionaryResultType
         request.propertiesToFetch = keys + [objectID]
+        // Records of subentities have their own record type, see `SDSIdentity.matchingObject`
+        request.includesSubentities = false
         // Only saved objects
         request.includesPendingChanges = false
 

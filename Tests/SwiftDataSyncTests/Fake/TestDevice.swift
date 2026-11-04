@@ -49,7 +49,7 @@ final class ScenarioNote {
     }
 }
 
-/// A model that can be shared, with documents below it.
+/// A model with documents below it. It isn't sharable, as documents have an identity.
 @Model
 final class ScenarioWorkspace {
     var title: String = ""
@@ -107,7 +107,7 @@ let scenarioConfiguration = SDSConfiguration(swiftDataEntities: [
     .init(entity: ScenarioSubscription.self, description: .sync(.without([]), identity: ["feedLink"])),
     .init(entity: ScenarioEpisode.self, description: .sync(.without([]), identity: ["feedLink", "guid"])),
     .init(entity: ScenarioNote.self, description: .sync(.without([]))),
-    .init(entity: ScenarioWorkspace.self, description: .sync(.without([]), isSharable: true)),
+    .init(entity: ScenarioWorkspace.self, description: .sync(.without([]))),
     .init(entity: ScenarioDocument.self, description: .sync(.without([]), parentKey: "workspace", identity: ["title"]))
 ])
 

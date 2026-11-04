@@ -70,6 +70,12 @@ extension SDSSynchronizer {
 
             var stored: [(change: SDSObjectChange, id: String, previousId: String?, zoneId: CKRecordZone.ID?)] = []
             for change in batch {
+                // Before the object gets a record, which would keep backfill from uploading it, see `backfill(onlyUntracked:)`
+                let zoneId = zone(change.sharableRootLocalId)
+                if onlyPrivate && zoneId != nil {
+                    continue
+                }
+
                 let id: String
                 var previousId: String?
                 if change.identityChanged {
@@ -82,6 +88,13 @@ extension SDSSynchronizer {
                         in: context
                     )
                     entries[change.localId] = CloudKitLocalEntity.entry(forLocalId: change.localId, in: context)
+                    if previousId != nil && removedIds.contains(id) {
+                        // E.g. the identity changed back before its move was uploaded. The record is kept, rather than deleted,
+                        // as its removal would win over the upload.
+                        logger.log("Keeping `\(id)`, as the model moved back to it")
+                        context.metadataEntries(of: "CloudKitRemoval", withIds: [id]).forEach(context.delete)
+                        removedIds.remove(id)
+                    }
                 } else if let entry = entries[change.localId] {
                     id = entry.id
                 } else if
@@ -105,13 +118,16 @@ extension SDSSynchronizer {
                     }
                     id = identityName ?? UUID().uuidString
                     entries[change.localId] = CloudKitLocalEntity(id: id, localId: change.localId, context: context)
+                    if removedIds.contains(id) {
+                        // The record of a model that moved to another identity, which wasn't deleted yet. It's kept for
+                        // this model, as its removal would win over the upload.
+                        logger.log("Giving `\(id)` to a model with the identity another model moved away from")
+                        context.metadataEntries(of: "CloudKitRemoval", withIds: [id]).forEach(context.delete)
+                        removedIds.remove(id)
+                    }
                 }
                 takenIds.insert(id)
 
-                let zoneId = zone(change.sharableRootLocalId)
-                if onlyPrivate && zoneId != nil {
-                    continue
-                }
                 stored.append((change, id, previousId, zoneId))
             }
 

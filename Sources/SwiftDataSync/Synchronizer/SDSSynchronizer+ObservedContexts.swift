@@ -66,7 +66,7 @@ extension SDSSynchronizer {
             .filter { !wasDeletedBySynchronizer($0.objectID) }
             .compactMap(onlyIfSyncronizable)
         
-        setUpdates(for: changes(of: updatedObjects, inserted: false))
+        setUpdates(for: changes(of: updatedObjects, inserted: false, beforeSave: true))
         handleDeletedObjects(deletedObjects)
     }
     
@@ -105,15 +105,20 @@ extension SDSSynchronizer {
         // Changes that were saved are stored again, so their saved values are uploaded too, see `contextWillSave`
         let updatedObjects = (userInfo[NSUpdatedObjectsKey] as? NSSet ?? []).compactMap { $0 as? NSManagedObject }
         let savedChanges = takeKeysBeingSaved(by: savingContext)
-        let updatedChanges = updatedObjects.compactMap { object -> SDSObjectChange? in
-            guard let keys = savedChanges[object.objectID], let container = container(for: object) else { return nil }
-            return identifying(SDSObjectChange(
+        var updatedChanges: [SDSObjectChange] = []
+        for object in updatedObjects {
+            guard let keys = savedChanges[object.objectID], let container = container(for: object) else { continue }
+            let change = identifying(SDSObjectChange(
                 localId: object.objectID.uriRepresentation().absoluteString,
                 sharableRootLocalId: container.sharableRootLocalId,
                 entityName: object.entity.name!,
                 changedKeys: Array(keys),
                 allKeys: container.syncKeys + [container.parentKey].compactMap { $0 }
             ), of: container, inserted: false)
+            updatedChanges.append(change)
+            if change.identityChanged {
+                updatedChanges += referencingChanges(to: object)
+            }
         }
 
         let insertedObjects = (userInfo[NSInsertedObjectsKey] as? NSSet ?? []).compactMap(onlyIfSyncronizable)
@@ -213,7 +218,8 @@ extension SDSSynchronizer {
     }
     
     /// Has to be called on the queue of the objects' context.
-    func changes(of objects: [SDSSynchronizableContainer], inserted: Bool) -> [SDSObjectChange] {
+    /// - Parameter beforeSave: Whether the changes aren't saved yet, so they can still be discarded, see `contextChanged`.
+    func changes(of objects: [SDSSynchronizableContainer], inserted: Bool, beforeSave: Bool = false) -> [SDSObjectChange] {
         objects.compactMap { updated in
             let parentKey = updated.parentKey
             let syncKeys = updated.syncKeys
@@ -248,22 +254,72 @@ extension SDSSynchronizer {
                 entityName: entityName,
                 changedKeys: keysToSync,
                 allKeys: allSyncKeys
-            ), of: updated, inserted: inserted)
+            ), of: updated, inserted: inserted, beforeSave: beforeSave)
         }
     }
 
     /// Adds what the identity of the object's entity, if it has one, needs to the change. Has to be called on the queue of the object's context.
-    private func identifying(_ change: SDSObjectChange, of container: SDSSynchronizableContainer, inserted: Bool) -> SDSObjectChange {
+    /// - Parameter beforeSave: Whether the change isn't saved yet. It can still be discarded, e.g. by a rollback, so the object
+    ///   keeps the record of its saved identity values until it's saved, see `contextSaved`.
+    private func identifying(_ change: SDSObjectChange, of container: SDSSynchronizableContainer, inserted: Bool, beforeSave: Bool = false) -> SDSObjectChange {
         guard
             let identity = configuration?.entities[change.entityName]?.identity,
             !identity.isEmpty
         else { return change }
-        
+
         var change = change
-        change.identityRecordName = identityRecordName(for: container.object)
-        change.identityChanged = !inserted && identity.contains(where: change.changedKeys.contains)
+        if beforeSave {
+            let saved = container.object.committedValues(forKeys: identity)
+            change.identityRecordName = SDSIdentity.recordName(entityName: change.entityName, values: identity.map { saved[$0] })
+        } else {
+            change.identityRecordName = identityRecordName(for: container.object)
+            change.identityChanged = !inserted && identity.contains(where: change.changedKeys.contains)
+        }
         change.allKeys = container.syncKeys + [container.parentKey].compactMap { $0 }
         return change
+    }
+
+    /// Changes of the objects that reference the object through synchronized relationships, so their records reference its
+    /// record again once it moved to another record: as its identity changed, or it was given the record of its identity,
+    /// see `CloudKitLocalEntity.adopt`. Its previous record is deleted. Has to be called on the queue of the object's context.
+    func referencingChanges(to object: NSManagedObject) -> [SDSObjectChange] {
+        guard
+            let context = object.managedObjectContext,
+            let model = context.persistentStoreCoordinator?.managedObjectModel,
+            let entities = configuration?.entities
+        else { return [] }
+
+        var keysByObject: [NSManagedObject: Set<String>] = [:]
+        for (entityName, entity) in entities {
+            guard let description = model.entitiesByName[entityName] else { continue }
+            for key in entity.syncedProperties + [entity.parentKey].compactMap({ $0 }) {
+                guard
+                    let relationship = description.relationshipsByName[key],
+                    let destination = relationship.destinationEntity,
+                    object.entity.isKindOf(entity: destination)
+                else { continue }
+
+                let request = NSFetchRequest<NSManagedObject>(entityName: entityName)
+                // Subentities are fetched with their own configurations
+                request.includesSubentities = false
+                request.predicate = NSPredicate(format: relationship.isToMany ? "ANY %K == %@" : "%K == %@", key, object)
+                // Objects that aren't saved yet are uploaded with every key once they are
+                for referencing in (try? context.fetch(request)) ?? [] where referencing != object && !referencing.objectID.isTemporaryID && !referencing.isDeleted {
+                    keysByObject[referencing, default: []].insert(key)
+                }
+            }
+        }
+
+        return keysByObject.compactMap { referencing, keys in
+            guard let container = container(for: referencing) else { return nil }
+            return identifying(SDSObjectChange(
+                localId: referencing.objectID.uriRepresentation().absoluteString,
+                sharableRootLocalId: container.sharableRootLocalId,
+                entityName: referencing.entity.name!,
+                changedKeys: Array(keys),
+                allKeys: container.syncKeys + [container.parentKey].compactMap { $0 }
+            ), of: container, inserted: false)
+        }
     }
 
     /// Stores the changes at once, so an upload never selects some of them without the others.

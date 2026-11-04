@@ -188,6 +188,8 @@ extension SDSSynchronizer {
         }
         
         let isRequested = await viewModel.endSavingShare(restoring: previousState)
+        // `start()` and `stop()` only change the state they find, which this replaced meanwhile
+        await updateStoppedState()
         if isExclusive {
             endActivity()
         }
