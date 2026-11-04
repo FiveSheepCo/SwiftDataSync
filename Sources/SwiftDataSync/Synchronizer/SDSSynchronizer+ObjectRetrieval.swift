@@ -141,6 +141,13 @@ extension SDSSynchronizer {
         {
             preliminaryUpdateHandler(match, movedKeys)
             return match
+        } else if hasPendingDeletions, self.context.performAndWaitUnchecked({
+            self.context.metadataEntries(of: "CloudKitLocalEntity", withIds: [id]).contains { isDeletionPending(localId: ($0 as? CloudKitLocalEntity)?.localId ?? "") }
+        }) {
+            // Its object is gone, as it was deleted, and the removal is about to be stored, see `isDeletionPending(localId:)`
+            logger.log("[Download] Skipping `\(id)`, which was deleted locally")
+            preliminaryUpdateHandler(nil, [])
+            return nil
         } else {
             let object = NSEntityDescription.insertNewObject(forEntityName: entityName, into: context)
             preliminaryUpdateHandler(container(id: { id }, object: object), [])
