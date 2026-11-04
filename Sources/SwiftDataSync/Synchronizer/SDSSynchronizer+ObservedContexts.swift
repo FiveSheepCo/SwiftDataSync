@@ -19,8 +19,8 @@ struct SDSObjectChange: Sendable {
     var allKeys: [String] = []
 }
 
-/// A deletion of a synchronizable object, read while the object can still be read. It's stored once it's saved, as it can
-/// still be discarded before, e.g. by a rollback, see `contextSaved`.
+/// A deletion of a synchronizable object, read while the object can still be read, when its save starts. It's stored once
+/// it's saved, as it can still be discarded before, e.g. by a rollback, see `contextSaved`.
 struct SDSObjectDeletion: Sendable {
     /// The URI of the object's ID.
     let localId: String
@@ -64,7 +64,7 @@ extension SDSSynchronizer {
     @objc func contextChanged(_ notification:Notification) {
         guard let userInfo = userInfo(from: notification), !isForgetting else { return }
         
-        // Only changes and deleted objects are handled here so that the update works
+        // Only changes are handled here so that the update works. Deletions are stored once they're saved, see `contextWillSave`.
         // Objects that weren't saved yet are reported too. They don't have a record, and must not get a record id now,
         // as saving them gives them another one. They are uploaded with all keys once they are saved.
         let savedObjects = { (key: String) in
@@ -72,20 +72,7 @@ extension SDSSynchronizer {
         }
         // An object that was inserted, but has a permanent ID already, isn't saved yet either
         let updatedObjects = savedObjects(NSUpdatedObjectsKey).filter { !$0.isInserted }.compactMap(onlyIfSyncronizable)
-        let deletedObjects = savedObjects(NSDeletedObjectsKey)
-            // Deletions merged from the synchronizer's own saves are reported here too, but must not be uploaded
-            .filter { !wasDeletedBySynchronizer($0.objectID) }
-            .compactMap(onlyIfSyncronizable)
-        
         setUpdates(for: changes(of: updatedObjects, inserted: false, beforeSave: true))
-        // Read now, as the objects can't be read anymore once the deletions are saved, see `contextSaved`
-        rememberUnsavedDeletions(deletedObjects.map { deleted in
-            (deleted.object.objectID, SDSObjectDeletion(
-                localId: deleted.object.objectID.uriRepresentation().absoluteString,
-                sharableRootLocalId: deleted.sharableRootLocalId,
-                isSharable: deleted is SDSSharableContainer
-            ))
-        })
     }
     
     /// Changes are stored when they are made, but uploads read the values from the store, so ones that were uploaded
@@ -110,6 +97,21 @@ extension SDSSynchronizer {
             }
         }
         rememberKeysBeingSaved(keys, by: context)
+
+        // Deletions are read now, as their objects can't be read anymore once they're saved, see `contextSaved`. Only the
+        // ones being saved, rather than all that are made, which can still be discarded, e.g. by a rollback.
+        // Pending changes are processed first, so the deletions that delete rules cascade to are included.
+        context.processPendingChanges()
+        var deletions: [NSManagedObjectID: SDSObjectDeletion] = [:]
+        for object in context.deletedObjects where !object.objectID.isTemporaryID && !wasDeletedBySynchronizer(object.objectID) {
+            guard let deleted = onlyIfSyncronizable(object: object) else { continue }
+            deletions[object.objectID] = SDSObjectDeletion(
+                localId: object.objectID.uriRepresentation().absoluteString,
+                sharableRootLocalId: deleted.sharableRootLocalId,
+                isSharable: deleted is SDSSharableContainer
+            )
+        }
+        rememberDeletionsBeingSaved(deletions, by: context)
     }
     
     @objc func contextSaved(_ notification:Notification) {
@@ -125,11 +127,11 @@ extension SDSSynchronizer {
         let deletedObjectIDs = (userInfo[NSDeletedObjectsKey] as? NSSet ?? []).compactMap { ($0 as? NSManagedObject)?.objectID }.filter { objectID in
             configuration?.entities[objectID.entity.name ?? ""] != nil && !wasDeletedBySynchronizer(objectID)
         }
-        let readDeletions = takeUnsavedDeletions(of: deletedObjectIDs)
+        let readDeletions = takeDeletionsBeingSaved(by: savingContext)
         // See `resetSyncData(beforeForgetting:)`
         guard !isForgetting else { return }
         let deletions = deletedObjectIDs.filter { !$0.isTemporaryID }.map { objectID in
-            // E.g. the context didn't report the deletion first. Its parent can't be read anymore, so it's sent to the private database.
+            // E.g. one a validation deleted. Its parent can't be read anymore, so it's sent to the private database.
             readDeletions[objectID] ?? SDSObjectDeletion(
                 localId: objectID.uriRepresentation().absoluteString,
                 sharableRootLocalId: nil,

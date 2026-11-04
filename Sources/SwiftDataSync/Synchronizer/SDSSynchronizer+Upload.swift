@@ -63,6 +63,9 @@ extension SDSSynchronizer {
 
     /// How many rounds in a row may only upload records that changed again since, before the rest is left to a later synchronization.
     private static let maximumRoundsOfChangedRecords = 3
+    /// How often in a row the records can be selected again, as every record was left for later, before the rest is left to a
+    /// later synchronization, see `UploadRound.hasDeferredRecords`.
+    private static let maximumDeferredSelections = 10
 
     /// What an operation's records and removals came to.
     private struct UploadOutcome {
@@ -94,12 +97,14 @@ extension SDSSynchronizer {
     /// Returns how many records are left for later as CloudKit rejected them, see `SDSRecordQuarantine`.
     /// - Parameter roundsOfChangedRecords: How many rounds in a row only uploaded records that changed again since.
     /// - Parameter didRetryConflicts: Whether records that existed already were uploaded again in this round already.
+    /// - Parameter deferredSelections: How often in a row every selected record was left for later, see `UploadRound.hasDeferredRecords`.
     private func _upload(
         sharedDatabase: Bool,
         checkingRecordsExist: Bool,
         maximumRecords: Int = CKModifyRecordsOperation.maximumRecords,
         roundsOfChangedRecords: Int = 0,
-        didRetryConflicts: Bool = false
+        didRetryConflicts: Bool = false,
+        deferredSelections: Int = 0
     ) async throws -> Int {
         // Another process could have taken over while this one was suspended
         guard syncLease.renew() else { throw SDSSyncLease.UnavailableError() }
@@ -131,6 +136,15 @@ extension SDSSynchronizer {
         let removalChangeDates = Dictionary(deletes.map { ($0.recordName, SDSRecordQuarantine.removalChangeDate) }, uniquingKeysWith: { date, _ in date })
 
         guard records.count + deletes.count > 0 else {
+            if round.hasDeferredRecords {
+                // The objects they reference were queued meanwhile, which a new selection uploads first. Not indefinitely, e.g.
+                // while another process keeps queuing objects.
+                guard deferredSelections + 1 < Self.maximumDeferredSelections else {
+                    logger.log("Records keep waiting for the records they reference, uploading them later")
+                    throw ChangesStillPendingError()
+                }
+                return try await _upload(sharedDatabase: sharedDatabase, checkingRecordsExist: checkingRecordsExist, maximumRecords: maximumRecords, deferredSelections: deferredSelections + 1)
+            }
             self.lastCompletedUpload = Date()
             logger.log("No remaining changed records")
             return round.quarantinedCount
@@ -353,6 +367,9 @@ extension SDSSynchronizer {
         var localInserts: Set<String> = []
         /// The record keys in the overflow assets of records that send their split, by name, see `SDSOverflow`.
         var overflowKeys: [String: Set<String>] = [:]
+        /// Whether records are left for a later round, as the objects they reference only got records while they were
+        /// selected, see `synchronizableUpdates(sharedDatabase:maximum:)`.
+        var hasDeferredRecords = false
     }
 
     /// Up to `maximum` records to upload.
@@ -374,14 +391,16 @@ extension SDSSynchronizer {
             + typesByDepth.keys.filter { $0 > 0 }.sorted().map { NSPredicate(format: "recordType IN %@", typesByDepth[$0] ?? []) }
         let zonePredicate = NSPredicate(format: sharedDatabase ? "sharedZone != nil" : "sharedZone == nil")
         let backfilledPredicate = NSPredicate(format: "rawChangedKeys CONTAINS %@", CloudKitUpdate.backfillMarker)
+        let maximumSelectionPasses = timing.maximumSelectionPasses
 
         return try context.performAndWaitUnchecked {
             var skippedCount = 0
             // Whether records were left for a later round, as the objects they reference only got records now
             var deferred = false
             // Each pass selects the records the previous one queued first, e.g. one for each level of a chain of references
-            for _ in 0..<Self.maximumSelectionPasses {
+            for _ in 0..<maximumSelectionPasses {
                 skippedCount = 0
+                deferred = false
                 // Records built once an object was queued in this pass might reference it, so they wait too
                 let queuedReferencedObjectCount = self.queuedReferencedObjectCount
                 // A record's references are uploaded before it, also if only one of them has backfilled values
@@ -458,14 +477,10 @@ extension SDSSynchronizer {
                 }
                 // Once more if every record was left for later, for the records of the objects they reference
                 guard deferred else { break }
-                deferred = false
             }
-            return UploadRound(quarantinedCount: skippedCount)
+            return UploadRound(quarantinedCount: skippedCount, hasDeferredRecords: deferred)
         }
     }
-
-    /// How often the records of an upload round are selected, see `synchronizableUpdates(sharedDatabase:maximum:)`.
-    private static let maximumSelectionPasses = 10
 
     /// - Parameter overflowKeys: Gets the record keys of the record's overflow asset, if it sends them, see `SDSOverflow`.
     private func record(for update: CloudKitUpdate, overflowKeys: inout [String: Set<String>]) throws -> CKRecord? {

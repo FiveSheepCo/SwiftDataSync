@@ -230,15 +230,22 @@ extension SDSSynchronizer {
     /// Objects in zones of other users' shares are left alone. The objects are read in batches.
     /// - Parameter keysByEntity: The keys to upload by entity name, `nil` for every synchronized key.
     /// - Parameter skippingRecordNames: Records whose objects are left out, e.g. as the catch-up couldn't store them.
-    func uploadLocalObjects(keysByEntity: [String: [String]?], skippingRecordNames: Set<String> = []) throws {
+    /// - Parameter onlyRecordNames: The records whose objects are uploaded, rather than every object's, e.g. the ones an
+    ///   earlier catch-up couldn't store.
+    func uploadLocalObjects(keysByEntity: [String: [String]?], skippingRecordNames: Set<String> = [], onlyRecordNames: Set<String>? = nil) throws {
         guard let observedUpdateContext else { return }
         let context = self.context
-        let skippedLocalIds: Set<String> = skippingRecordNames.isEmpty ? [] : context.performAndWait {
-            Set(context.metadataEntries(of: "CloudKitLocalEntity", withIds: Array(skippingRecordNames)).compactMap { ($0 as? CloudKitLocalEntity)?.localId })
+        let localIds = { (recordNames: Set<String>) -> Set<String> in
+            recordNames.isEmpty ? [] : context.performAndWait {
+                Set(context.metadataEntries(of: "CloudKitLocalEntity", withIds: Array(recordNames)).compactMap { ($0 as? CloudKitLocalEntity)?.localId })
+            }
         }
+        let skippedLocalIds = localIds(skippingRecordNames)
         if !skippedLocalIds.isEmpty {
             logger.log("Not uploading \(skippedLocalIds.count) local objects whose records couldn't be caught up on")
         }
+        let onlyLocalIds = onlyRecordNames.map(localIds)
+        if onlyLocalIds?.isEmpty == true { return }
 
         var count = 0
         for (entityName, keys) in keysByEntity.sorted(by: { $0.key < $1.key }) {
@@ -246,7 +253,9 @@ extension SDSSynchronizer {
                 let request = NSFetchRequest<NSManagedObjectID>(entityName: entityName)
                 request.resultType = .managedObjectIDResultType
                 request.includesSubentities = false
-                return try observedUpdateContext.fetch(request)
+                let objectIDs = try observedUpdateContext.fetch(request)
+                guard let onlyLocalIds else { return objectIDs }
+                return objectIDs.filter { onlyLocalIds.contains($0.uriRepresentation().absoluteString) }
             }
             for start in stride(from: 0, to: objectIDs.count, by: Self.backfillBatchSize) {
                 let batch = Array(objectIDs[start ..< min(start + Self.backfillBatchSize, objectIDs.count)])

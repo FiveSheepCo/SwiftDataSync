@@ -127,8 +127,9 @@ public final class SDSSynchronizer: Sendable {
         var startedSynchronizationCount = 0
         /// Counts the objects without records that were queued as a record references them, see `container(for:)`.
         var queuedReferencedObjectCount = 0
-        /// Deletions that weren't saved yet, by object, see `contextChanged`.
-        var unsavedDeletions: [NSManagedObjectID: SDSObjectDeletion] = [:]
+        /// The deletions a context is saving to the store, by object. Read when the save starts, and taken when it's done,
+        /// like `keysBeingSaved`.
+        var deletionsBeingSaved: [ObjectIdentifier: [NSManagedObjectID: SDSObjectDeletion]] = [:]
         /// Records a catch-up couldn't store, and whether it's tried again for them, see `download(refreshingSharedZones:)`.
         var recordsSkippedWhileCatchingUp: [String: Bool] = [:]
     }
@@ -184,6 +185,8 @@ public final class SDSSynchronizer: Sendable {
         var isRecoveringVanishedObjects = false
         /// What the save of a download's page changes, until it's done, see `repairInterruptedPageSave()`.
         var interruptedPageSave: PageSave?
+        /// How often a catch-up couldn't store every record, see `maximumCatchUpAttempts`.
+        var catchUpAttempts: Int?
         
         /// The local entities a page creates for the objects it inserts, by the URIs of the objects, and the records it deletes.
         struct PageSave: Codable, Sendable, Equatable {
@@ -290,26 +293,14 @@ public final class SDSSynchronizer: Sendable {
         }
     }
 
-    /// Remembers deletions until they're saved, see `contextChanged`. A deletion that's discarded isn't saved, and stays here.
-    func rememberUnsavedDeletions(_ deletions: [(NSManagedObjectID, SDSObjectDeletion)]) {
-        guard !deletions.isEmpty else { return }
-        mutableState.withLock { state in
-            for (objectID, deletion) in deletions {
-                state.unsavedDeletions[objectID] = deletion
-            }
-        }
+    /// Remembers the deletions a context is about to save to the store, see `contextWillSave`.
+    func rememberDeletionsBeingSaved(_ deletions: [NSManagedObjectID: SDSObjectDeletion], by context: NSManagedObjectContext) {
+        mutableState.withLock { $0.deletionsBeingSaved[ObjectIdentifier(context)] = deletions.isEmpty ? nil : deletions }
     }
 
-    /// The deletions of the objects that were remembered before they were saved, see `contextSaved`.
-    func takeUnsavedDeletions(of objectIDs: [NSManagedObjectID]) -> [NSManagedObjectID: SDSObjectDeletion] {
-        guard !objectIDs.isEmpty else { return [:] }
-        return mutableState.withLock { state in
-            var deletions: [NSManagedObjectID: SDSObjectDeletion] = [:]
-            for objectID in objectIDs {
-                deletions[objectID] = state.unsavedDeletions.removeValue(forKey: objectID)
-            }
-            return deletions
-        }
+    /// Returns and forgets the deletions a context saved to the store.
+    func takeDeletionsBeingSaved(by context: NSManagedObjectContext) -> [NSManagedObjectID: SDSObjectDeletion] {
+        mutableState.withLock { $0.deletionsBeingSaved.removeValue(forKey: ObjectIdentifier(context)) ?? [:] }
     }
     
     /// Remembers that the current account's private database was downloaded completely, see `hasDownloadedOnce`.
@@ -592,6 +583,8 @@ public final class SDSSynchronizer: Sendable {
         var routineRetryInterval: TimeInterval? = nil
         /// How long uploads pause once the user's iCloud storage is full, see `QuotaExceededError`.
         var quotaExceededRetryInterval: TimeInterval = 30 * 60
+        /// How often the records of an upload round are selected, see `synchronizableUpdates(sharedDatabase:maximum:)`.
+        var maximumSelectionPasses = 10
     }
     let timing: Timing
 
@@ -880,7 +873,8 @@ public final class SDSSynchronizer: Sendable {
     /// matched with their records by their values first, as after objects vanished (see `SDSContentIndex`), so they aren't
     /// duplicated. Local copies of other users' shares are removed, and downloaded again.
     ///
-    /// Throws if the data couldn't be forgotten, which then stays as it is, apart from the changes of `beforeForgetting`.
+    /// Throws if the data couldn't be forgotten, which then stays as it is, apart from the changes of `beforeForgetting`, and
+    /// local copies of other users' shares that were removed already, which are downloaded again once a reset succeeds.
     /// Synchronizing stays stopped then too, until `start()`.
     /// - Parameter beforeForgetting: Runs once no synchronization runs anymore, before the data is forgotten. Its changes
     ///   aren't recorded, so they're never uploaded, e.g. an app can empty the observed store there, and start again to
@@ -909,8 +903,10 @@ public final class SDSSynchronizer: Sendable {
         defer { mutableState.withLock { $0.isForgetting = false } }
         await beforeForgetting()
 
-        // Found while their shares are known, see below
-        let otherUsersSharedRoots = otherUsersSharedRoots()
+        // Otherwise they'd be uploaded to the user's own zone, as nothing tells they belong to someone else's once the data is
+        // forgotten. They're removed first, while their shares are known, so nothing is forgotten if one can't be removed.
+        // The download of the shared database brings them back.
+        try removeLocalCopiesOfOtherUsersShares()
 
         // Written first, so objects without an identity aren't uploaded as duplicates if the app is terminated before the
         // file state is replaced
@@ -954,16 +950,6 @@ public final class SDSSynchronizer: Sendable {
             state.serverRecordsOfConflicts = [:]
             state.quarantine = SDSRecordQuarantine()
             state.lastRecordFailure = nil
-        }
-
-        // Otherwise they'd be uploaded to the user's own zone, as nothing tells they belong to someone else's anymore. The
-        // download of the shared database brings them back.
-        for root in otherUsersSharedRoots {
-            do {
-                try removeLocalCopy(of: root)
-            } catch {
-                logger.error("Failed to remove the local copy of a share of another user: \(error.localizedDescription)")
-            }
         }
     }
 
@@ -1165,7 +1151,14 @@ public final class SDSSynchronizer: Sendable {
         let newKeys: Set<String>
         /// After a failure, the catch-up waits until then, as it downloads every record.
         var retryDate: Date?
+        /// The records the last try couldn't store, whose objects' values the next try uploads once it stores them, rather
+        /// than every object's again. `nil` before the first try of this process.
+        var recordsLeft: Set<String>?
     }
+
+    /// How often catching up is tried, if records couldn't be downloaded, before it's done without them. Their local values
+    /// aren't uploaded then, and a later download can clear them, if their records still lack the keys.
+    static let maximumCatchUpAttempts = 3
     
     /// Downloads skip models and keys this version of the app doesn't synchronize, e.g. ones a newer version added, while their
     /// change tokens move on. Once more is synchronized, they are caught up on, see `download(refreshingSharedZones:)`.
@@ -1214,10 +1207,27 @@ public final class SDSSynchronizer: Sendable {
     func finishCatchUp(_ catchUp: CatchUp) {
         storeSynchronizedKeys(catchUp.keys)
         mutableState.withLock { $0.catchUp = nil }
+        updateFileState { $0.catchUpAttempts = nil }
     }
     
-    func postponeCatchUp(until date: Date) {
-        mutableState.withLock { $0.catchUp?.retryDate = date }
+    /// - Parameter recordsLeft: See `CatchUp.recordsLeft`, `nil` to leave it as it is.
+    func postponeCatchUp(until date: Date, recordsLeft: Set<String>? = nil) {
+        mutableState.withLock { state in
+            state.catchUp?.retryDate = date
+            if let recordsLeft {
+                state.catchUp?.recordsLeft = recordsLeft
+            }
+        }
+    }
+
+    /// Counts a catch-up that couldn't store every record, and returns how often that happened, also in earlier processes.
+    func countIncompleteCatchUp() -> Int {
+        var attempts = 0
+        updateFileState { state in
+            attempts = (state.catchUpAttempts ?? 0) + 1
+            state.catchUpAttempts = attempts
+        }
+        return attempts
     }
     
     /// A record's changes that weren't uploaded yet: the keys that changed locally, the ones with backfilled values (see
