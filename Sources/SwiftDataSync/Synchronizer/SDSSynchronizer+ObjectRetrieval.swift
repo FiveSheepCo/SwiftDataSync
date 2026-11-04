@@ -141,10 +141,13 @@ extension SDSSynchronizer {
         {
             preliminaryUpdateHandler(match, movedKeys)
             return match
-        } else if hasPendingDeletions, self.context.performAndWaitUnchecked({
+        } else if self.context.performAndWaitUnchecked({
+            // On `context`'s queue, where removals are stored, so a deletion is either pending or stored
             self.context.metadataEntries(of: "CloudKitLocalEntity", withIds: [id]).contains { isDeletionPending(localId: ($0 as? CloudKitLocalEntity)?.localId ?? "") }
+                || !self.context.metadataEntries(of: "CloudKitRemoval", withIds: [id]).isEmpty
         }) {
-            // Its object is gone, as it was deleted, and the removal is about to be stored, see `isDeletionPending(localId:)`
+            // Its object is gone, as it was deleted, and the removal is about to be stored, or was since the download checked,
+            // see `isDeletionPending(localId:)`
             logger.log("[Download] Skipping `\(id)`, which was deleted locally")
             preliminaryUpdateHandler(nil, [])
             return nil

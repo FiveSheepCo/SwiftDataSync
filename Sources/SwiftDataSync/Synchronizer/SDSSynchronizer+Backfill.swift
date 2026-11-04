@@ -165,9 +165,11 @@ extension SDSSynchronizer {
             let vanished = Array(vanished)
             for start in stride(from: 0, to: vanished.count, by: Self.backfillBatchSize) {
                 let batch = Array(vanished[start ..< min(start + Self.backfillBatchSize, vanished.count)])
-                let entries = CloudKitLocalEntity.entries(forLocalIds: batch, in: context).values
-                    // Their deletions are uploaded next, after which their entities are removed
-                    .filter { !removedIds.contains($0.id) }
+                // Their deletions are uploaded next, after which their entities are removed. Read now, after the pending
+                // deletions were left out above, so one that was stored meanwhile is seen, see `isDeletionPending(localId:)`.
+                let allEntries = CloudKitLocalEntity.entries(forLocalIds: batch, in: context).values
+                let removed = Set(context.metadataEntries(of: "CloudKitRemoval", withIds: allEntries.map(\.id)).compactMap { $0.value(forKey: "id") as? String })
+                let entries = allEntries.filter { !removedIds.contains($0.id) && !removed.contains($0.id) }
                 // Their pending changes can't be uploaded without the objects
                 context.metadataEntries(of: "CloudKitUpdate", withIds: entries.map(\.id)).forEach(context.delete)
                 entries.forEach(context.delete)

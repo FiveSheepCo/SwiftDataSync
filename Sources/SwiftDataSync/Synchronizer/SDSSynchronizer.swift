@@ -1306,8 +1306,8 @@ public final class SDSSynchronizer: Sendable {
     /// `CloudKitUpdate.backfilledKeys`), and whether it was deleted locally.
     func pendingLocalChange(of id: String) -> PendingLocalChange {
         let context = self.context
-        let hasPendingDeletions = self.hasPendingDeletions
-        let (pending, localId) = context.performAndWait { () -> (PendingLocalChange, String?) in
+        // On `context`'s queue, where removals are stored, so a deletion is either pending or stored
+        let (pending, pendingLocalId) = context.performAndWait { () -> (PendingLocalChange, String?) in
             let request = CloudKitRemoval.fetchRequest()
             request.predicate = NSPredicate(format: "id = %@", id)
             let isRemoved = ((try? context.count(for: request)) ?? 0) > 0
@@ -1318,11 +1318,14 @@ public final class SDSSynchronizer: Sendable {
                 isLocalInsert: update?.isLocalInsert ?? false,
                 isRemoved: isRemoved
             )
-            return (change, hasPendingDeletions && !isRemoved ? CloudKitLocalEntity.entry(forId: id, in: context)?.localId : nil)
+            guard !isRemoved, hasPendingDeletions, let localId = CloudKitLocalEntity.entry(forId: id, in: context)?.localId, isDeletionPending(localId: localId) else {
+                return (change, nil)
+            }
+            return (change, localId)
         }
         var change = pending
         // Deleted, but its removal isn't stored yet
-        if let localId, isDeletionPending(localId: localId), isObjectGone(localId: localId) {
+        if let pendingLocalId, isObjectGone(localId: pendingLocalId) {
             change.isRemoved = true
         }
         return change
