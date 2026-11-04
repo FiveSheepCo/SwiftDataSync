@@ -162,6 +162,65 @@ struct SixthReviewScenarioTests {
         device.terminate()
     }
 
+    /// A model changed after a reset, and changed back, whose record fails to download once while every record is
+    /// downloaded again. It isn't uploaded until its record was downloaded and matched with it, rather than as a new record.
+    @Test func nothingIsUploadedWhileRecordsFailToDownloadAfterAReset() async throws {
+        let server = FakeCloudServer()
+        let device = TestDevice("A", server: server)
+        try await device.launch(configuration: Self.subscriptionsWithoutIdentity)
+        try device.insertSubscriptions(["s1", "s2"])
+        await device.sync()
+        let s1 = try #require(server.records(account: "first").first { $0["feedLink"] as? String == "s1" }?.recordID.recordName)
+
+        device.synchronizer.stop()
+        try await device.synchronizer.resetSyncData()
+        try editAndRevert(device)
+        server.failDownloading(where: { $0.recordName == s1 }, with: CKError(.networkFailure), count: 1)
+        device.synchronizer.start()
+        await device.settle()
+        await device.sync()
+        await device.sync()
+
+        #expect(device.serverSubscriptions().map(\.feedLink) == ["s1", "s2"])
+        #expect(try device.subscriptions().map(\.feedLink) == ["s1", "s2"])
+        device.terminate()
+    }
+
+    /// A document is added to a workspace after a reset, and the workspace's record fails to download once while every
+    /// record is downloaded again. The workspace isn't uploaded as a new record for the document to reference.
+    @Test func referencedModelsArentUploadedWhileTheirRecordsFailToDownload() async throws {
+        let server = FakeCloudServer()
+        let device = TestDevice("A", server: server)
+        try await device.launch()
+        try device.change { context in
+            let workspace = ScenarioWorkspace(title: "w")
+            context.insert(workspace)
+            let document = ScenarioDocument(title: "d1")
+            context.insert(document)
+            document.workspace = workspace
+        }
+        await device.sync()
+        let workspace = try #require(server.records(account: "first").first { $0.recordType == "ScenarioWorkspace" }?.recordID.recordName)
+
+        device.synchronizer.stop()
+        try await device.synchronizer.resetSyncData()
+        try device.change { context in
+            let document = ScenarioDocument(title: "d2")
+            context.insert(document)
+            document.workspace = try context.fetch(FetchDescriptor<ScenarioWorkspace>()).first
+        }
+        server.failDownloading(where: { $0.recordName == workspace }, with: CKError(.networkFailure), count: 1)
+        device.synchronizer.start()
+        await device.settle()
+        await device.sync()
+        await device.sync()
+
+        #expect(server.records(account: "first").filter { $0.recordType == "ScenarioWorkspace" }.count == 1)
+        #expect(try device.count(ScenarioWorkspace.self) == 1)
+        #expect(server.records(account: "first").filter { $0.recordType == "ScenarioDocument" }.count == 2)
+        device.terminate()
+    }
+
     /// While every record is downloaded again, the store's data isn't complete yet.
     @Test func notDownloadedOnceWhileRecovering() async throws {
         let device = TestDevice("A", server: FakeCloudServer())

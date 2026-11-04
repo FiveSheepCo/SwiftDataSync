@@ -307,8 +307,9 @@ extension SDSSynchronizer {
                 if !sharedDatabase, case .all = scope {
                     self.markDownloadedOnce()
                     // Not while records failed, which local objects without records can be copies of: they'd be uploaded as
-                    // new records, and the records downloaded as duplicates
-                    if self.isRecoveringVanishedObjects && !handler.hasFailedRecords {
+                    // new records, and the records downloaded as duplicates. Unless they keep failing, which would keep
+                    // anything from being uploaded, see `synchronize()`.
+                    if self.isRecoveringVanishedObjects && (!handler.hasFailedRecords || self.countIncompleteRecovery() >= Self.maximumIncompleteRecoveries) {
                         self.finishRecoveringVanishedObjects()
                     }
                 }

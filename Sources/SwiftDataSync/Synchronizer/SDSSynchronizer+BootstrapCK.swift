@@ -306,6 +306,20 @@ extension SDSSynchronizer {
             }
             try checkNotStopped()
 
+            // Nothing is uploaded until every record was downloaded again, e.g. after a reset, also if only single records
+            // failed: local objects can be copies of them, which would be uploaded as new records, see `SDSContentIndex`.
+            // The records are downloaded again later.
+            if isRecoveringVanishedObjects {
+                logger.log("Not uploading until every record was downloaded again")
+                if let sharedDownloadError {
+                    throw sharedDownloadError
+                }
+                await set(state: .idle)
+                await setRoutineTimer(onlyAfterError: false)
+                await synchronizeAgainIfRequested()
+                return
+            }
+
             await set(state: .uploading)
             let upload = try await upload(
                 includingSharedDatabase: downloadError == nil && sharedDownloadError == nil,
