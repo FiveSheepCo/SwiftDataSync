@@ -116,7 +116,8 @@ records that have their values, so they aren't duplicated, and local copies of o
 downloaded again. Changes made in
 `beforeForgetting`, which runs once no synchronization runs anymore, aren't recorded, so they're never uploaded: an app can
 empty its store there, to look at iCloud's data before deciding what to do with its own. If the data can't be forgotten,
-e.g. as the disk is full, the reset throws, the data stays as it is, and synchronizing stays stopped until `start()`:
+e.g. as the disk is full, the reset throws, the data stays as it is, apart from local copies of other users' shares that
+were removed already, which are downloaded again once a reset succeeds, and synchronizing stays stopped until `start()`:
 
 ```swift
 try await SDSSynchronizer.shared.resetSyncData {

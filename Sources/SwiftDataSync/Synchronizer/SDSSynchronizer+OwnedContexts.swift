@@ -49,14 +49,21 @@ extension SDSSynchronizer {
         // identity changed always leaves one, see `CloudKitLocalEntity.recordId`. Identities can't be sharable, so none is
         // left out by `onlyPrivate`.
         var vacating: Set<String> = []
+        // The keys of moving models whose values are of unknown age, read before another model takes their records, which
+        // gets updates of its own there, see below
+        var backfilledKeysOfMoving: [String: Set<String>] = [:]
         let moving = changes.filter(\.identityChanged)
         if !moving.isEmpty {
             let current = CloudKitLocalEntity.entries(forLocalIds: moving.map(\.localId), in: context)
+            let pending = CloudKitUpdate.find(ids: current.values.map(\.id), in: context)
             for change in moving {
-                guard let id = current[change.localId]?.id, id != change.identityRecordName, UUID(uuidString: id) == nil else { continue }
+                guard let id = current[change.localId]?.id else { continue }
+                backfilledKeysOfMoving[change.localId] = Set(pending[id]?.backfilledKeys ?? [])
+                guard id != change.identityRecordName, UUID(uuidString: id) == nil else { continue }
                 vacating.insert(id)
             }
         }
+        let vacatedByMoving = vacating
 
         // The names models moved away from, which are deleted once every batch is stored, unless another model of these
         // changes took them, also one of another batch
@@ -179,7 +186,7 @@ extension SDSSynchronizer {
                     logger.log("Moving `\(previousId)` to `\(id)`, as its identity changed")
                     // Values of unknown age stay so, e.g. of an object saved before synchronizing started, and mustn't
                     // overwrite a record of the new identity
-                    let previouslyBackfilled = Set(CloudKitUpdate.find(ids: [previousId], in: context)[previousId]?.backfilledKeys ?? [])
+                    let previouslyBackfilled = backfilledKeysOfMoving[change.localId] ?? []
                     vacatedIds.append((previousId, zoneId))
                     keys = change.allKeys.filter { !previouslyBackfilled.contains($0) || change.changedKeys.contains($0) }
                     unchangedKeys = change.allKeys.filter { !keys.contains($0) }
@@ -193,7 +200,14 @@ extension SDSSynchronizer {
                 }
 
                 // Not one a removal of this batch deleted, which is gone from the context if it wasn't saved yet
-                let update = updates[id].flatMap { $0.isDeleted || $0.managedObjectContext == nil ? nil : $0 } ?? CloudKitUpdate(id: id, entityName: change.entityName, context: context)
+                var existing = updates[id].flatMap { $0.isDeleted || $0.managedObjectContext == nil ? nil : $0 }
+                if let other = existing, vacatedByMoving.contains(id), previousId != nil || !hadRecord.contains(change.localId) {
+                    // The update of the model that moved away from the record, whose changes go to its new record. This one
+                    // gets an update of its own, rather than taking the other's keys and their ages.
+                    context.delete(other)
+                    existing = nil
+                }
+                let update = existing ?? CloudKitUpdate(id: id, entityName: change.entityName, context: context)
                 updates[id] = update
                 if backfilled {
                     update.addBackfilledKeys(keys)

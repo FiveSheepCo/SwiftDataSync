@@ -125,14 +125,20 @@ extension SDSSynchronizer {
         // Deletions are stored once they're saved, rather than when they're made, so ones that are discarded aren't uploaded
         let configuration = self.configuration
         let deletedObjectIDs = (userInfo[NSDeletedObjectsKey] as? NSSet ?? []).compactMap { ($0 as? NSManagedObject)?.objectID }.filter { objectID in
-            configuration?.entities[objectID.entity.name ?? ""] != nil && !wasDeletedBySynchronizer(objectID)
+            configuration?.entities[objectID.entity.name ?? ""] != nil && !objectID.isTemporaryID
         }
         let readDeletions = takeDeletionsBeingSaved(by: savingContext)
         // See `resetSyncData(beforeForgetting:)`
         guard !isForgetting else { return }
-        let deletions = deletedObjectIDs.filter { !$0.isTemporaryID }.map { objectID in
+        let deletions = deletedObjectIDs.compactMap { objectID -> SDSObjectDeletion? in
+            // Read when the save started, while only the app deleted it: a download that saves before this runs can take in
+            // the deletion, which then looks like the synchronizer's, see `saveObservedUpdateContext`
+            if let deletion = readDeletions[objectID] {
+                return deletion
+            }
+            guard !wasDeletedBySynchronizer(objectID) else { return nil }
             // E.g. one a validation deleted. Its parent can't be read anymore, so it's sent to the private database.
-            readDeletions[objectID] ?? SDSObjectDeletion(
+            return SDSObjectDeletion(
                 localId: objectID.uriRepresentation().absoluteString,
                 sharableRootLocalId: nil,
                 isSharable: configuration?.entities[objectID.entity.name ?? ""]?.isSharable == true
