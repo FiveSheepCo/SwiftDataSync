@@ -136,6 +136,32 @@ struct SixthReviewScenarioTests {
         device.terminate()
     }
 
+    /// A record fails to download while every record is downloaded again after a reset. Its model, which has no record yet,
+    /// isn't uploaded as a new one until the record was downloaded and matched with it, rather than becoming a duplicate.
+    @Test func recoveringWaitsForRecordsThatFailedToDownload() async throws {
+        let server = FakeCloudServer()
+        let device = TestDevice("A", server: server)
+        try await device.launch()
+        try device.change { context in
+            context.insert(ScenarioNote(text: "Hello"))
+            context.insert(ScenarioNote(text: "World"))
+        }
+        await device.settle()
+        let hello = try #require(server.records(account: "first").first { $0["text"] as? String == "Hello" }?.recordID.recordName)
+
+        device.synchronizer.stop()
+        try await device.synchronizer.resetSyncData()
+        server.failDownloading(where: { $0.recordName == hello }, with: CKError(.networkFailure), count: 2)
+        device.synchronizer.start()
+        await device.settle()
+        await device.sync()
+        await device.sync()
+
+        #expect(device.serverNotes() == ["Hello", "World"])
+        #expect(try device.notes() == ["Hello", "World"])
+        device.terminate()
+    }
+
     /// While every record is downloaded again, the store's data isn't complete yet.
     @Test func notDownloadedOnceWhileRecovering() async throws {
         let device = TestDevice("A", server: FakeCloudServer())

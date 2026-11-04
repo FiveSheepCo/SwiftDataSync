@@ -306,7 +306,9 @@ extension SDSSynchronizer {
                 // Also if records were held back, e.g. as their references are missing. They might never be resolved.
                 if !sharedDatabase, case .all = scope {
                     self.markDownloadedOnce()
-                    if self.isRecoveringVanishedObjects {
+                    // Not while records failed, which local objects without records can be copies of: they'd be uploaded as
+                    // new records, and the records downloaded as duplicates
+                    if self.isRecoveringVanishedObjects && !handler.hasFailedRecords {
                         self.finishRecoveringVanishedObjects()
                     }
                 }
@@ -501,6 +503,11 @@ private final class CKDownloadHandler {
     }
     
     /// The records that failed to download before, which are downloaded again before the zone's changes.
+    /// Whether records of this download failed, which the next one downloads again, see `recordIDsToDownloadAgain`.
+    var hasFailedRecords: Bool {
+        !failedRecordIDs.isEmpty
+    }
+
     var recordIDsToDownloadAgain: [CKRecord.ID] {
         Array(failedRecordIDs)
     }
@@ -1552,6 +1559,28 @@ private final class CKDownloadHandler {
             }
             synchronizer.logger.error("tryFixingObservedContext: Not deleting a `\(object.entity.name ?? "Unknown")` that can't be deleted")
         } else if object.isInserted {
+            // Objects that were saved before don't go with it, e.g. ones its record moved into it, which a delete rule would
+            // delete, without the deletion being uploaded. They keep their saved values, and their records are kept for later
+            // downloads like this one's.
+            for (name, relationship) in object.entity.relationshipsByName where relationship.deleteRule == .cascadeDeleteRule {
+                let value = object.value(forKey: name)
+                let related = (value as? NSSet)?.allObjects ?? (value as? NSOrderedSet)?.array ?? [value].compactMap { $0 }
+                for case let existing as NSManagedObject in related where !existing.isInserted {
+                    if relationship.isToMany {
+                        if relationship.isOrdered {
+                            object.mutableOrderedSetValue(forKey: name).remove(existing)
+                        } else {
+                            object.mutableSetValue(forKey: name).remove(existing)
+                        }
+                    } else {
+                        object.setValue(nil, forKey: name)
+                    }
+                    context.refresh(existing, mergeChanges: false)
+                    if let relatedName = synchronizer.existingRecordId(of: existing), let record = pageRecords[relatedName] {
+                        setAside(record)
+                    }
+                }
+            }
             // The object isn't stored, nor its local entity once the download is saved
             context.delete(object)
             deletedRecordIds.insert(container.id)
