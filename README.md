@@ -110,8 +110,9 @@ SDSSynchronizer.shared.start()
 To start over instead, `resetSyncData()` forgets everything the synchronizer stored about iCloud's data: which objects
 have records, the changes that weren't uploaded, change tokens and whether everything was downloaded. iCloud's data stays
 as it is. Synchronizing stops, and the next `start()` downloads everything and uploads the local objects iCloud doesn't
-have, like a new device. Local models without an identity are first matched with the records that have their values, so
-they aren't duplicated, and local copies of other users' shares are removed, and downloaded again. Changes made in
+have, like a new device. Local models without an identity, or without all of its values, are first matched with the
+records that have their values, so they aren't duplicated, and local copies of other users' shares are removed, and
+downloaded again. Changes made in
 `beforeForgetting`, which runs once no synchronization runs anymore, aren't recorded, so they're never uploaded: an app can
 empty its store there, to look at iCloud's data before deciding what to do with its own. If the data can't be forgotten,
 e.g. as the disk is full, the reset throws, the data stays as it is, and synchronizing stays stopped until `start()`:

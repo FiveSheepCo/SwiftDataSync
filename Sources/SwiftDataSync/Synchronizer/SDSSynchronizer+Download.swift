@@ -103,7 +103,7 @@ extension SDSSynchronizer {
                 } else {
                     try uploadLocalObjects(keysByEntity: keysByEntity(catchUp.newKeys), skippingRecordNames: Set(skipped.keys))
                 }
-                if skipped.values.contains(true) && countIncompleteCatchUp() < Self.maximumCatchUpAttempts {
+                if skipped.values.contains(true) && countIncompleteCatchUp(catchUp) < Self.maximumCatchUpAttempts {
                     // Their records might lack the keys, which would clear the local values once caught up. Downloads leave
                     // the keys alone until the catch-up is done.
                     logger.log("Couldn't catch up on \(skipped.count) records, catching up again later")
@@ -487,7 +487,7 @@ private final class CKDownloadHandler {
             failedRecordIDs = heldRecords.loadFailedIDs()
             persistedFailedRecordIDs = failedRecordIDs
             if !forSharedDatabase && synchronizer.isRecoveringVanishedObjects {
-                contentIndex = SDSContentIndex(synchronizer: synchronizer, context: synchronizer.observedUpdateContext!, trackedLocalIds: Self.ids(of: "CloudKitLocalEntity", key: "localId", in: synchronizer.context))
+                contentIndex = SDSContentIndex(synchronizer: synchronizer, context: synchronizer.observedUpdateContext!, trackedLocalIds: Self.localIdsOfConfirmedRecords(in: synchronizer.context))
             }
         } else {
             heldRecords = nil
@@ -520,6 +520,27 @@ private final class CKDownloadHandler {
         }
     }
     
+    /// The URIs of the objects whose records are known to exist. Objects whose records were only named here, e.g. ones changed
+    /// while every record is downloaded again, can still be copies of the records' objects, see `SDSContentIndex`.
+    private static func localIdsOfConfirmedRecords(in context: NSManagedObjectContext) -> Set<String> {
+        context.performAndWait {
+            // Saved first, as dictionaries are only read from the store
+            try? context.save()
+            let inserts = NSFetchRequest<NSDictionary>(entityName: "CloudKitUpdate")
+            inserts.resultType = .dictionaryResultType
+            inserts.propertiesToFetch = ["id"]
+            inserts.predicate = NSPredicate(format: "rawChangedKeys BEGINSWITH %@", CloudKitUpdate.insertMarker)
+            let unconfirmed = Set(((try? context.fetch(inserts)) ?? []).compactMap { $0["id"] as? String })
+            let entities = NSFetchRequest<NSDictionary>(entityName: "CloudKitLocalEntity")
+            entities.resultType = .dictionaryResultType
+            entities.propertiesToFetch = ["id", "localId"]
+            return Set(((try? context.fetch(entities)) ?? []).compactMap { row in
+                guard let id = row["id"] as? String, !unconfirmed.contains(id) else { return nil }
+                return row["localId"] as? String
+            })
+        }
+    }
+
     private static func ids(of entityName: String, key: String = "id", in context: NSManagedObjectContext) -> Set<String> {
         context.performAndWait {
             // Saved first, as dictionaries are only read from the store
@@ -869,8 +890,11 @@ private final class CKDownloadHandler {
                 try identityIndex.object(entityName: entityName, keys: identity, recordName: name)
             }
         } else if let contentIndex {
+            // Not the keys a pending catch-up adds, which the records of older versions lack, while the local values don't
+            let newKeys = synchronizer.pendingCatchUp?.newKeys ?? []
+            let keys = configuration.syncedProperties.filter { !newKeys.contains("\(entityName).\($0)") }
             matchingObject = {
-                contentIndex.object(matching: record, overflowValues: overflowValues, entity: entity, keys: configuration.syncedProperties)
+                contentIndex.object(matching: record, overflowValues: overflowValues, entity: entity, keys: keys)
             }
         }
         

@@ -19,9 +19,9 @@ extension SDSSynchronizer {
     /// objects whose records don't exist are uploaded with them.
     ///
     /// Objects whose records are known, but that are gone from the store, e.g. because it was lost or rebuilt, are looked for
-    /// as well, see `forgetVanishedObjects`. While every record is downloaded again, objects without an identity that have no
-    /// records are left for later: they might be copies of the vanished ones, which the download gives their records, see
-    /// `SDSContentIndex`.
+    /// as well, see `forgetVanishedObjects`. While every record is downloaded again, objects without an identity, or without
+    /// all of its values, that have no records are left for later: they might be copies of the vanished ones, which the
+    /// download gives their records, see `SDSContentIndex`.
     ///
     /// Only object IDs are fetched to find the objects, which are compared with the local entities' IDs, and the objects
     /// themselves are read in batches. Throws if the stores can't be read, which mustn't be taken for no objects.
@@ -74,6 +74,20 @@ extension SDSSynchronizer {
             synchronizedEntities: Set(configuration.entities.keys)
         )
         let isRecovering = isRecoveringVanishedObjects
+        // Objects that lack one of their identity values get records named like objects without an identity, see
+        // `SDSIdentity.identityRecordName(entityName:values:)`, so they're matched by their values too
+        let lackingIdentityValues: Set<NSManagedObjectID> = !isRecovering ? [] : try observedUpdateContext.performAndWaitUnchecked {
+            var lacking: Set<NSManagedObjectID> = []
+            for (entityName, entity) in configuration.entities where !entity.identity.isEmpty {
+                let request = NSFetchRequest<NSManagedObjectID>(entityName: entityName)
+                request.resultType = .managedObjectIDResultType
+                request.includesSubentities = false
+                request.includesPendingChanges = false
+                request.predicate = NSCompoundPredicate(orPredicateWithSubpredicates: entity.identity.map { NSPredicate(format: "%K == nil", $0) })
+                lacking.formUnion(try observedUpdateContext.fetch(request))
+            }
+            return lacking
+        }
         
         var untracked: [String: [NSManagedObjectID]] = [:]
         var leftForRecoveryCount = 0
@@ -82,7 +96,7 @@ extension SDSSynchronizer {
             for objectID in ids {
                 let isTracked = trackedLocalIds.contains(objectID.uriRepresentation().absoluteString)
                 if isTracked && onlyUntracked { continue }
-                if !isTracked && isRecovering && !hasIdentity {
+                if !isTracked && isRecovering && (!hasIdentity || lackingIdentityValues.contains(objectID)) {
                     leftForRecoveryCount += 1
                     continue
                 }

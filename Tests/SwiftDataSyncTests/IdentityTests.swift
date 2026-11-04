@@ -184,18 +184,18 @@ struct IdentityTests {
 
         try context.performAndWait {
             // A model without a record gets it
-            let first = CloudKitLocalEntity.adopt(recordName: name, forLocalId: "x-coredata://store/IdentityModel/p1", isNamedAfterIdentity: true, in: context)
+            let first = CloudKitLocalEntity.adopt(recordName: name, forLocalId: "x-coredata://store/IdentityModel/p1", replacingOwnRecord: true, in: context)
             #expect(first.adopted && first.previousId == nil)
             #expect(CloudKitLocalEntity.entry(forLocalId: "x-coredata://store/IdentityModel/p1", in: context)?.id == name)
 
             // A model with a random record gets the one named after its identity, its own is deleted as a duplicate
             _ = CloudKitLocalEntity(id: "random", localId: "x-coredata://store/IdentityModel/p2", context: context)
-            let second = CloudKitLocalEntity.adopt(recordName: name + "2", forLocalId: "x-coredata://store/IdentityModel/p2", isNamedAfterIdentity: true, in: context)
+            let second = CloudKitLocalEntity.adopt(recordName: name + "2", forLocalId: "x-coredata://store/IdentityModel/p2", replacingOwnRecord: true, in: context)
             #expect(second.adopted && second.previousId == "random")
 
             // A record that isn't named after its identity, e.g. uploaded before the identity was configured, doesn't replace one
             _ = CloudKitLocalEntity(id: "own", localId: "x-coredata://store/IdentityModel/p3", context: context)
-            let third = CloudKitLocalEntity.adopt(recordName: "legacy", forLocalId: "x-coredata://store/IdentityModel/p3", isNamedAfterIdentity: false, in: context)
+            let third = CloudKitLocalEntity.adopt(recordName: "legacy", forLocalId: "x-coredata://store/IdentityModel/p3", replacingOwnRecord: false, in: context)
             #expect(!third.adopted && third.previousId == nil)
             #expect(CloudKitLocalEntity.entry(forLocalId: "x-coredata://store/IdentityModel/p3", in: context)?.id == "own")
             try context.save()

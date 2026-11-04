@@ -7,7 +7,8 @@ extension SDSSynchronizer {
     /// Whether the private database was downloaded completely at least once with the current iCloud account.
     ///
     /// It's `false` on a device that never synchronized, e.g. right after installing the app on a new device, and again after
-    /// switching to another iCloud account, until that account's data was downloaded. Apps can use it to tell missing data
+    /// switching to another iCloud account, until that account's data was downloaded, and while every record is downloaded
+    /// again after the store's objects vanished, e.g. as it was lost or rebuilt. Apps can use it to tell missing data
     /// from data that isn't there yet, e.g. before deciding that something was deleted on another device, or to show that
     /// the user's data is still being restored. It stays `true` across launches. It can be read from any thread.
     public var hasDownloadedOnce: Bool {

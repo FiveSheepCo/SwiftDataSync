@@ -168,11 +168,14 @@ extension SDSSynchronizer {
         let entityName = object.entity.name ?? ""
         let isNamedAfterIdentity = recordName == identityRecordName
         let (adopted, movedKeys, replacedRecord) = self.context.performAndWaitUnchecked {
-            let (adopted, previousId) = CloudKitLocalEntity.adopt(recordName: recordName, forLocalId: localId, isNamedAfterIdentity: isNamedAfterIdentity, in: self.context)
+            // An object matched by its values whose record was only named here, e.g. as it changed while every record is
+            // downloaded again, is a copy of this record's object too, see `SDSContentIndex`
+            let hasUnconfirmedRecord = identityRecordName == nil && CloudKitLocalEntity.entry(forLocalId: localId, in: self.context).flatMap { CloudKitUpdate.find(for: $0.id)?.isLocalInsert } == true
+            let (adopted, previousId) = CloudKitLocalEntity.adopt(recordName: recordName, forLocalId: localId, replacingOwnRecord: isNamedAfterIdentity || hasUnconfirmedRecord, in: self.context)
             var movedKeys: [String] = []
             if let previousId {
                 // The object's own record is a duplicate of this one. Its pending changes would be deleted with it.
-                logger.log("[Download] Replacing record `\(previousId)` with `\(recordName)` of the same identity")
+                logger.log("[Download] Replacing record `\(previousId)` with `\(recordName)` of the same object")
                 movedKeys = CloudKitUpdate.find(for: previousId)?.changedKeys ?? []
                 setRemoval(id: previousId, zoneId: nil)
                 if !movedKeys.isEmpty {

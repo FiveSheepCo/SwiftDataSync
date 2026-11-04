@@ -132,6 +132,7 @@ extension SDSSynchronizer {
         }
 
         withAcceptedShareZones { $0 = [:] }
+        restartCatchUp()
         resetQuarantine()
         forgetServerRecordsOfConflicts()
         resumeUploads()
