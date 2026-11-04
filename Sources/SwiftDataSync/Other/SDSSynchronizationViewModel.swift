@@ -186,6 +186,8 @@ public final class SDSSynchronizationViewModel {
     }
     
     var forceSyncDisabled: Bool {
+        // E.g. after the user deleted the app's data in iCloud, until the app starts synchronizing again, which changes the state
+        if synchronizer?.isStopped == true { return true }
         switch state {
         case .idle, .error: return false
         default: return true

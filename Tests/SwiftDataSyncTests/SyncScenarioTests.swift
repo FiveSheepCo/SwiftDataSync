@@ -701,7 +701,7 @@ struct SyncScenarioTests {
         try device.deleteSubscription("s1")
         try device.editSubscription("s2") { $0.title = "Changed before the reset" }
         let saves = server.events(of: "A", .modifyRecords).count
-        await device.synchronizer.resetSyncData()
+        try await device.synchronizer.resetSyncData()
         #expect(!device.synchronizer.hasDownloadedOnce)
         #expect(server.events(of: "A", .modifyRecords).count == saves)
 

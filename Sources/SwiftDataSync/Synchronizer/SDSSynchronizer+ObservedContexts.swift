@@ -19,6 +19,16 @@ struct SDSObjectChange: Sendable {
     var allKeys: [String] = []
 }
 
+/// A deletion of a synchronizable object, read while the object can still be read. It's stored once it's saved, as it can
+/// still be discarded before, e.g. by a rollback, see `contextSaved`.
+struct SDSObjectDeletion: Sendable {
+    /// The URI of the object's ID.
+    let localId: String
+    /// See `SDSSynchronizableContainer.sharableRootLocalId`.
+    let sharableRootLocalId: String?
+    let isSharable: Bool
+}
+
 extension SDSSynchronizer {
     
     func setupNotifications() {
@@ -52,7 +62,7 @@ extension SDSSynchronizer {
     }
     
     @objc func contextChanged(_ notification:Notification) {
-        guard let userInfo = userInfo(from: notification) else { return }
+        guard let userInfo = userInfo(from: notification), !isForgetting else { return }
         
         // Only changes and deleted objects are handled here so that the update works
         // Objects that weren't saved yet are reported too. They don't have a record, and must not get a record id now,
@@ -60,14 +70,22 @@ extension SDSSynchronizer {
         let savedObjects = { (key: String) in
             (userInfo[key] as? NSSet ?? []).compactMap { $0 as? NSManagedObject }.filter { !$0.objectID.isTemporaryID }
         }
-        let updatedObjects = savedObjects(NSUpdatedObjectsKey).compactMap(onlyIfSyncronizable)
+        // An object that was inserted, but has a permanent ID already, isn't saved yet either
+        let updatedObjects = savedObjects(NSUpdatedObjectsKey).filter { !$0.isInserted }.compactMap(onlyIfSyncronizable)
         let deletedObjects = savedObjects(NSDeletedObjectsKey)
             // Deletions merged from the synchronizer's own saves are reported here too, but must not be uploaded
             .filter { !wasDeletedBySynchronizer($0.objectID) }
             .compactMap(onlyIfSyncronizable)
         
         setUpdates(for: changes(of: updatedObjects, inserted: false, beforeSave: true))
-        handleDeletedObjects(deletedObjects)
+        // Read now, as the objects can't be read anymore once the deletions are saved, see `contextSaved`
+        rememberUnsavedDeletions(deletedObjects.map { deleted in
+            (deleted.object.objectID, SDSObjectDeletion(
+                localId: deleted.object.objectID.uriRepresentation().absoluteString,
+                sharableRootLocalId: deleted.sharableRootLocalId,
+                isSharable: deleted is SDSSharableContainer
+            ))
+        })
     }
     
     /// Changes are stored when they are made, but uploads read the values from the store, so ones that were uploaded
@@ -101,10 +119,28 @@ extension SDSSynchronizer {
             // A child context only saves to its parent, whose save is handled. Its inserted objects don't have permanent IDs yet.
             savingContext.parent == nil
         else { return }
+        let savedChanges = takeKeysBeingSaved(by: savingContext)
+        // Deletions are stored once they're saved, rather than when they're made, so ones that are discarded aren't uploaded
+        let configuration = self.configuration
+        let deletedObjectIDs = (userInfo[NSDeletedObjectsKey] as? NSSet ?? []).compactMap { ($0 as? NSManagedObject)?.objectID }.filter { objectID in
+            configuration?.entities[objectID.entity.name ?? ""] != nil && !wasDeletedBySynchronizer(objectID)
+        }
+        let readDeletions = takeUnsavedDeletions(of: deletedObjectIDs)
+        // See `resetSyncData(beforeForgetting:)`
+        guard !isForgetting else { return }
+        let deletions = deletedObjectIDs.filter { !$0.isTemporaryID }.map { objectID in
+            // E.g. the context didn't report the deletion first. Its parent can't be read anymore, so it's sent to the private database.
+            readDeletions[objectID] ?? SDSObjectDeletion(
+                localId: objectID.uriRepresentation().absoluteString,
+                sharableRootLocalId: nil,
+                isSharable: configuration?.entities[objectID.entity.name ?? ""]?.isSharable == true
+            )
+        }
+        // Before the changes, so a model saved with the identity of a deleted one gets its record, see `storeUpdates`
+        storeRemovals(deletions)
         
         // Changes that were saved are stored again, so their saved values are uploaded too, see `contextWillSave`
         let updatedObjects = (userInfo[NSUpdatedObjectsKey] as? NSSet ?? []).compactMap { $0 as? NSManagedObject }
-        let savedChanges = takeKeysBeingSaved(by: savingContext)
         var updatedChanges: [SDSObjectChange] = []
         for object in updatedObjects {
             guard let keys = savedChanges[object.objectID], let container = container(for: object) else { continue }
@@ -133,14 +169,8 @@ extension SDSSynchronizer {
         let synchronizedChanges = updatedChanges + changes(of: insertedObjects, inserted: true)
         setUpdates(for: synchronizedChanges)
 
-        // Deletions were stored when they were made, see `contextChanged`. Only the IDs of deleted objects are read.
-        let configuration = self.configuration
-        let hasDeletions = (userInfo[NSDeletedObjectsKey] as? NSSet ?? []).contains { object in
-            guard let objectID = (object as? NSManagedObject)?.objectID else { return false }
-            return configuration?.entities[objectID.entity.name ?? ""] != nil && !wasDeletedBySynchronizer(objectID)
-        }
         // E.g. saves of models or keys that aren't synchronized don't need a synchronization
-        guard !synchronizedChanges.isEmpty || hasDeletions else { return }
+        guard !synchronizedChanges.isEmpty || !deletions.isEmpty else { return }
 
         // The changes are saved right away, rather than when no synchronization runs, so they aren't lost if the app
         // is terminated while one does. Blocks run on the context's queue in order, so this saves them.
@@ -270,7 +300,7 @@ extension SDSSynchronizer {
         var change = change
         if beforeSave {
             let saved = container.object.committedValues(forKeys: identity)
-            change.identityRecordName = SDSIdentity.recordName(entityName: change.entityName, values: identity.map { saved[$0] })
+            change.identityRecordName = SDSIdentity.identityRecordName(entityName: change.entityName, values: identity.map { saved[$0] })
         } else {
             change.identityRecordName = identityRecordName(for: container.object)
             change.identityChanged = !inserted && identity.contains(where: change.changedKeys.contains)
@@ -335,16 +365,8 @@ extension SDSSynchronizer {
         }
     }
 
-    /// Stores the removals without waiting for `context`, like `setUpdates(for:)`. Has to be called on the queue of the objects' context.
-    func handleDeletedObjects(_ objects: [SDSSynchronizableContainer]) {
-        // Callers only pass saved objects, see `contextChanged`
-        let deletions = objects.filter { !$0.object.objectID.isTemporaryID }.map { delete in
-            (
-                localId: delete.object.objectID.uriRepresentation().absoluteString,
-                sharableRootLocalId: delete.sharableRootLocalId,
-                isSharable: delete is SDSSharableContainer
-            )
-        }
+    /// Stores the removals without waiting for `context`, like `setUpdates(for:)`.
+    func storeRemovals(_ deletions: [SDSObjectDeletion]) {
         guard !deletions.isEmpty else { return }
 
         let context = self.context

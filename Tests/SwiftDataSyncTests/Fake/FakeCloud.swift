@@ -428,6 +428,11 @@ final class FakeCloudServer: @unchecked Sendable {
         guard recordsToSave.count + recordIDsToDelete.count <= Self.maximumRecordsPerOperation else {
             return finish(CKError(.limitExceeded))
         }
+        // CloudKit rejects saving a record twice, or saving and deleting it, in one operation
+        let recordIDs = recordsToSave.map(\.recordID) + recordIDsToDelete
+        guard Set(recordIDs).count == recordIDs.count else {
+            return finish(CKError(.invalidArguments))
+        }
         guard !isShared else {
             // This fake has no shares
             return finish(CKError(.zoneNotFound))

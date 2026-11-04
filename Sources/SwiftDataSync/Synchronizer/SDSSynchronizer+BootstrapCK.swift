@@ -21,7 +21,8 @@ extension SDSSynchronizer {
         lastCompletedDownload = nil
         resumeUploads()
         resetQuarantine()
-        await synchronize()
+        // In a task of its own, as cancelling the caller, e.g. a view's refresh, would end it with errors it didn't have
+        await Task { await self.synchronize() }.value
     }
     
     func forceUpload() {
@@ -102,18 +103,8 @@ extension SDSSynchronizer {
     /// and keep their record names: a model the new account has a record of, e.g. because the user switches back to an
     /// account the device synchronized before, gets the record's values instead of becoming a duplicate.
     private func resetForNewAccount() throws {
-        let context = self.context
-        let sharedRootIds: [String] = context.performAndWait {
-            ((try? context.fetch(CloudKitShare.fetchRequest())) ?? []).compactMap { entry in
-                entry.share?.isSharedByOtherUser == true ? entry.id : nil
-            }
-        }
-        for id in sharedRootIds {
-            if let root = find(for: id) {
-                try removeLocalCopy(of: root)
-            }
-        }
-        
+        try removeLocalCopiesOfOtherUsersShares()
+
         // Nothing of this device is in the new account yet. Its data isn't overwritten, see `backfill(onlyUntracked:)`.
         // Written first, so it's also done if the app is terminated before the reset is saved.
         updateFileState { state in
@@ -489,25 +480,22 @@ extension SDSSynchronizer {
     /// Schedules a synchronization after an error, or also without one.
     /// - Parameter interval: How long it waits, rather than depending on the error.
     private func setRoutineTimer(onlyAfterError: Bool = true, interval: TimeInterval? = nil) async {
+        let state = await viewModel.state
         if onlyAfterError {
-            guard case .error = await viewModel.state else { return }
+            guard case .error = state else { return }
         }
 
-        startTask(at: \.routineSync) { @MainActor in
-            let minInterval: TimeInterval
-            if let interval {
-                minInterval = interval
-            } else if case .error(let error) = self.viewModel.state, let retryAfterSeconds = (error as? CKError)?.retryAfterSeconds {
-                minInterval = retryAfterSeconds * 1.5
-            } else {
-                minInterval = self.timing.routineRetryInterval ?? generalLoadMultiplier(networkMonitor: self.networkMonitor) * 60
-            }
-            
-            try? await Task.sleep(for: .milliseconds(minInterval * 1000))
-            
-            self.finishTask(at: \.routineSync)
-            self.startSync()
+        let minInterval: TimeInterval
+        if let interval {
+            minInterval = interval
+        } else if case .error(let error) = state, let retryAfterSeconds = (error as? CKError)?.retryAfterSeconds {
+            minInterval = retryAfterSeconds * 1.5
+        } else if let routineRetryInterval = timing.routineRetryInterval {
+            minInterval = routineRetryInterval
+        } else {
+            minInterval = await generalLoadMultiplier(networkMonitor: networkMonitor) * 60
         }
+        scheduleRoutineSync(after: minInterval)
     }
     
     /// Checks whether the synchronizer is bootstrapped. Should only be called by `synchronize()`.

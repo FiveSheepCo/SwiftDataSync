@@ -229,9 +229,16 @@ extension SDSSynchronizer {
     /// Uploads keys of every local object of the entities, e.g. the keys that a catch-up added, which records don't have yet.
     /// Objects in zones of other users' shares are left alone. The objects are read in batches.
     /// - Parameter keysByEntity: The keys to upload by entity name, `nil` for every synchronized key.
-    func uploadLocalObjects(keysByEntity: [String: [String]?]) throws {
+    /// - Parameter skippingRecordNames: Records whose objects are left out, e.g. as the catch-up couldn't store them.
+    func uploadLocalObjects(keysByEntity: [String: [String]?], skippingRecordNames: Set<String> = []) throws {
         guard let observedUpdateContext else { return }
         let context = self.context
+        let skippedLocalIds: Set<String> = skippingRecordNames.isEmpty ? [] : context.performAndWait {
+            Set(context.metadataEntries(of: "CloudKitLocalEntity", withIds: Array(skippingRecordNames)).compactMap { ($0 as? CloudKitLocalEntity)?.localId })
+        }
+        if !skippedLocalIds.isEmpty {
+            logger.log("Not uploading \(skippedLocalIds.count) local objects whose records couldn't be caught up on")
+        }
 
         var count = 0
         for (entityName, keys) in keysByEntity.sorted(by: { $0.key < $1.key }) {
@@ -254,7 +261,7 @@ extension SDSSynchronizer {
                         if let keys {
                             change.changedKeys = change.changedKeys.filter(keys.contains)
                         }
-                        return change.changedKeys.isEmpty ? nil : change
+                        return change.changedKeys.isEmpty || skippedLocalIds.contains(change.localId) ? nil : change
                     }
                     for object in objects where !object.hasChanges {
                         observedUpdateContext.refresh(object, mergeChanges: false)

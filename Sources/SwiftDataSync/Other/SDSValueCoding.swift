@@ -57,7 +57,12 @@ enum SDSValueCoding {
         case let data as Data where attribute.type != .binaryData:
             if let transformerName = attribute.valueTransformerName {
                 let transformer = try self.transformer(named: transformerName)
-                return isUnarchiving(transformer, name: transformerName) ? transformer.transformedValue(data) : transformer.reverseTransformedValue(data)
+                let value = isUnarchiving(transformer, name: transformerName) ? transformer.transformedValue(data) : transformer.reverseTransformedValue(data)
+                // Rather than clearing the local value
+                guard let value else {
+                    throw UnsupportedValueError(description: "`\(transformerName)` can't read the data")
+                }
+                return value
             }
             if let object = try? JSONSerialization.jsonObject(with: data) {
                 return object
@@ -67,7 +72,10 @@ enum SDSValueCoding {
             }
             throw UnsupportedValueError(description: "The data isn't JSON: \(String(data: data, encoding: .utf8) ?? "\(data.count) bytes")")
         case let string as String where attribute.type == .uri:
-            return URL(string: string)
+            guard let url = URL(string: string) else {
+                throw UnsupportedValueError(description: "`\(string)` isn't a URL")
+            }
+            return url
         case let string as String where attribute.type == .uuid:
             guard let uuid = UUID(uuidString: string) else {
                 throw UnsupportedValueError(description: "`\(string)` isn't a UUID")

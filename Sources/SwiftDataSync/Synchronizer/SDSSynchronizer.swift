@@ -64,6 +64,8 @@ public final class SDSSynchronizer: Sendable {
         var isStopped = false
         /// Whether `stop()` stopped synchronizing, which the state shows, rather than e.g. the error that stopped it.
         var showsStopped = false
+        /// Whether `resetSyncData` is about to forget the synchronization data, so changes made meanwhile aren't recorded.
+        var isForgetting = false
         /// Whether objects without records still have to be queued, see `backfillIfNeeded()`.
         var needsBackfill = false
         /// Counts the changes of the iCloud account, see `accountChanged(_:)`.
@@ -116,11 +118,19 @@ public final class SDSSynchronizer: Sendable {
         fileprivate var containerFinder: _ContainerFinder?
 
         var routineSync: Task<Void, Never>?
+        /// When `routineSync` synchronizes, see `scheduleRoutineSync(after:)`.
+        var routineSyncDate: Date?
         var catchUpRetry: Task<Void, Never>?
         var syncLeaseRetry: Task<Void, Never>?
         /// Saves the synchronization data and synchronizes shortly after the observed store was saved, see `contextSaved`.
         var saveSync: Task<Void, Never>?
         var startedSynchronizationCount = 0
+        /// Counts the objects without records that were queued as a record references them, see `container(for:)`.
+        var queuedReferencedObjectCount = 0
+        /// Deletions that weren't saved yet, by object, see `contextChanged`.
+        var unsavedDeletions: [NSManagedObjectID: SDSObjectDeletion] = [:]
+        /// Records a catch-up couldn't store, and whether it's tried again for them, see `download(refreshingSharedZones:)`.
+        var recordsSkippedWhileCatchingUp: [String: Bool] = [:]
     }
     private let mutableState = OSAllocatedUnfairLock(initialState: MutableState())
     
@@ -247,6 +257,59 @@ public final class SDSSynchronizer: Sendable {
     /// See `FileState.isRecoveringVanishedObjects`.
     var isRecoveringVanishedObjects: Bool {
         mutableState.withLock { $0.fileState.isRecoveringVanishedObjects }
+    }
+
+    /// See `MutableState.isForgetting`.
+    var isForgetting: Bool {
+        mutableState.withLock { $0.isForgetting }
+    }
+
+    /// See `MutableState.queuedReferencedObjectCount`.
+    var queuedReferencedObjectCount: Int {
+        mutableState.withLock { $0.queuedReferencedObjectCount }
+    }
+
+    func countQueuedReferencedObject() {
+        mutableState.withLock { $0.queuedReferencedObjectCount += 1 }
+    }
+
+    /// Remembers a record that a catch-up couldn't store, e.g. as its asset couldn't be read. Unlike other downloads, a catch-up
+    /// doesn't keep such records for later.
+    /// - Parameter isTriedAgain: Whether the catch-up is done again for it, rather than for a record that won't change, e.g.
+    ///   one whose reference was deleted.
+    func skippedWhileCatchingUp(_ recordName: String, isTriedAgain: Bool = true) {
+        mutableState.withLock { state in
+            state.recordsSkippedWhileCatchingUp[recordName] = isTriedAgain || state.recordsSkippedWhileCatchingUp[recordName] == true
+        }
+    }
+
+    func takeRecordsSkippedWhileCatchingUp() -> [String: Bool] {
+        mutableState.withLock { state in
+            defer { state.recordsSkippedWhileCatchingUp = [:] }
+            return state.recordsSkippedWhileCatchingUp
+        }
+    }
+
+    /// Remembers deletions until they're saved, see `contextChanged`. A deletion that's discarded isn't saved, and stays here.
+    func rememberUnsavedDeletions(_ deletions: [(NSManagedObjectID, SDSObjectDeletion)]) {
+        guard !deletions.isEmpty else { return }
+        mutableState.withLock { state in
+            for (objectID, deletion) in deletions {
+                state.unsavedDeletions[objectID] = deletion
+            }
+        }
+    }
+
+    /// The deletions of the objects that were remembered before they were saved, see `contextSaved`.
+    func takeUnsavedDeletions(of objectIDs: [NSManagedObjectID]) -> [NSManagedObjectID: SDSObjectDeletion] {
+        guard !objectIDs.isEmpty else { return [:] }
+        return mutableState.withLock { state in
+            var deletions: [NSManagedObjectID: SDSObjectDeletion] = [:]
+            for objectID in objectIDs {
+                deletions[objectID] = state.unsavedDeletions.removeValue(forKey: objectID)
+            }
+            return deletions
+        }
     }
     
     /// Remembers that the current account's private database was downloaded completely, see `hasDownloadedOnce`.
@@ -401,6 +464,31 @@ public final class SDSSynchronizer: Sendable {
     
     func finishTask(at keyPath: WritableKeyPath<MutableState, Task<Void, Never>?> & Sendable) {
         mutableState.withLock { $0[keyPath: keyPath] = nil }
+    }
+
+    /// Synchronizes after `delay`, unless a synchronization is scheduled sooner already. One scheduled later is replaced,
+    /// e.g. the retry of rejected records in an hour by one that CloudKit asks for in a few seconds.
+    func scheduleRoutineSync(after delay: TimeInterval) {
+        let date = Date.now.addingTimeInterval(delay)
+        mutableState.withLock { state in
+            if state.routineSync != nil, let scheduledDate = state.routineSyncDate, scheduledDate <= date { return }
+            state.routineSync?.cancel()
+            state.routineSyncDate = date
+            state.routineSync = Task {
+                try? await Task.sleep(for: .milliseconds(delay * 1000))
+
+                // Unless another one replaced it meanwhile
+                let isScheduled = self.mutableState.withLock { state in
+                    guard state.routineSyncDate == date else { return false }
+                    state.routineSync = nil
+                    state.routineSyncDate = nil
+                    return true
+                }
+                if isScheduled {
+                    self.startSync()
+                }
+            }
+        }
     }
     
     /// Saves `observedUpdateContext`. Has to be called on its queue.
@@ -788,31 +876,73 @@ public final class SDSSynchronizer: Sendable {
     ///
     /// Synchronizing stops (like `stop()`, without showing it), and starts again with `start()`. That synchronization
     /// downloads everything, and uploads the local objects iCloud doesn't have, like a new device would (see
-    /// `backfill(onlyUntracked:)`), so `hasDownloadedOnce` is `false` until it's done.
+    /// `backfill(onlyUntracked:)`), so `hasDownloadedOnce` is `false` until it's done. Local objects without an identity are
+    /// matched with their records by their values first, as after objects vanished (see `SDSContentIndex`), so they aren't
+    /// duplicated. Local copies of other users' shares are removed, and downloaded again.
+    ///
+    /// Throws if the data couldn't be forgotten, which then stays as it is, apart from the changes of `beforeForgetting`.
+    /// Synchronizing stays stopped then too, until `start()`.
     /// - Parameter beforeForgetting: Runs once no synchronization runs anymore, before the data is forgotten. Its changes
-    ///   aren't uploaded, e.g. an app can empty the observed store there, and start again to download iCloud's data into it.
-    public func resetSyncData(beforeForgetting: @MainActor @Sendable () async -> Void = {}) async {
+    ///   aren't recorded, so they're never uploaded, e.g. an app can empty the observed store there, and start again to
+    ///   download iCloud's data into it.
+    public func resetSyncData(beforeForgetting: @escaping @MainActor @Sendable () async -> Void = {}) async throws {
         stopSynchronizing()
+        // In a task of its own, as a cancelled caller would stop waiting for a running synchronization
+        try await Task {
+            try await self.forgetSyncData(beforeForgetting: beforeForgetting)
+        }.value
+        logger.log("Reset the synchronization data")
+    }
+
+    private func forgetSyncData(beforeForgetting: @MainActor @Sendable () async -> Void) async throws {
         // Waits until a running synchronization, or a save's, noticed it's stopped. None starts until the reset is done.
-        try? await beginExclusiveActivity()
+        try await beginExclusiveActivity()
         defer { endActivity() }
+        // Nor in another process using the same synchronization data, e.g. an extension
+        while !syncLease.acquire() {
+            try await Task.sleep(for: .seconds(1))
+        }
+        defer { syncLease.release() }
+
+        // Changes made meanwhile aren't recorded, rather than forgotten, so they're never uploaded, also if forgetting fails
+        mutableState.withLock { $0.isForgetting = true }
+        defer { mutableState.withLock { $0.isForgetting = false } }
         await beforeForgetting()
 
+        // Found while their shares are known, see below
+        let otherUsersSharedRoots = otherUsersSharedRoots()
+
+        // Written first, so objects without an identity aren't uploaded as duplicates if the app is terminated before the
+        // file state is replaced
+        let wasRecovering = isRecoveringVanishedObjects
+        updateFileState { $0.isRecoveringVanishedObjects = true }
         let context = self.context
-        context.performAndWaitUnchecked {
-            for entityName in ["CloudKitLocalEntity", "CloudKitUpdate", "CloudKitRemoval", "CloudKitZone", "CloudKitShare", "SDSSynchronizerSavedState"] {
-                ((try? context.fetch(NSFetchRequest<NSManagedObject>(entityName: entityName))) ?? []).forEach(context.delete)
+        do {
+            try context.performAndWaitUnchecked {
+                for entityName in ["CloudKitLocalEntity", "CloudKitUpdate", "CloudKitRemoval", "CloudKitZone", "CloudKitShare", "SDSSynchronizerSavedState"] {
+                    ((try? context.fetch(NSFetchRequest<NSManagedObject>(entityName: entityName))) ?? []).forEach(context.delete)
+                }
+                do {
+                    try context.save()
+                } catch {
+                    context.rollback()
+                    throw error
+                }
             }
-            do {
-                try context.save()
-            } catch {
-                logger.error("Failed to reset the synchronization data: \(error.localizedDescription)")
-                context.rollback()
-            }
+        } catch {
+            logger.error("Failed to reset the synchronization data: \(error.localizedDescription)")
+            updateFileState { $0.isRecoveringVanishedObjects = wasRecovering }
+            throw error
         }
+        // Changes saved from now on are recorded, like ones saved before a device synchronized for the first time
+        mutableState.withLock { $0.isForgetting = false }
+
         heldRecords(sharedDatabase: false).removeAll()
         heldRecords(sharedDatabase: true).removeAll()
-        updateFileState { $0 = FileState() }
+        updateFileState { state in
+            state = FileState()
+            state.isRecoveringVanishedObjects = true
+        }
         mutableState.withLock { state in
             state.needsBackfill = false
             state.quotaPauseEnds = [:]
@@ -820,12 +950,21 @@ public final class SDSSynchronizer: Sendable {
             state.lastCompletedUpload = nil
             state.lastCompletedDownload = nil
             state.acceptedShareZones = [:]
-            state.catchUp = nil
+            // A pending catch-up is kept, as records of older versions still lack its keys
             state.serverRecordsOfConflicts = [:]
             state.quarantine = SDSRecordQuarantine()
             state.lastRecordFailure = nil
         }
-        logger.log("Reset the synchronization data")
+
+        // Otherwise they'd be uploaded to the user's own zone, as nothing tells they belong to someone else's anymore. The
+        // download of the shared database brings them back.
+        for root in otherUsersSharedRoots {
+            do {
+                try removeLocalCopy(of: root)
+            } catch {
+                logger.error("Failed to remove the local copy of a share of another user: \(error.localizedDescription)")
+            }
+        }
     }
 
     /// Stops observing and synchronizing for good, like a process that is terminated: nothing is saved, the lease is given up

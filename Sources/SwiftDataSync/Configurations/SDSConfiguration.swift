@@ -77,9 +77,10 @@ public struct SDSConfiguration: Sendable {
         /// Indicates synchronization with specified properties.
         ///
         /// `identity` names synchronized attributes (not relationships or `assetProperties`) whose values identify a model
-        /// on every device. Without it, every model gets a random record name, so models that several devices create for
-        /// the same thing become duplicate records. With it:
-        /// - The record is named `<Entity>.<SHA-256 of the values>`, the same on every device.
+        /// on every device: strings, integers, doubles, booleans, dates, UUIDs, URLs or data. Without it, every model gets a
+        /// random record name, so models that several devices create for the same thing become duplicate records. With it:
+        /// - The record is named `<Entity>.<SHA-256 of the values>`, the same on every device. A model without all of its
+        ///   values gets a random name.
         /// - A downloaded record whose name isn't known yet is matched to a local model with the same values, which is
         ///   updated instead of inserting another one.
         /// - Uploading a record that another device created already updates it with the changed keys.

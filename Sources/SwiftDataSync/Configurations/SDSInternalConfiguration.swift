@@ -34,12 +34,20 @@ struct SDSInternalConfiguration {
             for key in entity.identity where description.attributesByName[key] == nil || !entity.syncedProperties.contains(key) || entity.assetProperties.contains(key) {
                 problems.append("`\(name).\(key)`: An identity has to consist of synchronized attributes that aren't asset properties.")
             }
+            // A model's values have to give the same name as its record's, see `SDSIdentity.canonicalString`. E.g. a float is
+            // stored as a double, whose text differs.
+            for key in entity.identity {
+                guard let attribute = description.attributesByName[key], !Self.identityAttributeTypes.contains(attribute.attributeType) else { continue }
+                problems.append("`\(name).\(key)`: Identity values have to be strings, integers, booleans, doubles, dates, UUIDs, URLs or data.")
+            }
 
             // The zones of different users' shares can have records of the same identity, which a model can't tell apart
             var visited: Set<String> = []
             var ancestor: NSEntityDescription? = description
             while let current = ancestor, let currentName = current.name, visited.insert(currentName).inserted {
-                if sharableEntities.contains(where: { $0.isKindOf(entity: current) }) {
+                // A parent can be a model of a subentity of the entity its key points to. The entity itself is configured on its own.
+                let isSharable = current == description ? entity.isSharable : sharableEntities.contains(where: { $0.isKindOf(entity: current) })
+                if isSharable {
                     problems.append("`\(name)`: Entities with an identity can't be sharable, or below a sharable entity.")
                     break
                 }
@@ -54,6 +62,12 @@ struct SDSInternalConfiguration {
         }
         return problems
     }
+
+    /// The types of attributes that can be identity values.
+    private static let identityAttributeTypes: Set<NSAttributeType> = [
+        .stringAttributeType, .integer16AttributeType, .integer32AttributeType, .integer64AttributeType, .booleanAttributeType,
+        .doubleAttributeType, .dateAttributeType, .UUIDAttributeType, .URIAttributeType, .binaryDataAttributeType
+    ]
 
     struct Entity {
         let syncedProperties: [String]
