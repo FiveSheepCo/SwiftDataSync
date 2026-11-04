@@ -29,11 +29,12 @@ extension SDSSynchronizer {
         startSync()
     }
     
-    /// Synchronizes now, e.g. when the user asks for it, also if uploads paused as iCloud was full, see `QuotaExceededError`.
+    /// Synchronizes now, e.g. when the user asks for it, like `forceDownload()`.
     func forceSyncEverything() {
         lastCompletedUpload = nil
         lastCompletedDownload = nil
         resumeUploads()
+        resetQuarantine()
         startSync()
     }
     

@@ -166,7 +166,7 @@ extension SDSSynchronizer {
         let localId = object.objectID.uriRepresentation().absoluteString
         let entityName = object.entity.name ?? ""
         let isNamedAfterIdentity = recordName == identityRecordName
-        let (adopted, movedKeys) = self.context.performAndWaitUnchecked {
+        let (adopted, movedKeys, replacedRecord) = self.context.performAndWaitUnchecked {
             let (adopted, previousId) = CloudKitLocalEntity.adopt(recordName: recordName, forLocalId: localId, isNamedAfterIdentity: isNamedAfterIdentity, in: self.context)
             var movedKeys: [String] = []
             if let previousId {
@@ -178,9 +178,19 @@ extension SDSSynchronizer {
                     setUpdate(id: recordName, zoneId: nil, entityName: entityName, changedKeys: movedKeys)
                 }
             }
-            return (adopted, Set(movedKeys))
+            return (adopted, Set(movedKeys), previousId != nil)
         }
         guard adopted else { return nil }
+
+        if replacedRecord {
+            // Records that reference the deleted record reference this one from now on
+            let changes = referencingChanges(to: object)
+            if !changes.isEmpty {
+                self.context.performAndWaitUnchecked {
+                    self.storeUpdates(changes)
+                }
+            }
+        }
         
         logger.log("[Download] Matched record `\(recordName)` to a local object of the same identity")
         guard let container = container(id: { recordName }, object: object) else { return nil }

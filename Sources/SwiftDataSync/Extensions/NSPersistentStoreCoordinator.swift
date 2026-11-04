@@ -130,13 +130,6 @@ extension NSPersistentStoreCoordinator {
                 }
             }).map(\.name)
             
-            // Downloads match records to models by these values, so the records have to contain them
-            for key in identity where entityDescription.attributesByName[key] == nil || !syncedProperties.contains(key) {
-                fatalError("`\(entityName).\(key)`: An identity has to consist of synchronized attributes. Please fix your configuration.")
-            }
-            if !identity.isEmpty && isSharable {
-                fatalError("`\(entityName)`: Entities with an identity can't be sharable. Please fix your configuration.")
-            }
             // Downloaded models are inserted with the values of their records, so they couldn't be saved without these.
             // Not a crash, as apps could have such configurations already. Their downloaded models are skipped.
             for key in SDSInternalConfiguration.unsynchronizedRequiredAttributes(of: entityDescription, syncedProperties: syncedProperties) {
@@ -152,6 +145,10 @@ extension NSPersistentStoreCoordinator {
                     referenceDepth: referenceDepth(of: entityName),
                     identity: identity
                 )
+        }
+        
+        if let problem = SDSInternalConfiguration.identityProblems(of: configurationEntities, descriptions: entities).first {
+            fatalError("\(problem) Please fix your configuration.")
         }
         
         return .init(entities: configurationEntities)
