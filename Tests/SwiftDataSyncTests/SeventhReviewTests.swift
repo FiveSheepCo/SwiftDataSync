@@ -49,6 +49,86 @@ struct SeventhReviewScenarioTests {
         device.terminate()
     }
 
+    /// A workspace and its document change their identities in one save, so the document's change comes twice, once as
+    /// it references the workspace. The record it moved away from is still deleted.
+    @Test(arguments: 1...3) func movedModelsThatReferenceMovedModelsLeaveNoRecordBehind(attempt: Int) async throws {
+        let server = FakeCloudServer()
+        let device = TestDevice("A", server: server)
+        let identities = SDSConfiguration(swiftDataEntities: [
+            .init(entity: ScenarioSubscription.self, description: .sync(.without([]), identity: ["feedLink"])),
+            .init(entity: ScenarioEpisode.self, description: .sync(.without([]), identity: ["feedLink", "guid"])),
+            .init(entity: ScenarioNote.self, description: .sync(.without([]))),
+            .init(entity: ScenarioWorkspace.self, description: .sync(.without([]), identity: ["title"])),
+            // The workspace is only referenced, as entities with an identity can't be parents
+            .init(entity: ScenarioDocument.self, description: .sync(.without([]), identity: ["title"]))
+        ])
+        try await device.launch(configuration: identities)
+        try device.change { context in
+            let workspace = ScenarioWorkspace(title: "w")
+            context.insert(workspace)
+            for number in 1...5 {
+                let document = ScenarioDocument(title: "d\(number)")
+                context.insert(document)
+                document.workspace = workspace
+            }
+        }
+        await device.sync()
+
+        try device.change { context in
+            for workspace in try context.fetch(FetchDescriptor<ScenarioWorkspace>()) {
+                workspace.title = "w2"
+            }
+            for document in try context.fetch(FetchDescriptor<ScenarioDocument>()) {
+                document.title += "b"
+            }
+        }
+        await device.sync()
+
+        let documents = Set(server.records(account: "first").filter { $0.recordType == "ScenarioDocument" }.map(\.recordID.recordName))
+        #expect(documents == Set((1...5).map { documentRecordName("d\($0)b") }))
+        #expect(server.records(account: "first").filter { $0.recordType == "ScenarioWorkspace" }.count == 1)
+        device.terminate()
+    }
+
+    /// The app deletes a model, and a download forgets its local entity before the deletion is stored, e.g. as it
+    /// downloads the record. The deletion is still uploaded, with the record it had when the save started.
+    @Test func deletionIsUploadedAlsoIfADownloadForgetsTheRecordFirst() async throws {
+        let server = FakeCloudServer()
+        let device = TestDevice("A", server: server)
+        let observer = ObserverToken()
+        device.beforeSetup = { synchronizer in
+            let token = NotificationCenter.default.addObserver(forName: .NSManagedObjectContextDidSave, object: nil, queue: nil) { notification in
+                guard
+                    let saving = notification.object as? NSManagedObjectContext,
+                    let updateContext = synchronizer.observedUpdateContext,
+                    saving !== updateContext,
+                    saving.persistentStoreCoordinator === updateContext.persistentStoreCoordinator,
+                    let deleted = notification.userInfo?[NSDeletedObjectsKey] as? Set<NSManagedObject>, !deleted.isEmpty
+                else { return }
+                // Like a download that finds the record's object gone, and forgets its local entity
+                let localIds = deleted.map { $0.objectID.uriRepresentation().absoluteString }
+                synchronizer.context.performAndWait {
+                    for entity in (try? synchronizer.context.fetch(NSFetchRequest<NSManagedObject>(entityName: "CloudKitLocalEntity"))) ?? []
+                    where localIds.contains(entity.value(forKey: "localId") as? String ?? "") {
+                        synchronizer.context.delete(entity)
+                    }
+                    try? synchronizer.context.save()
+                }
+            }
+            observer.token = token
+        }
+        try await device.launch()
+        try device.insertSubscriptions(["s1", "s2"])
+        await device.sync()
+
+        try device.deleteSubscription("s1")
+        await device.sync()
+        observer.token.map(NotificationCenter.default.removeObserver)
+
+        #expect(device.serverSubscriptions().map(\.feedLink) == ["s2"])
+        device.terminate()
+    }
+
     /// A model with values of unknown age and one without swap their identities. Each keeps its own keys' ages, rather
     /// than taking the other's, which kept known values from being uploaded, or uploaded unknown ones over iCloud's.
     @Test(arguments: 1...4) func swappedIdentitiesKeepTheirOwnValuesAges(attempt: Int) async throws {

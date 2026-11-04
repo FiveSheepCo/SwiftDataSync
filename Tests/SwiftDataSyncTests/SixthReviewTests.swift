@@ -50,33 +50,67 @@ struct SixthReviewScenarioTests {
         device.terminate()
     }
 
+    /// Subscriptions without an identity, so they're matched with their records by their values after a reset.
+    private static let subscriptionsWithoutIdentity = SDSConfiguration(swiftDataEntities: [
+        .init(entity: ScenarioSubscription.self, description: .sync(.without([]))),
+        .init(entity: ScenarioEpisode.self, description: .sync(.without([]), identity: ["feedLink", "guid"])),
+        .init(entity: ScenarioNote.self, description: .sync(.without([]))),
+        .init(entity: ScenarioWorkspace.self, description: .sync(.without([]))),
+        .init(entity: ScenarioDocument.self, description: .sync(.without([]), parentKey: "workspace", identity: ["title"]))
+    ])
+
+    /// Changes the title of s1 and back, like an edit that's undone.
+    private func editAndRevert(_ device: TestDevice) throws {
+        for title in ["Edited", "Title of s1"] {
+            try device.editSubscription("s1") { $0.title = title }
+        }
+    }
+
     /// A model without an identity changes after a reset, before its record is downloaded again. It's still matched with
-    /// its record by its values, rather than its record being downloaded as a duplicate.
+    /// its record by its values, as some of them are of unknown age, so it was saved before, rather than its record being
+    /// downloaded as a duplicate.
     @Test func modelsChangedAfterAResetAreMatchedByTheirValues() async throws {
         let server = FakeCloudServer()
         let device = TestDevice("A", server: server)
-        try await device.launch()
-        try device.change { context in
-            context.insert(ScenarioNote(text: "n1"))
-            context.insert(ScenarioNote(text: "n2"))
-        }
-        await device.settle()
-        #expect(device.serverNotes() == ["n1", "n2"])
+        try await device.launch(configuration: Self.subscriptionsWithoutIdentity)
+        try device.insertSubscriptions(["s1", "s2"])
+        await device.sync()
+        #expect(device.serverSubscriptions().count == 2)
 
         device.synchronizer.stop()
         try await device.synchronizer.resetSyncData()
-        for text in ["n1 edited", "n1"] {
-            try device.change { context in
-                let note = try #require(try context.fetch(FetchDescriptor<ScenarioNote>()).first { $0.text.hasPrefix("n1") })
-                note.text = text
-            }
-        }
+        try editAndRevert(device)
         device.synchronizer.start()
         await device.settle()
         await device.sync()
 
-        #expect(device.serverNotes() == ["n1", "n2"])
-        #expect(try device.notes() == ["n1", "n2"])
+        #expect(device.serverSubscriptions().map(\.feedLink) == ["s1", "s2"])
+        #expect(try device.subscriptions().map(\.feedLink) == ["s1", "s2"])
+        device.terminate()
+    }
+
+    /// A model is created after a reset with the values of another device's model. It stays a model of its own, rather
+    /// than being taken for a copy of the other device's.
+    @Test func modelsCreatedAfterAResetAreNotMatchedByTheirValues() async throws {
+        let server = FakeCloudServer()
+        let device = TestDevice("A", server: server)
+        try await device.launch()
+        device.synchronizer.stop()
+        // Created while this device doesn't synchronize
+        let other = TestDevice("B", server: server)
+        try await other.launch()
+        try other.change { $0.insert(ScenarioNote(text: "Hello")) }
+        await other.settle()
+        other.terminate()
+
+        try await device.synchronizer.resetSyncData()
+        try device.change { $0.insert(ScenarioNote(text: "Hello")) }
+        device.synchronizer.start()
+        await device.settle()
+        await device.sync()
+
+        #expect(device.serverNotes() == ["Hello", "Hello"])
+        #expect(try device.notes() == ["Hello", "Hello"])
         device.terminate()
     }
 
@@ -85,28 +119,20 @@ struct SixthReviewScenarioTests {
     @Test func nothingIsUploadedWhileRecoveringIfTheDownloadFails() async throws {
         let server = FakeCloudServer()
         let device = TestDevice("A", server: server)
-        try await device.launch()
-        try device.change { context in
-            context.insert(ScenarioNote(text: "n1"))
-            context.insert(ScenarioNote(text: "n2"))
-        }
-        await device.settle()
+        try await device.launch(configuration: Self.subscriptionsWithoutIdentity)
+        try device.insertSubscriptions(["s1", "s2"])
+        await device.sync()
 
         device.synchronizer.stop()
         try await device.synchronizer.resetSyncData()
-        for text in ["n1 edited", "n1"] {
-            try device.change { context in
-                let note = try #require(try context.fetch(FetchDescriptor<ScenarioNote>()).first { $0.text.hasPrefix("n1") })
-                note.text = text
-            }
-        }
+        try editAndRevert(device)
         server.failNextFetch(with: CKError(.networkFailure))
         device.synchronizer.start()
         await device.settle()
         await device.sync()
 
-        #expect(device.serverNotes() == ["n1", "n2"])
-        #expect(try device.notes() == ["n1", "n2"])
+        #expect(device.serverSubscriptions().map(\.feedLink) == ["s1", "s2"])
+        #expect(try device.subscriptions().map(\.feedLink) == ["s1", "s2"])
         device.terminate()
     }
 
