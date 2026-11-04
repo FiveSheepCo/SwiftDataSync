@@ -198,15 +198,17 @@ extension CloudKitLocalEntity {
     /// object has that record, or the object lacks identity values, a record named after previous identity values is
     /// replaced with a randomly named one, as another object can take those values.
     /// `isReserved` tells about record ids of objects that get their entities later, e.g. ones a running download inserted.
-    /// Has to be called on `context`'s queue.
+    /// `vacating` are record ids whose objects move to other ones in the same batch of changes, which are available, e.g.
+    /// when two objects swap their identities. Has to be called on `context`'s queue.
     static func recordId(
         forLocalId localId: String,
         identityRecordName: String?,
         renamingToIdentity: Bool,
         isReserved: @escaping (String) -> Bool = { _ in false },
+        vacating: Set<String> = [],
         in context: NSManagedObjectContext
     ) -> (id: String, previousId: String?) {
-        let isAvailable = { (id: String) in !isReserved(id) && entry(forId: id, in: context) == nil }
+        let isAvailable = { (id: String) in !isReserved(id) && (vacating.contains(id) || entry(forId: id, in: context) == nil) }
 
         if let entry = entry(forLocalId: localId, in: context) {
             guard renamingToIdentity, entry.id != identityRecordName else { return (entry.id, nil) }
@@ -231,15 +233,17 @@ extension CloudKitLocalEntity {
         return (CloudKitLocalEntity(id: id, localId: localId, context: context).id, nil)
     }
 
-    /// Gives a downloaded record that isn't known yet to the object with the given URI, which has the record's identity values.
+    /// Gives a downloaded record that isn't known yet to the object with the given URI, which has the record's identity values,
+    /// or its values, see `SDSContentIndex`.
     ///
-    /// An object that has a record already only gets this one if it's named after its identity values (`isNamedAfterIdentity`):
-    /// its own record is then a duplicate, whose id is returned to delete it. Otherwise it keeps its record, and `nil` is returned.
+    /// An object that has a record already only gets this one with `replacingOwnRecord`, e.g. as the record is named after
+    /// its identity values: its own record is then a duplicate, whose id is returned to delete it. Otherwise it keeps its
+    /// record, and `nil` is returned.
     /// Has to be called on `context`'s queue.
     static func adopt(
         recordName: String,
         forLocalId localId: String,
-        isNamedAfterIdentity: Bool,
+        replacingOwnRecord: Bool,
         in context: NSManagedObjectContext
     ) -> (adopted: Bool, previousId: String?) {
         // An entity whose object is gone (see `SDSSynchronizer.lookUp(for:)`) would keep the record from being found again
@@ -249,7 +253,7 @@ extension CloudKitLocalEntity {
             _ = CloudKitLocalEntity(id: recordName, localId: localId, context: context)
             return (true, nil)
         }
-        guard isNamedAfterIdentity, entry.id != recordName else { return (entry.id == recordName, nil) }
+        guard replacingOwnRecord, entry.id != recordName else { return (entry.id == recordName, nil) }
 
         stale.forEach(context.delete)
         let previousId = entry.id

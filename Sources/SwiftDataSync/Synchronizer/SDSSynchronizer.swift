@@ -185,9 +185,16 @@ public final class SDSSynchronizer: Sendable {
         var isRecoveringVanishedObjects = false
         /// What the save of a download's page changes, until it's done, see `repairInterruptedPageSave()`.
         var interruptedPageSave: PageSave?
-        /// How often a catch-up couldn't store every record, see `maximumCatchUpAttempts`.
-        var catchUpAttempts: Int?
+        /// How often the catch-up of the keys couldn't store every record, see `maximumCatchUpAttempts`.
+        var incompleteCatchUp: IncompleteCatchUp?
         
+        /// See `incompleteCatchUp`.
+        struct IncompleteCatchUp: Codable, Sendable, Equatable {
+            /// See `CatchUp.newKeys`. A catch-up of other keys, e.g. after another update, counts anew.
+            var newKeys: Set<String>
+            var count: Int
+        }
+
         /// The local entities a page creates for the objects it inserts, by the URIs of the objects, and the records it deletes.
         struct PageSave: Codable, Sendable, Equatable {
             var createdLocalIds: [String]
@@ -310,9 +317,12 @@ public final class SDSSynchronizer: Sendable {
     }
     
     /// See `hasDownloadedOnce`. Not until this launch checked the account, which could have changed while the app wasn't
-    /// running, and not after it changed until it's checked again.
+    /// running, not after it changed until it's checked again, and not while every record is downloaded again after objects
+    /// vanished, see `backfill(onlyUntracked:)`.
     var hasDownloadedOnceFlag: Bool {
-        mutableState.withLock { $0.fileState.downloadedOnceUserRecordName != nil && !$0.accountNeedsCheck }
+        mutableState.withLock { state in
+            state.fileState.downloadedOnceUserRecordName != nil && !state.accountNeedsCheck && !state.fileState.isRecoveringVanishedObjects
+        }
     }
     
     /// Whether the file state existed when the synchronizer was made, or was written since.
@@ -869,9 +879,9 @@ public final class SDSSynchronizer: Sendable {
     ///
     /// Synchronizing stops (like `stop()`, without showing it), and starts again with `start()`. That synchronization
     /// downloads everything, and uploads the local objects iCloud doesn't have, like a new device would (see
-    /// `backfill(onlyUntracked:)`), so `hasDownloadedOnce` is `false` until it's done. Local objects without an identity are
-    /// matched with their records by their values first, as after objects vanished (see `SDSContentIndex`), so they aren't
-    /// duplicated. Local copies of other users' shares are removed, and downloaded again.
+    /// `backfill(onlyUntracked:)`), so `hasDownloadedOnce` is `false` until it's done. Local objects without an identity, or
+    /// without all of its values, are matched with their records by their values first, as after objects vanished (see
+    /// `SDSContentIndex`), so they aren't duplicated. Local copies of other users' shares are removed, and downloaded again.
     ///
     /// Throws if the data couldn't be forgotten, which then stays as it is, apart from the changes of `beforeForgetting`, and
     /// local copies of other users' shares that were removed already, which are downloaded again once a reset succeeds.
@@ -946,7 +956,10 @@ public final class SDSSynchronizer: Sendable {
             state.lastCompletedUpload = nil
             state.lastCompletedDownload = nil
             state.acceptedShareZones = [:]
-            // A pending catch-up is kept, as records of older versions still lack its keys
+            // A pending catch-up is kept, as records of older versions still lack its keys. It starts over, as the updates
+            // its earlier tries queued were forgotten.
+            state.catchUp?.recordsLeft = nil
+            state.catchUp?.retryDate = nil
             state.serverRecordsOfConflicts = [:]
             state.quarantine = SDSRecordQuarantine()
             state.lastRecordFailure = nil
@@ -1207,7 +1220,16 @@ public final class SDSSynchronizer: Sendable {
     func finishCatchUp(_ catchUp: CatchUp) {
         storeSynchronizedKeys(catchUp.keys)
         mutableState.withLock { $0.catchUp = nil }
-        updateFileState { $0.catchUpAttempts = nil }
+        updateFileState { $0.incompleteCatchUp = nil }
+    }
+
+    /// A pending catch-up starts over, rather than only uploading the values of the records an earlier try couldn't store:
+    /// the updates the earlier tries queued were forgotten, e.g. by a reset.
+    func restartCatchUp() {
+        mutableState.withLock { state in
+            state.catchUp?.recordsLeft = nil
+            state.catchUp?.retryDate = nil
+        }
     }
     
     /// - Parameter recordsLeft: See `CatchUp.recordsLeft`, `nil` to leave it as it is.
@@ -1220,14 +1242,15 @@ public final class SDSSynchronizer: Sendable {
         }
     }
 
-    /// Counts a catch-up that couldn't store every record, and returns how often that happened, also in earlier processes.
-    func countIncompleteCatchUp() -> Int {
-        var attempts = 0
+    /// Counts a catch-up that couldn't store every record, and returns how often that happened for its keys, also in earlier
+    /// processes.
+    func countIncompleteCatchUp(_ catchUp: CatchUp) -> Int {
+        var count = 0
         updateFileState { state in
-            attempts = (state.catchUpAttempts ?? 0) + 1
-            state.catchUpAttempts = attempts
+            count = (state.incompleteCatchUp.flatMap { $0.newKeys == catchUp.newKeys ? $0.count : nil } ?? 0) + 1
+            state.incompleteCatchUp = .init(newKeys: catchUp.newKeys, count: count)
         }
-        return attempts
+        return count
     }
     
     /// A record's changes that weren't uploaded yet: the keys that changed locally, the ones with backfilled values (see
