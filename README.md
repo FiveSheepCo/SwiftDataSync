@@ -43,8 +43,9 @@ download where it was.
 
 `hasDownloadedOnce` tells whether the user's data was downloaded completely at least once with the current iCloud account,
 e.g. to tell data that isn't there yet from data that was deleted. After each launch it's `false` until the account was
-checked, as it can change while the app isn't running, and again after it changed until it's checked. A download that was
-interrupted doesn't count.
+checked, as it can change while the app isn't running, and again after it changed until it's checked. It's also `false`
+after `resetSyncData()`, and after the store's objects vanished, e.g. as it was lost or rebuilt, until every record was
+downloaded again. A download that was interrupted doesn't count.
 
 Models that were saved while nothing observed the store, e.g. before `setup`, before the app adopted SwiftDataSync, or by a
 process without it, are uploaded too: the first synchronization after `setup` looks for models without records and queues

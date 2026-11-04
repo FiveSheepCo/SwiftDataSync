@@ -80,6 +80,36 @@ struct SixthReviewScenarioTests {
         device.terminate()
     }
 
+    /// A model without an identity changes after a reset, and the download that would match it with its record fails.
+    /// Nothing is uploaded until every record was downloaded again, rather than the model being uploaded as a new record.
+    @Test func nothingIsUploadedWhileRecoveringIfTheDownloadFails() async throws {
+        let server = FakeCloudServer()
+        let device = TestDevice("A", server: server)
+        try await device.launch()
+        try device.change { context in
+            context.insert(ScenarioNote(text: "n1"))
+            context.insert(ScenarioNote(text: "n2"))
+        }
+        await device.settle()
+
+        device.synchronizer.stop()
+        try await device.synchronizer.resetSyncData()
+        for text in ["n1 edited", "n1"] {
+            try device.change { context in
+                let note = try #require(try context.fetch(FetchDescriptor<ScenarioNote>()).first { $0.text.hasPrefix("n1") })
+                note.text = text
+            }
+        }
+        server.failNextFetch(with: CKError(.networkFailure))
+        device.synchronizer.start()
+        await device.settle()
+        await device.sync()
+
+        #expect(device.serverNotes() == ["n1", "n2"])
+        #expect(try device.notes() == ["n1", "n2"])
+        device.terminate()
+    }
+
     /// While every record is downloaded again, the store's data isn't complete yet.
     @Test func notDownloadedOnceWhileRecovering() async throws {
         let device = TestDevice("A", server: FakeCloudServer())
@@ -159,6 +189,60 @@ struct SixthReviewScenarioTests {
         #expect(names == [subscriptionRecordName("s1"), subscriptionRecordName("s2")])
         #expect(server.events(of: "A", .modifyRecords).dropFirst(savesBefore).allSatisfy { $0.deletedNames.isEmpty })
         #expect(device.serverSubscriptions().map(\.title) == ["Was s2", "Was s1"])
+        device.terminate()
+    }
+
+    /// A save swaps the identities of more models than are stored in one batch. Models whose identities another model of
+    /// another batch takes keep their records too.
+    @Test func identitiesSwappedAcrossBatchesKeepTheirRecords() async throws {
+        let server = FakeCloudServer()
+        let device = TestDevice("A", server: server)
+        try await device.launch()
+        let feedLinks = (0..<1_000).map { String(format: "s%04d", $0) }
+        try device.insertSubscriptions(feedLinks)
+        await device.sync()
+        let savesBefore = server.events(of: "A", .modifyRecords).count
+
+        try device.change { context in
+            // Each model takes the identity of its partner from the other end, so the models of many pairs are in different batches
+            let subscriptions = try context.fetch(FetchDescriptor<ScenarioSubscription>()).sorted { $0.feedLink < $1.feedLink }
+            let partners = subscriptions.reversed().map(\.feedLink)
+            for (subscription, partner) in zip(subscriptions, partners) {
+                subscription.title = "Was \(subscription.feedLink)"
+                subscription.feedLink = partner
+            }
+        }
+        await device.sync()
+
+        let names = Set(server.records(account: "first").filter { $0.recordType == "ScenarioSubscription" }.map(\.recordID.recordName))
+        #expect(names == Set(feedLinks.map(subscriptionRecordName)))
+        #expect(server.events(of: "A", .modifyRecords).dropFirst(savesBefore).allSatisfy { $0.deletedNames.isEmpty })
+        device.terminate()
+    }
+
+    /// A model is deleted, and another one moves to its identity before the deletion was uploaded. It takes the deleted
+    /// model's record, rather than moving to a random name and both records being deleted.
+    @Test func modelMovingToTheIdentityOfADeletedOneTakesItsRecord() async throws {
+        let server = FakeCloudServer()
+        let device = TestDevice("A", server: server)
+        try await device.launch()
+        try device.insertSubscriptions(["s1", "s2"])
+        await device.sync()
+
+        try device.change { context in
+            let subscriptions = try context.fetch(FetchDescriptor<ScenarioSubscription>())
+            for subscription in subscriptions where subscription.feedLink == "s1" {
+                context.delete(subscription)
+            }
+            for subscription in subscriptions where subscription.feedLink == "s2" {
+                subscription.feedLink = "s1"
+            }
+        }
+        await device.sync()
+
+        let names = Set(server.records(account: "first").filter { $0.recordType == "ScenarioSubscription" }.map(\.recordID.recordName))
+        #expect(names == [subscriptionRecordName("s1")])
+        #expect(server.record(named: subscriptionRecordName("s1"), account: "first")?["title"] as? String == "Title of s2")
         device.terminate()
     }
 

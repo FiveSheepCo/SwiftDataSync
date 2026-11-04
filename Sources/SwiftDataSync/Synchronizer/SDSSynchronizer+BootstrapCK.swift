@@ -296,9 +296,11 @@ extension SDSSynchronizer {
             var sharedDownloadError: (any Error)?
             do {
                 sharedDownloadError = try await download(refreshingSharedZones: !didRefreshSharedZones)
-            } catch let error where Self.allowsUploading(after: error) {
+            } catch let error where Self.allowsUploading(after: error) && !isRecoveringVanishedObjects {
                 // A download that keeps failing mustn't keep the changes from being uploaded. Edits are only uploaded for
                 // records that still exist, as one that was deleted elsewhere would be created again as a partial record.
+                // Not while every record is downloaded again, e.g. after a reset: local objects can be copies of records
+                // that weren't downloaded yet, which are matched by their values, see `SDSContentIndex`.
                 logger.error("Failed to download, uploading anyway: \(error.localizedDescription)")
                 downloadError = error
             }

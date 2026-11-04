@@ -58,6 +58,11 @@ extension SDSSynchronizer {
             }
         }
 
+        // The names models moved away from, which are deleted once every batch is stored, unless another model of these
+        // changes took them, also one of another batch
+        var vacatedIds: [(id: String, zoneId: CKRecordZone.ID?)] = []
+        var assignedIds: Set<String> = []
+
         for start in stride(from: 0, to: changes.count, by: batchSize) {
             let batch = Array(changes[start ..< min(start + batchSize, changes.count)])
 
@@ -70,8 +75,6 @@ extension SDSSynchronizer {
             var takenIds = CloudKitLocalEntity.existingIds(identityNames, in: context)
             // Names whose models were deleted, which wasn't uploaded yet, see below
             var removedIds = Set(context.metadataEntries(of: "CloudKitRemoval", withIds: identityNames).compactMap { $0.value(forKey: "id") as? String })
-            // Names that models moved away from in this batch. The ones other models took are kept, see below.
-            var vacatedIds: Set<String> = []
 
             var zonesByRoot: [String: CKRecordZone.ID?] = [:]
             let zone = { (rootLocalId: String?) -> CKRecordZone.ID? in
@@ -96,6 +99,19 @@ extension SDSSynchronizer {
                 let id: String
                 var previousId: String?
                 if change.identityChanged {
+                    if
+                        let name = change.identityRecordName,
+                        removedIds.contains(name),
+                        let stale = CloudKitLocalEntity.entry(forId: name, in: context),
+                        stale.localId != change.localId
+                    {
+                        // The model of the identity was deleted, which wasn't uploaded yet. This one takes its record, like
+                        // a model created again with it (see below), rather than moving to a random name.
+                        logger.log("Giving `\(name)` to a model that moved to the identity of a deleted one")
+                        context.delete(stale)
+                        context.metadataEntries(of: "CloudKitRemoval", withIds: [name]).forEach(context.delete)
+                        removedIds.remove(name)
+                    }
                     // Rare, so it's done like for a single change
                     (id, previousId) = CloudKitLocalEntity.recordId(
                         forLocalId: change.localId,
@@ -106,9 +122,6 @@ extension SDSSynchronizer {
                         in: context
                     )
                     entries[change.localId] = CloudKitLocalEntity.entry(forLocalId: change.localId, in: context)
-                    if let previousId {
-                        vacatedIds.insert(previousId)
-                    }
                     if previousId != nil && removedIds.contains(id) {
                         // E.g. the identity changed back before its move was uploaded. The record is kept, rather than deleted,
                         // as its removal would win over the upload.
@@ -150,13 +163,9 @@ extension SDSSynchronizer {
                 }
                 takenIds.insert(id)
                 vacating.remove(id)
+                assignedIds.insert(id)
 
                 stored.append((change, id, previousId, zoneId))
-            }
-            // E.g. two models swap their identities, or one takes the identity another gave up: the record stays for it
-            let reclaimedIds = vacatedIds.intersection(stored.map(\.id))
-            for id in reclaimedIds {
-                logger.log("Giving `\(id)` to a model of the same save, as the one that had it moved away from it")
             }
 
             var updates = CloudKitUpdate.find(ids: stored.map(\.id), in: context)
@@ -165,15 +174,13 @@ extension SDSSynchronizer {
                 // Keys whose values are of unknown age
                 var unchangedKeys: [String] = []
                 if let previousId {
-                    // An identity value changed: the record of the old values is deleted, unless another model took it, and
-                    // the object uploaded as a new record
+                    // An identity value changed: the record of the old values is deleted, unless another model takes it (see
+                    // below), and the object uploaded as a new record
                     logger.log("Moving `\(previousId)` to `\(id)`, as its identity changed")
                     // Values of unknown age stay so, e.g. of an object saved before synchronizing started, and mustn't
                     // overwrite a record of the new identity
                     let previouslyBackfilled = Set(CloudKitUpdate.find(ids: [previousId], in: context)[previousId]?.backfilledKeys ?? [])
-                    if !reclaimedIds.contains(previousId) {
-                        setRemoval(id: previousId, zoneId: zoneId)
-                    }
+                    vacatedIds.append((previousId, zoneId))
                     keys = change.allKeys.filter { !previouslyBackfilled.contains($0) || change.changedKeys.contains($0) }
                     unchangedKeys = change.allKeys.filter { !keys.contains($0) }
                 } else if !hadRecord.contains(change.localId) && !change.allKeys.isEmpty {
@@ -202,6 +209,15 @@ extension SDSSynchronizer {
                     update.sharedZone = CloudKitZone.getZone(with: zoneId, context: context)
                 }
             }
+        }
+
+        // E.g. two models swap their identities, or one takes the identity another gave up: the record stays for it
+        for (id, zoneId) in vacatedIds {
+            guard !assignedIds.contains(id) else {
+                logger.log("Giving `\(id)` to another model of the same changes, as the one that had it moved away from it")
+                continue
+            }
+            setRemoval(id: id, zoneId: zoneId)
         }
     }
 }
