@@ -201,20 +201,15 @@ extension SDSSynchronizer {
     
     /// Removes the local copies of other users' shares, like `removeLocalCopy(of:)`, e.g. as they were shared with another account.
     func removeLocalCopiesOfOtherUsersShares() throws {
-        for root in otherUsersSharedRoots() {
-            try removeLocalCopy(of: root)
-        }
-    }
-
-    /// The local root objects of other users' shares.
-    func otherUsersSharedRoots() -> [SDSSynchronizableContainer] {
         let context = self.context
         let sharedRootIds: [String] = context.performAndWait {
             ((try? context.fetch(CloudKitShare.fetchRequest())) ?? []).compactMap { entry in
                 entry.share?.isSharedByOtherUser == true ? entry.id : nil
             }
         }
-        return sharedRootIds.compactMap(find(for:))
+        for root in sharedRootIds.compactMap(find(for:)) {
+            try removeLocalCopy(of: root)
+        }
     }
 
     /// Removes a shared root object and the synced objects below it locally, without uploading the deletion.

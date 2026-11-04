@@ -76,8 +76,8 @@ extension SDSSynchronizer {
         if let catchUp, !isAppExtension, catchUp.retryDate.map({ $0 <= .now }) ?? true {
             try checkNotStopped()
             logger.log("More models or keys are synchronized than before, catching up on them")
-            func catchUpLater() {
-                postponeCatchUp(until: .now.addingTimeInterval(catchUpRetryDelay))
+            func catchUpLater(recordsLeft: Set<String>? = nil) {
+                postponeCatchUp(until: .now.addingTimeInterval(catchUpRetryDelay), recordsLeft: recordsLeft)
                 // Nothing else might start a synchronization by then
                 startTask(at: \.catchUpRetry) {
                     try? await Task.sleep(for: .seconds(catchUpRetryDelay))
@@ -97,13 +97,21 @@ extension SDSSynchronizer {
                 // Until then, downloads leave them alone, as they're local changes. The upload follows this download.
                 // Records that couldn't be stored might have the keys already, which the local values mustn't overwrite.
                 let skipped = takeRecordsSkippedWhileCatchingUp()
-                try uploadLocalObjects(keysByEntity: keysByEntity(catchUp.newKeys), skippingRecordNames: Set(skipped.keys))
-                if skipped.values.contains(true) {
+                if let recordsLeft = catchUp.recordsLeft {
+                    // The other objects' values were uploaded by an earlier try
+                    try uploadLocalObjects(keysByEntity: keysByEntity(catchUp.newKeys), onlyRecordNames: recordsLeft.subtracting(skipped.keys))
+                } else {
+                    try uploadLocalObjects(keysByEntity: keysByEntity(catchUp.newKeys), skippingRecordNames: Set(skipped.keys))
+                }
+                if skipped.values.contains(true) && countIncompleteCatchUp() < Self.maximumCatchUpAttempts {
                     // Their records might lack the keys, which would clear the local values once caught up. Downloads leave
                     // the keys alone until the catch-up is done.
                     logger.log("Couldn't catch up on \(skipped.count) records, catching up again later")
-                    catchUpLater()
+                    catchUpLater(recordsLeft: Set(skipped.keys))
                 } else {
+                    if !skipped.isEmpty {
+                        logger.error("Caught up without \(skipped.count) records that couldn't be stored: \(skipped.keys.sorted())")
+                    }
                     finishCatchUp(catchUp)
                 }
             } catch let error where !(error is StoppedError || error is AccountChangedError || error is SDSSyncLease.UnavailableError || Self.isNotAuthenticated(error)) {
@@ -729,7 +737,8 @@ private final class CKDownloadHandler {
     /// Keeps a record that can't be stored as it is for later downloads, see `setAsideRecords`.
     private func setAside(_ record: CKRecord) {
         guard heldRecords != nil else {
-            synchronizer.skippedWhileCatchingUp(record.recordID.recordName)
+            // E.g. it lacks a required value, which trying again doesn't change. Once it changes, a download stores it.
+            synchronizer.skippedWhileCatchingUp(record.recordID.recordName, isTriedAgain: false)
             return
         }
         setAsideRecords.removeAll { $0.recordID == record.recordID }
