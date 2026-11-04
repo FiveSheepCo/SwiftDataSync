@@ -154,7 +154,8 @@ extension SDSSynchronizer {
         // URIs look like `x-coredata://<store>/<entity>/p<number>`.
         let vanished = localIds.filter { localId in
             guard let components = URL(string: localId)?.pathComponents, components.count >= 2 else { return false }
-            return synchronizedEntities.contains(components[1])
+            // Not ones that were deleted, whose removals are about to be stored, see `isDeletionPending(localId:)`
+            return synchronizedEntities.contains(components[1]) && !isDeletionPending(localId: localId)
         }
         guard !vanished.isEmpty else { return 0 }
 

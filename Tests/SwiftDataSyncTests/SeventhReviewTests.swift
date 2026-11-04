@@ -125,6 +125,65 @@ struct SeventhReviewScenarioTests {
         device.terminate()
     }
 
+    /// A backfill runs while the app saves a deletion, before the synchronizer stores it, e.g. as another observer of the save
+    /// runs first. The deleted model isn't taken for one that vanished, which forgot its record, so the deletion is uploaded.
+    @Test func backfillDoesntTakeADeletedModelForVanished() async throws {
+        let server = FakeCloudServer()
+        let device = TestDevice("A", server: server)
+        let observer = ObserverToken()
+        device.beforeSetup = { synchronizer in
+            let token = NotificationCenter.default.addObserver(forName: .NSManagedObjectContextDidSave, object: nil, queue: nil) { notification in
+                guard
+                    let saving = notification.object as? NSManagedObjectContext,
+                    let updateContext = synchronizer.observedUpdateContext,
+                    saving !== updateContext,
+                    saving.persistentStoreCoordinator === updateContext.persistentStoreCoordinator,
+                    let deleted = notification.userInfo?[NSDeletedObjectsKey] as? Set<NSManagedObject>, !deleted.isEmpty
+                else { return }
+                try? synchronizer.backfill(onlyUntracked: true)
+            }
+            observer.token = token
+        }
+        try await device.launch()
+        try device.insertSubscriptions(["s1", "s2"])
+        await device.sync()
+
+        try device.deleteSubscription("s1")
+        await device.sync()
+        await device.sync()
+        observer.token.map(NotificationCenter.default.removeObserver)
+
+        #expect(device.serverSubscriptions().map(\.feedLink) == ["s2"])
+        #expect(try device.subscriptions().map(\.feedLink) == ["s2"])
+        device.terminate()
+    }
+
+    /// A save that deletes a model fails, so the model stays. Downloads still apply other devices' changes of its record.
+    @Test func aDeletionThatWasntSavedDoesntKeepDownloadsAway() async throws {
+        let server = FakeCloudServer()
+        let device = TestDevice("A", server: server)
+        try await device.launch()
+        try device.insertSubscriptions(["s1", "s2"])
+        await device.sync()
+
+        // Like a save whose deletion was read when it started, and that failed
+        let synchronizer = try #require(device.synchronizer)
+        let context = try #require(synchronizer.observedUpdateContext)
+        let deletion = try context.performAndWait {
+            let model = try #require(try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "ScenarioSubscription")).first { ($0.value(forKey: "feedLink") as? String) == "s1" })
+            return (model.objectID, SDSObjectDeletion(localId: model.objectID.uriRepresentation().absoluteString, sharableRootLocalId: nil, isSharable: false))
+        }
+        let failedContext = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        synchronizer.rememberDeletionsBeingSaved([deletion.0: deletion.1], by: failedContext)
+
+        server.seed([subscriptionRecord("s1", title: "Edited elsewhere")], account: "first")
+        await device.sync()
+
+        #expect(try device.subscription("s1")?.title == "Edited elsewhere")
+        _ = failedContext
+        device.terminate()
+    }
+
     /// The app deletes models in saves on a queue that also handles the synchronizer's saves. Its saves don't wait for the
     /// synchronizer's queue, which would wait for the app's.
     @Test func deletingDoesntWaitForTheSynchronizer() async throws {
