@@ -238,9 +238,27 @@ extension SDSSynchronizer {
     /// Every record was downloaded again after objects vanished, which gave the copies of the vanished objects their
     /// records. The objects without records left are queued with the next synchronization, see `backfill(onlyUntracked:)`.
     func finishRecoveringVanishedObjects() {
-        updateFileState { $0.isRecoveringVanishedObjects = false }
+        updateFileState { state in
+            state.isRecoveringVanishedObjects = false
+            state.incompleteRecoveries = nil
+        }
         mutableStateNeedsBackfill()
         requestSynchronization()
+    }
+
+    /// How many downloads of every record can have failed records before recovering vanished objects ends anyway, see
+    /// `download(refreshingSharedZones:)`.
+    static let maximumIncompleteRecoveries = 3
+
+    /// Counts a download of every record, while recovering vanished objects, that couldn't download every record, and
+    /// returns how many there were, also in earlier processes.
+    func countIncompleteRecovery() -> Int {
+        var count = 0
+        updateFileState { state in
+            count = (state.incompleteRecoveries ?? 0) + 1
+            state.incompleteRecoveries = count
+        }
+        return count
     }
 
     /// Uploads keys of every local object of the entities, e.g. the keys that a catch-up added, which records don't have yet.

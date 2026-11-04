@@ -185,6 +185,8 @@ public final class SDSSynchronizer: Sendable {
         var needsFullBackfill = false
         /// Whether objects vanished, and every record is downloaded again, see `backfill(onlyUntracked:)`.
         var isRecoveringVanishedObjects = false
+        /// How many downloads while recovering couldn't download every record, see `countIncompleteRecovery()`.
+        var incompleteRecoveries: Int?
         /// What the save of a download's page changes, until it's done, see `repairInterruptedPageSave()`.
         var interruptedPageSave: PageSave?
         /// How often the catch-up of the keys couldn't store every record, see `maximumCatchUpAttempts`.
