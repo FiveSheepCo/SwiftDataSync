@@ -1328,7 +1328,6 @@ private final class CKDownloadHandler {
             }
             synchronizer.logger.log("Succeeded trying to fix save errors. Trying to save again.")
         }
-        pageRecords = [:]
         // Objects that fixing the save deleted, e.g. ones a deleted object cascaded to, don't keep their local entities, which
         // would be taken for objects that vanished
         let createdLocalIds = syncContext.performAndWaitUnchecked { createdLocalEntities.map(\.localId) }
@@ -1340,11 +1339,22 @@ private final class CKDownloadHandler {
         }
         // The objects are saved, so their local entities stay if a later step fails, rather than the records being inserted
         // again as duplicates, see `discardDownload`
-        syncContext.performAndWaitUnchecked {
-            createdLocalEntities.filter { unsavedLocalIds.contains($0.localId) }.forEach(syncContext.delete)
+        let unsavedRecordNames: [String] = syncContext.performAndWaitUnchecked {
+            let unsaved = createdLocalEntities.filter { unsavedLocalIds.contains($0.localId) }
+            let names = unsaved.map(\.id)
+            unsaved.forEach(syncContext.delete)
             synchronizer.removeAllTemporaryObjects()
             createdLocalEntities = []
+            return names
         }
+        // Their records are kept for later downloads too, like the one whose object couldn't be saved, rather than the change
+        // token moving past them
+        for name in unsavedRecordNames {
+            if let record = pageRecords[name] {
+                setAside(record)
+            }
+        }
+        pageRecords = [:]
         
         // Held records are kept in files before the token moves past them. Files of records that were stored meanwhile are
         // only removed now that the objects are saved.
