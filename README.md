@@ -30,7 +30,8 @@ Saves of the observed store are recorded as pending changes, and synchronized sh
 device deleted is discarded with the deletion, rather than uploaded as a partial record. Local changes that weren't
 uploaded yet still win over downloaded values of the same keys. A model created on this device keeps its record, though:
 e.g. after unsubscribing and subscribing again, the earlier deletion doesn't delete the new subscription. If the download
-fails, the changes are uploaded anyway, edits only of records that still exist.
+fails, the changes are uploaded anyway, edits only of records that still exist, except while every record is downloaded
+again, e.g. after `resetSyncData()`: local models can be copies of records that weren't downloaded yet.
 
 Downloads are saved page by page, together with their change token. A long first download, e.g. on a new device, doesn't
 keep every record in memory, and continues where it was if the app is suspended or terminated meanwhile. Records that

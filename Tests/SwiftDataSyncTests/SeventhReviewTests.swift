@@ -90,12 +90,14 @@ struct SeventhReviewScenarioTests {
         device.terminate()
     }
 
-    /// The app deletes a model, and a download forgets its local entity before the deletion is stored, e.g. as it
-    /// downloads the record. The deletion is still uploaded, with the record it had when the save started.
-    @Test func deletionIsUploadedAlsoIfADownloadForgetsTheRecordFirst() async throws {
+    /// The app deletes a model, and a download runs before the synchronizer stores the deletion, e.g. as another observer of
+    /// the save runs first. The download leaves the record alone, rather than taking the model for gone and inserting it
+    /// again, so the deletion is uploaded.
+    @Test func downloadsLeaveARecordAloneWhileItsDeletionIsStored() async throws {
         let server = FakeCloudServer()
         let device = TestDevice("A", server: server)
         let observer = ObserverToken()
+        let wasRemoved = ObserverToken()
         device.beforeSetup = { synchronizer in
             let token = NotificationCenter.default.addObserver(forName: .NSManagedObjectContextDidSave, object: nil, queue: nil) { notification in
                 guard
@@ -105,15 +107,8 @@ struct SeventhReviewScenarioTests {
                     saving.persistentStoreCoordinator === updateContext.persistentStoreCoordinator,
                     let deleted = notification.userInfo?[NSDeletedObjectsKey] as? Set<NSManagedObject>, !deleted.isEmpty
                 else { return }
-                // Like a download that finds the record's object gone, and forgets its local entity
-                let localIds = deleted.map { $0.objectID.uriRepresentation().absoluteString }
-                synchronizer.context.performAndWait {
-                    for entity in (try? synchronizer.context.fetch(NSFetchRequest<NSManagedObject>(entityName: "CloudKitLocalEntity"))) ?? []
-                    where localIds.contains(entity.value(forKey: "localId") as? String ?? "") {
-                        synchronizer.context.delete(entity)
-                    }
-                    try? synchronizer.context.save()
-                }
+                // What a download that receives the record now asks
+                wasRemoved.token = synchronizer.pendingLocalChange(of: subscriptionRecordName("s1")).isRemoved as NSNumber
             }
             observer.token = token
         }
@@ -125,7 +120,36 @@ struct SeventhReviewScenarioTests {
         await device.sync()
         observer.token.map(NotificationCenter.default.removeObserver)
 
+        #expect((wasRemoved.token as? NSNumber)?.boolValue == true)
         #expect(device.serverSubscriptions().map(\.feedLink) == ["s2"])
+        device.terminate()
+    }
+
+    /// The app deletes models in saves on a queue that also handles the synchronizer's saves. Its saves don't wait for the
+    /// synchronizer's queue, which would wait for the app's.
+    @Test func deletingDoesntWaitForTheSynchronizer() async throws {
+        let server = FakeCloudServer()
+        let device = TestDevice("A", server: server)
+        try await device.launch()
+        try device.insertSubscriptions(["s1", "s2"])
+        await device.sync()
+
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        let synchronizerContext = device.synchronizer.context
+        let token = NotificationCenter.default.addObserver(forName: .NSManagedObjectContextDidSave, object: synchronizerContext, queue: queue) { _ in }
+        let done = ObserverToken()
+        queue.addOperation {
+            try? device.deleteSubscription("s1")
+            try? device.deleteSubscription("s2")
+            done.token = true as NSNumber
+        }
+        for _ in 0..<500 where done.token == nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        NotificationCenter.default.removeObserver(token)
+
+        #expect(done.token != nil)
         device.terminate()
     }
 

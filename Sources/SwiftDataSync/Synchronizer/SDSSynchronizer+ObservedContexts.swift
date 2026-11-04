@@ -24,9 +24,6 @@ struct SDSObjectChange: Sendable {
 struct SDSObjectDeletion: Sendable {
     /// The URI of the object's ID.
     let localId: String
-    /// The record of the object when its save started. A download can forget the object's local entity before the deletion
-    /// is stored, e.g. as it downloads the record, see `storeRemovals(_:)`.
-    var recordId: String? = nil
     /// See `SDSSynchronizableContainer.sharableRootLocalId`.
     let sharableRootLocalId: String?
     let isSharable: Bool
@@ -114,15 +111,7 @@ extension SDSSynchronizer {
                 isSharable: deleted is SDSSharableContainer
             )
         }
-        if !deletions.isEmpty {
-            let syncContext = self.context
-            let recordIds = syncContext.performAndWait {
-                CloudKitLocalEntity.entries(forLocalIds: deletions.values.map(\.localId), in: syncContext).mapValues(\.id)
-            }
-            for (objectID, deletion) in deletions {
-                deletions[objectID]?.recordId = recordIds[deletion.localId]
-            }
-        }
+        // Downloads leave their records alone until the removals are stored, see `isDeletionPending(localId:)`
         rememberDeletionsBeingSaved(deletions, by: context)
     }
     
@@ -141,7 +130,10 @@ extension SDSSynchronizer {
         }
         let readDeletions = takeDeletionsBeingSaved(by: savingContext)
         // See `resetSyncData(beforeForgetting:)`
-        guard !isForgetting else { return }
+        guard !isForgetting else {
+            finishStoringRemovals(of: Array(readDeletions.values))
+            return
+        }
         let deletions = deletedObjectIDs.compactMap { objectID -> SDSObjectDeletion? in
             // Read when the save started, while only the app deleted it: a download that saves before this runs can take in
             // the deletion, which then looks like the synchronizer's, see `saveObservedUpdateContext`
@@ -157,7 +149,7 @@ extension SDSSynchronizer {
             )
         }
         // Before the changes, so a model saved with the identity of a deleted one gets its record, see `storeUpdates`
-        storeRemovals(deletions)
+        storeRemovals(deletions, finishing: Array(readDeletions.values))
         
         // Changes that were saved are stored again, so their saved values are uploaded too, see `contextWillSave`
         let updatedObjects = (userInfo[NSUpdatedObjectsKey] as? NSSet ?? []).compactMap { $0 as? NSManagedObject }
@@ -386,14 +378,16 @@ extension SDSSynchronizer {
     }
 
     /// Stores the removals without waiting for `context`, like `setUpdates(for:)`.
-    func storeRemovals(_ deletions: [SDSObjectDeletion]) {
-        guard !deletions.isEmpty else { return }
+    /// - Parameter finishing: Deletions that downloads leave alone until now, see `isDeletionPending(localId:)`.
+    func storeRemovals(_ deletions: [SDSObjectDeletion], finishing: [SDSObjectDeletion] = []) {
+        guard !deletions.isEmpty || !finishing.isEmpty else { return }
 
         let context = self.context
         context.perform {
+            defer { self.finishStoringRemovals(of: finishing) }
             for deletion in deletions {
                 // An object without a record was never uploaded, so there's nothing to delete
-                guard let id = self.existingRecordId(forLocalId: deletion.localId) ?? deletion.recordId else { continue }
+                guard let id = self.existingRecordId(forLocalId: deletion.localId) else { continue }
                 // Read before the share is deleted, which would send the removal to the private database
                 let zoneId = self.sharedZoneId(forRootLocalId: deletion.sharableRootLocalId)
 

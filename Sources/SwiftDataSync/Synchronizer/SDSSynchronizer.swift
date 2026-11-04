@@ -130,6 +130,8 @@ public final class SDSSynchronizer: Sendable {
         /// The deletions a context is saving to the store, by object. Read when the save starts, and taken when it's done,
         /// like `keysBeingSaved`.
         var deletionsBeingSaved: [ObjectIdentifier: [NSManagedObjectID: SDSObjectDeletion]] = [:]
+        /// The URIs of objects whose deletions were saved, until their removals are stored, see `contextSaved`.
+        var removalsBeingStored: [String: Int] = [:]
         /// Records a catch-up couldn't store, and whether it's tried again for them, see `download(refreshingSharedZones:)`.
         var recordsSkippedWhileCatchingUp: [String: Bool] = [:]
     }
@@ -305,9 +307,42 @@ public final class SDSSynchronizer: Sendable {
         mutableState.withLock { $0.deletionsBeingSaved[ObjectIdentifier(context)] = deletions.isEmpty ? nil : deletions }
     }
 
-    /// Returns and forgets the deletions a context saved to the store.
+    /// Returns the deletions a context saved to the store. Downloads keep leaving their records alone until
+    /// `finishStoringRemovals(of:)`.
     func takeDeletionsBeingSaved(by context: NSManagedObjectContext) -> [NSManagedObjectID: SDSObjectDeletion] {
-        mutableState.withLock { $0.deletionsBeingSaved.removeValue(forKey: ObjectIdentifier(context)) ?? [:] }
+        mutableState.withLock { state in
+            let deletions = state.deletionsBeingSaved.removeValue(forKey: ObjectIdentifier(context)) ?? [:]
+            for deletion in deletions.values {
+                state.removalsBeingStored[deletion.localId, default: 0] += 1
+            }
+            return deletions
+        }
+    }
+
+    /// The removals of the deletions are stored, see `takeDeletionsBeingSaved(by:)`.
+    func finishStoringRemovals(of deletions: [SDSObjectDeletion]) {
+        guard !deletions.isEmpty else { return }
+        mutableState.withLock { state in
+            for deletion in deletions {
+                let count = (state.removalsBeingStored[deletion.localId] ?? 1) - 1
+                state.removalsBeingStored[deletion.localId] = count > 0 ? count : nil
+            }
+        }
+    }
+
+    /// Whether the object's deletion is being saved, or was saved, but its removal isn't stored yet. A download leaves its
+    /// record alone meanwhile, as it would otherwise take the object for gone, and insert the record's object again, see
+    /// `lookUp(for:)`. Changes of other contexts that are rolled back don't matter, as only objects that are gone are
+    /// looked for this way.
+    func isDeletionPending(localId: String) -> Bool {
+        mutableState.withLock { state in
+            state.removalsBeingStored[localId] != nil || state.deletionsBeingSaved.values.contains { $0.values.contains { $0.localId == localId } }
+        }
+    }
+
+    /// Whether `isDeletionPending(localId:)` can be true for any object.
+    var hasPendingDeletions: Bool {
+        mutableState.withLock { !$0.removalsBeingStored.isEmpty || !$0.deletionsBeingSaved.isEmpty }
     }
     
     /// Remembers that the current account's private database was downloaded completely, see `hasDownloadedOnce`.
@@ -1261,6 +1296,7 @@ public final class SDSSynchronizer: Sendable {
             let request = CloudKitRemoval.fetchRequest()
             request.predicate = NSPredicate(format: "id = %@", id)
             let isRemoved = ((try? context.count(for: request)) ?? 0) > 0
+                || (hasPendingDeletions && CloudKitLocalEntity.entry(forId: id, in: context).map { isDeletionPending(localId: $0.localId) } == true)
             let update = CloudKitUpdate.find(for: id)
             return PendingLocalChange(
                 keys: Set(update?.changedKeys ?? []),

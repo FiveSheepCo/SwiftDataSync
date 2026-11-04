@@ -560,7 +560,7 @@ private final class CKDownloadHandler {
             removalCount = synchronizer.removalCount
             pendingRemovalIds = Self.ids(of: "CloudKitRemoval", in: synchronizer.context)
         }
-        guard pendingUpdateIds.contains(id) || pendingRemovalIds.contains(id) else { return .init() }
+        guard pendingUpdateIds.contains(id) || pendingRemovalIds.contains(id) || synchronizer.hasPendingDeletions else { return .init() }
         return synchronizer.pendingLocalChange(of: id)
     }
     
