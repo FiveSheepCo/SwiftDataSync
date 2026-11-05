@@ -1568,11 +1568,7 @@ private final class CKDownloadHandler {
                 discardDownload(observedContext: observedContext)
                 return permanentIdError
             }
-            var identityMerges: [(downloaded: NSManagedObjectID, local: NSManagedObjectID)] = []
             let entitiesError: (any Error)? = syncContext.performAndWaitUnchecked {
-                // On `context`'s queue, where the app's changes are stored, so a collision is either here or not yet
-                identityMerges = mergeIdentityCollisions()
-                createdLocalEntities.removeAll { $0.isDeleted || $0.managedObjectContext == nil }
                 // Saving again after a fixed save, the entities exist already
                 var createdLocalIds = Set(createdLocalEntities.map(\.localId))
                 for (object, id) in synchronizer.temporaryObjectIds where !object.objectID.isTemporaryID {
@@ -1607,7 +1603,6 @@ private final class CKDownloadHandler {
             // Local changes are looked for right before saving, on the context's queue, so the app's saves aren't merged into
             // it in between, and one that's saved meanwhile conflicts, see `SDSDownloadMergePolicy`
             let saveError: (any Error)? = observedContext.performAndWaitUnchecked {
-                mergeObjects(identityMerges, in: observedContext)
                 hadLocalChanges = keepLocalChanges(in: observedContext) || hadLocalChanges
                 synchronizer.beforeSavingDownloadedObjects?()
                 let removals = removalsOfObjectsMovedIntoDeletedOnes(in: observedContext)
@@ -1759,71 +1754,6 @@ private final class CKDownloadHandler {
         return nil
     }
     
-    /// Gives local models that got random record names, as this download inserted objects of the same identities, the records
-    /// of their identities, see `SDSSynchronizer.identityCollisions`. The app couldn't see the downloaded object yet, so it
-    /// created the model itself. The local model's changes move to the identity's record, and win over its values like other
-    /// local changes, and the downloaded objects are merged into the models, see `mergeObjects(_:in:)`. Returns the objects
-    /// to merge. Has to be called on `context`'s queue, before the downloaded objects get their local entities.
-    private func mergeIdentityCollisions() -> [(downloaded: NSManagedObjectID, local: NSManagedObjectID)] {
-        let collisions = synchronizer.identityCollisions
-        guard !collisions.isEmpty, let store = synchronizer.observedStore else { return [] }
-        synchronizer.identityCollisions = [:]
-        let syncContext = synchronizer.context
-        var merges: [(downloaded: NSManagedObjectID, local: NSManagedObjectID)] = []
-        for (localId, recordName) in collisions {
-            // The downloaded object, which isn't saved yet, or was saved by an earlier page
-            let downloadedID = synchronizer.temporaryObject(for: recordName)?.objectID
-                ?? CloudKitLocalEntity.entry(forId: recordName, in: syncContext).flatMap { URL(string: $0.localId) }.flatMap(store.managedObjectID(forURIRepresentation:))
-            guard
-                let downloadedID,
-                let localID = URL(string: localId).flatMap(store.managedObjectID(forURIRepresentation:)),
-                downloadedID != localID
-            else { continue }
-            synchronizer.removeTemporaryObject(for: recordName)
-            let (_, previousId) = CloudKitLocalEntity.adopt(recordName: recordName, forLocalId: localId, replacingOwnRecord: true, in: syncContext)
-            if let previousId {
-                synchronizer.logger.log("[Download] Giving `\(recordName)` to the local model that was given `\(previousId)` while it was downloaded")
-                let keys = CloudKitUpdate.find(for: previousId)?.changedKeys ?? []
-                synchronizer.setRemoval(id: previousId, zoneId: nil)
-                if !keys.isEmpty {
-                    synchronizer.setUpdate(id: recordName, zoneId: nil, entityName: downloadedID.entity.name ?? "", changedKeys: keys)
-                }
-            }
-            merges.append((downloadedID, localID))
-        }
-        return merges
-    }
-
-    /// Merges downloaded objects into the local models of the same identities, see `mergeIdentityCollisions()`: the objects
-    /// related to the downloaded one are related to the local model, and the downloaded one is deleted, which isn't uploaded.
-    /// Has to be called on the queue of the observed update context.
-    private func mergeObjects(_ merges: [(downloaded: NSManagedObjectID, local: NSManagedObjectID)], in observedContext: NSManagedObjectContext) {
-        for (downloadedID, localID) in merges {
-            guard
-                let downloaded = try? observedContext.existingObject(with: downloadedID),
-                let local = try? observedContext.existingObject(with: localID),
-                !downloaded.isDeleted, !local.isDeleted
-            else { continue }
-            for (key, relationship) in downloaded.entity.relationshipsByName {
-                if relationship.isToMany {
-                    let related = (downloaded.value(forKey: key) as? NSOrderedSet)?.array ?? (downloaded.value(forKey: key) as? NSSet)?.allObjects ?? []
-                    for case let object as NSManagedObject in related {
-                        if let inverse = relationship.inverseRelationship, !inverse.isToMany {
-                            object.setValue(local, forKey: inverse.name)
-                        } else if relationship.isOrdered {
-                            local.mutableOrderedSetValue(forKey: key).add(object)
-                        } else {
-                            local.mutableSetValue(forKey: key).add(object)
-                        }
-                    }
-                } else if let object = downloaded.value(forKey: key), local.value(forKey: key) == nil {
-                    local.setValue(object, forKey: key)
-                }
-            }
-            observedContext.delete(downloaded)
-        }
-    }
-
     /// The removals of objects that delete rules delete with downloaded deletions, which this device moved into the deleted
     /// objects, e.g. a link moved into a subscription another device deleted. Other devices don't know about the move, as it
     /// wasn't uploaded, so they'd keep the object where it was, while this device deleted it. As it was moved into an object
