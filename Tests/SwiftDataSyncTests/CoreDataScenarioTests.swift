@@ -205,15 +205,35 @@ private final class CoreDataDevice: @unchecked Sendable {
             timing: .init(saveSynchronizationDelay: .milliseconds(50), routineRetryInterval: 3600)
         )
         synchronizer.setup(containerName: "iCloud.test", configuration: configuration, coordinator: coordinator)
+        // The first synchronization starts in a task, after the state is idle already, see `TestDevice.launch`
+        for _ in 0..<100 where synchronizer.startedSynchronizationCount == 0 {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
         await sync()
     }
 
+    /// Synchronizes once everything else is done, and waits until that's done too: one that's requested while another
+    /// runs follows it, rather than running now.
     func sync() async {
-        for _ in 0..<500 {
-            if !synchronizer.hasPendingSaveSync, case .idle = await synchronizer.viewModel.state { break }
+        await settle()
+        await synchronizer.synchronize()
+        await settle()
+    }
+
+    private func settle() async {
+        var idleChecks = 0
+        for _ in 0..<1000 {
+            var isBusy = synchronizer.hasPendingSaveSync
+            if !isBusy {
+                switch await synchronizer.viewModel.state {
+                case .bootstrapping, .uploading, .downloading, .processingSaveEvent, .waitingForSetup, .waitingForContainerDetection: isBusy = true
+                default: break
+                }
+            }
+            idleChecks = isBusy ? 0 : idleChecks + 1
+            if idleChecks >= 3 { return }
             try? await Task.sleep(for: .milliseconds(10))
         }
-        await synchronizer.synchronize()
     }
 
     func change(_ body: (NSManagedObjectContext) throws -> Void) throws {
