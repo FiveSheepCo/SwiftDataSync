@@ -124,6 +124,40 @@ struct SecondIndependentReviewTests {
         b.terminate()
     }
 
+    /// Device A saves large artwork, which goes into the record's overflow asset. Device B, which hasn't downloaded that,
+    /// saves a large note, which goes into the asset too. A's artwork stays in it, rather than the asset being replaced with
+    /// one of B's values only.
+    @Test func overflowAssetKeepsAnotherDevicesValues() async throws {
+        let server = FakeCloudServer()
+        server.freshRecordsConflict = false
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try await b.launch()
+        try a.insertSubscriptions(["s1"])
+        await a.sync()
+        await b.sync()
+
+        let artwork = Data(repeating: 7, count: 300_000)
+        try a.editSubscription("s1") { $0.artwork = artwork }
+        await a.sync()
+
+        // B's download fails, so it uploads without knowing A's asset
+        server.failNextFetch(with: CKError(.networkFailure))
+        let note = String(repeating: "n", count: 300_000)
+        try b.editSubscription("s1") { $0.note = note }
+        await b.settle()
+
+        await a.sync()
+        await b.sync()
+        for device in [a, b] {
+            #expect(try device.subscription("s1")?.artwork == artwork)
+            #expect(try device.subscription("s1")?.note == note)
+        }
+        a.terminate()
+        b.terminate()
+    }
+
     /// Documents below sharable workspaces, without an identity, which can't be below a sharable entity.
     private static let sharableConfiguration = SDSConfiguration(swiftDataEntities: [
         .init(entity: ScenarioSubscription.self, description: .sync(.without([]), identity: ["feedLink"])),

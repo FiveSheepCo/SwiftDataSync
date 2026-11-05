@@ -130,6 +130,13 @@ extension SDSSynchronizer {
                 skipsEditsDeletedElsewhere = true
             }
         }
+        do {
+            try await placeLargeValues(in: &round, database: database)
+        } catch {
+            // The updates are kept, so the records are uploaded with a later synchronization
+            CKAsset.removeTemporaryFiles(of: round.records)
+            throw error
+        }
         let (deletes, quarantinedDeleteCount) = round.records.isEmpty && !round.hasDeferredRecords
             ? synchronizableDeletes(sharedDatabase: sharedDatabase, maximum: maximumRecords)
             : ([], 0)
@@ -373,8 +380,11 @@ extension SDSSynchronizer {
         var insertsBackfilledValues = false
         /// The records of objects that got their records here, which aren't known to exist, see `CloudKitUpdate.isLocalInsert`.
         var localInserts: Set<String> = []
-        /// The record keys in the overflow assets of records that send their split, by name, see `SDSOverflow`.
+        /// The record keys in the overflow assets of records whose assets change, by name, see `SDSOverflow`.
         var overflowKeys: [String: Set<String>] = [:]
+        /// The records whose local values that can be large don't fit into them, which need an overflow asset, see
+        /// `placeLargeValues(in:database:)`.
+        var overflowingLocally: Set<String> = []
         /// Whether records are left for a later round, as the objects they reference only got records while they were
         /// selected, see `synchronizableUpdates(sharedDatabase:maximum:)`.
         var hasDeferredRecords = false
@@ -453,12 +463,12 @@ extension SDSSynchronizer {
                                     continue
                                 }
                                 let isLocalInsert = update.isLocalInsert
-                                if let record = try record(for: update, overflowKeys: &round.overflowKeys) {
+                                if let record = try record(for: update, overflowingLocally: &round.overflowingLocally) {
                                     guard self.queuedReferencedObjectCount == queuedReferencedObjectCount else {
                                         // It might reference an object that only got its record now, which is uploaded first, so
                                         // the reference's target exists. The update stays for a later round.
                                         CKAsset.removeTemporaryFiles(of: [record])
-                                        round.overflowKeys[record.recordID.recordName] = nil
+                                        round.overflowingLocally.remove(record.recordID.recordName)
                                         deferred = true
                                         continue
                                     }
@@ -490,8 +500,10 @@ extension SDSSynchronizer {
         }
     }
 
-    /// - Parameter overflowKeys: Gets the record keys of the record's overflow asset, if it sends them, see `SDSOverflow`.
-    private func record(for update: CloudKitUpdate, overflowKeys: inout [String: Set<String>]) throws -> CKRecord? {
+    /// The record with the object's changed values. Values that can be large are in their fields, which uploading places,
+    /// see `placeLargeValues(in:database:)`.
+    /// - Parameter overflowingLocally: Gets the record's name if the object's values that can be large don't fit into it.
+    private func record(for update: CloudKitUpdate, overflowingLocally: inout Set<String>) throws -> CKRecord? {
         let id = update.id
         let recordId = update.recordId(defaultZoneID: defaultZoneID)
         let newRecord = CKRecord(recordType: update.recordType, recordID: recordId)
@@ -511,8 +523,7 @@ extension SDSSynchronizer {
         
         let observedUpdateContext = self.observedUpdateContext!
         let entityConfiguration = configuration?.entities[update.recordType]
-        let previousOverflowKeys = self.overflowKeys(of: recordId.recordName)
-        var recordOverflowKeys: Set<String>?
+        var overflows = false
         let shouldContinue: Bool
         do {
             shouldContinue = try observedUpdateContext.performAndWaitUnchecked {
@@ -525,7 +536,6 @@ extension SDSSynchronizer {
                     return false
                 }
                 let entity = container.object.entity
-                let recordKey = { (key: String) in entity.propertiesByName[key]?.renamingIdentifier ?? key }
                 
                 // Synchronize parent, but only if parent is changed
                 if let parentKey = container.parentKey, keys.contains(parentKey) {
@@ -554,31 +564,11 @@ extension SDSSynchronizer {
                     newRecord[key] = value
                 }
                 
-                // Values too large for the record go into an asset. The split only depends on the object's values, so it's
-                // made again for every upload of a key that can be large. Only what changed is sent: keys that move into or
-                // out of the asset, changed keys that stay in it, and the asset if its keys or values changed. Unchanged keys
-                // aren't sent, which would overwrite another device's edits of them. See `SDSOverflow`.
+                // Whether the values that can be large need an overflow asset, which is placed with the server's record
                 let largeKeys = entityConfiguration.map { SDSOverflow.keys(of: $0, description: entity) } ?? []
                 if largeKeys.contains(where: syncKeys.contains) {
-                    let split = try container.overflowSplit(keys: largeKeys)
-                    let current = Set(split.overflow?.keys.map { $0 } ?? [])
-                    // Production schemas reject fields they don't have, so the field is only sent to records that need it or had it
-                    if !current.isEmpty || !previousOverflowKeys.isEmpty {
-                        let changedRecordKeys = Set(syncKeys.map(recordKey))
-                        for (key, value) in split.fields {
-                            if current.contains(key) {
-                                if changedRecordKeys.contains(key) || !previousOverflowKeys.contains(key) {
-                                    newRecord[key] = nil
-                                }
-                            } else if previousOverflowKeys.contains(key) {
-                                newRecord[key] = value
-                            }
-                        }
-                        if current != previousOverflowKeys || !current.isDisjoint(with: changedRecordKeys) {
-                            newRecord[SDSOverflow.key] = try split.overflow.map(SDSOverflow.asset(for:))
-                            recordOverflowKeys = current
-                        }
-                    }
+                    let sizes = try container.changeDictionary(for: largeKeys).mapValues { SDSOverflow.size(of: $0) }
+                    overflows = !SDSOverflow.overflowingKeys(sizes: sizes).isEmpty
                 }
                 return true
             }
@@ -592,8 +582,8 @@ extension SDSSynchronizer {
             update.delete()
             return nil
         }
-        if let recordOverflowKeys {
-            overflowKeys[recordId.recordName] = recordOverflowKeys
+        if overflows {
+            overflowingLocally.insert(recordId.recordName)
         }
         
         // A record that existed already is updated with this device's changes, see `serverRecordOfConflict`. Backfilled
@@ -635,6 +625,62 @@ extension SDSSynchronizer {
         var conflictCount = 0
         /// Records CloudKit rejected, which are uploaded later, see `SDSRecordQuarantine`.
         var rejectedCount = 0
+    }
+
+    /// Places the values that can be large into the records' fields or their overflow assets, see `SDSOverflow.place`.
+    ///
+    /// The records only carry the values that changed. One whose asset is involved, as it has one or needs one, is based on
+    /// the record in iCloud, so another device's values in the asset are kept, rather than being overwritten with this
+    /// device's, which can be older. Records that existed already when they were saved come with the server's record (see
+    /// `serverRecordOfConflict`), others are fetched, unless they're not known to exist. Throws if they can't be fetched.
+    private func placeLargeValues(in round: inout UploadRound, database: any SDSCloudDatabase) async throws {
+        guard let model = observedStore?.managedObjectModel, let configuration else { return }
+
+        var placements: [(index: Int, changedKeys: Set<String>, largeKeys: Set<String>)] = []
+        var recordIDsToFetch: [CKRecord.ID] = []
+        for (index, record) in round.records.enumerated() {
+            guard
+                let entity = configuration.entities[record.recordType],
+                let description = model.entitiesByName[record.recordType]
+            else { continue }
+            let largeKeys = Set(SDSOverflow.keys(of: entity, description: description).map { description.propertiesByName[$0]?.renamingIdentifier ?? $0 })
+            let changedKeys = largeKeys.intersection(record.changedKeys())
+            guard !changedKeys.isEmpty else { continue }
+
+            let name = record.recordID.recordName
+            let isServerRecord = record.recordChangeTag != nil
+            let hasAsset = !overflowKeys(of: name).isEmpty || (isServerRecord && record[SDSOverflow.key] != nil)
+            // Values that fit, of a record without an asset, stay in their fields
+            guard hasAsset || round.overflowingLocally.contains(name) else { continue }
+            placements.append((index, changedKeys, largeKeys))
+            if !isServerRecord && !round.localInserts.contains(name) {
+                recordIDsToFetch.append(record.recordID)
+            }
+        }
+        guard !placements.isEmpty else { return }
+
+        let serverRecords = recordIDsToFetch.isEmpty ? [:] : try await database.records(for: recordIDsToFetch, desiredKeys: nil)
+        for (index, changedKeys, largeKeys) in placements {
+            var record = round.records[index]
+            switch serverRecords[record.recordID] {
+            case .success(let serverRecord):
+                record = SDSIdentity.merging(record, into: serverRecord)
+            case .failure(let error as CKError) where error.code == .unknownItem:
+                // E.g. it was never uploaded, or deleted elsewhere, so it has no asset
+                break
+            case .failure(let error):
+                throw error
+            case nil:
+                break
+            }
+            round.overflowKeys[record.recordID.recordName] = try SDSOverflow.place(
+                changedKeys: changedKeys,
+                largeKeys: largeKeys,
+                in: record,
+                hasServerValues: record.recordChangeTag != nil
+            )
+            round.records[index] = record
+        }
     }
 
     /// Removes the updates and removals that were uploaded, and returns the progress.

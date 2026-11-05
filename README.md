@@ -153,11 +153,12 @@ SDSSynchronizer.shared.start()
 
 Records hold at most 1 MB, not counting assets. Store large data that is always large, e.g. images, as assets with
 `assetProperties`. Other texts and data that grow too large for a record, or a single value of 256 KB or more, are uploaded
-in the asset field `SDSOverflow` instead of their fields, and other devices read them like any other value. Which values
-go into the asset only depends on the model's values, so it's cleared once they fit again. Uploads only send the values
-that changed, and the asset if a value in it changed, so edits of other values on other devices stay. Two devices that
-edit two values in the same asset at the same time are the exception: the last upload of the asset wins. Only records that
-need the field or had it get it, so a production schema without it keeps working until a value grows that large:
+in the asset field `SDSOverflow` instead of their fields, and other devices read them like any other value. Uploads only
+send the values that changed. A record whose asset is involved is uploaded on top of the one in iCloud, so the values other
+devices put into the asset stay, and values that didn't change stay where they are. A changed value goes into the asset if
+it's large, or doesn't fit next to the others, and out of it once it fits. Two devices that change values in the same
+asset within the same moment are the exception: the last upload of the asset wins. Only records that need the field or had
+it get it, so a production schema without it keeps working until a value grows that large:
 `initializeSchema()` creates it for every entity with texts or data. Identity values are never moved into the asset.
 
 ## Installation
