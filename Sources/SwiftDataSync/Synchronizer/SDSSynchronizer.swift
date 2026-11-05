@@ -588,6 +588,20 @@ public final class SDSSynchronizer: Sendable {
         mutableState.withLock { $0.keysBeingSaved[ObjectIdentifier(context)] = keys }
     }
     
+    /// Whether a context is saving to the store, between `contextWillSave` and `contextSaved`.
+    func isSavingKeys(by context: NSManagedObjectContext) -> Bool {
+        mutableState.withLock { $0.keysBeingSaved[ObjectIdentifier(context)] != nil }
+    }
+
+    /// Adds keys that changed while a context saves, see `contextChangedWhileSaving`.
+    func addKeysBeingSaved(_ keys: [NSManagedObjectID: Set<String>], by context: NSManagedObjectContext) {
+        guard !keys.isEmpty else { return }
+        mutableState.withLock { state in
+            guard state.keysBeingSaved[ObjectIdentifier(context)] != nil else { return }
+            state.keysBeingSaved[ObjectIdentifier(context)]?.merge(keys) { $0.union($1) }
+        }
+    }
+
     /// Returns and forgets the synchronized keys a context saved to the store.
     func takeKeysBeingSaved(by context: NSManagedObjectContext) -> [NSManagedObjectID: Set<String>] {
         mutableState.withLock { $0.keysBeingSaved.removeValue(forKey: ObjectIdentifier(context)) ?? [:] }

@@ -107,6 +107,36 @@ nonisolated(unsafe) private let episodeInfoModel: NSManagedObjectModel = {
     return model
 }()
 
+/// Notes that count their revisions in `willSave()`, like models that stamp when they changed.
+@objc(RevisedNote)
+final class RevisedNote: NSManagedObject {
+    override func willSave() {
+        super.willSave()
+        if isUpdated && !isDeleted && changedValues()["revision"] == nil {
+            setValue((value(forKey: "revision") as? Int64 ?? 0) + 1, forKey: "revision")
+        }
+    }
+}
+
+nonisolated(unsafe) private let revisedNoteModel: NSManagedObjectModel = {
+    let note = NSEntityDescription()
+    note.name = "RevisedNote"
+    note.managedObjectClassName = "RevisedNote"
+    let text = NSAttributeDescription()
+    text.name = "text"
+    text.type = .string
+    text.isOptional = true
+    let revision = NSAttributeDescription()
+    revision.name = "revision"
+    revision.type = .integer64
+    revision.isOptional = false
+    revision.defaultValue = 0
+    note.properties = [text, revision]
+    let model = NSManagedObjectModel()
+    model.entities = [note]
+    return model
+}()
+
 /// A device whose store is a Core Data store, set up with its coordinator.
 private final class CoreDataDevice: @unchecked Sendable {
     let synchronizer: SDSSynchronizer
@@ -252,5 +282,29 @@ struct CoreDataScenarioTests {
         #expect(titles(second) == ["Second"])
         first.synchronizer.invalidate()
         second.synchronizer.invalidate()
+    }
+
+    /// A note counts its revisions in `willSave()`, which Core Data calls once the save started. The revision is uploaded with
+    /// the edit, and the next download doesn't revert it.
+    @Test func valueSetWhileSavingIsUploaded() async throws {
+        let server = FakeCloudServer()
+        let device = try await CoreDataDevice("A", server: server, model: revisedNoteModel)
+        try device.change { NSEntityDescription.insertNewObject(forEntityName: "RevisedNote", into: $0).setValue("a", forKey: "text") }
+        await device.sync()
+        try device.change { context in
+            try #require(try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "RevisedNote")).first).setValue("b", forKey: "text")
+        }
+        await device.sync()
+        await device.sync()
+
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = device.coordinator
+        let local = try context.performAndWait {
+            try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "RevisedNote")).first?.value(forKey: "revision") as? Int64
+        }
+        let remote = server.records(account: "first").first { $0.recordType == "RevisedNote" }?["revision"] as? Int64
+        #expect(local == 1)
+        #expect(remote == 1)
+        device.synchronizer.invalidate()
     }
 }
