@@ -63,4 +63,24 @@ struct IndependentReviewTests {
         // Other text still names other records
         #expect(SDSIdentity.recordName(entityName: "Feed", values: [composed]) != SDSIdentity.recordName(entityName: "Feed", values: ["Cafe"]))
     }
+
+    /// Rejected records whose time is up don't make uploads fetch more updates, and are forgotten.
+    @Test func quarantineOnlyCountsRecordsThatAreLeftOut() {
+        var quarantine = SDSRecordQuarantine()
+        let changeDate = Date(timeIntervalSinceReferenceDate: 1_000)
+        let now = Date(timeIntervalSinceReferenceDate: 2_000)
+        let later = now.addingTimeInterval(SDSRecordQuarantine.duration)
+
+        quarantine.add("a", lastChangeDate: changeDate, error: CKError(.invalidArguments), now: now)
+        #expect(quarantine.count(now: now) == 1)
+        #expect(quarantine.latestError(now: now) != nil)
+        #expect(quarantine.count(now: later) == 0)
+        #expect(quarantine.latestError(now: later) == nil)
+
+        // Adding another one forgets the first, whose time is up
+        quarantine.add("b", lastChangeDate: changeDate, now: later)
+        #expect(quarantine.count(now: now) == 1)
+        #expect(!quarantine.contains("a", lastChangeDate: changeDate, now: now))
+        #expect(quarantine.contains("b", lastChangeDate: changeDate, now: later))
+    }
 }
