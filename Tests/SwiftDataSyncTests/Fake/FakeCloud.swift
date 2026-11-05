@@ -154,6 +154,14 @@ final class FakeCloudServer: @unchecked Sendable {
     }
     private var _pageDelivered: (@Sendable (String, Int) -> Void)?
 
+    /// Called with the device and the number of the page, after a page's records were delivered and before its change token
+    /// update, which saves the page.
+    var beforePageTokenUpdate: (@Sendable (_ device: String, _ page: Int) -> Void)? {
+        get { lock.withLock { _beforePageTokenUpdate } }
+        set { lock.withLock { _beforePageTokenUpdate = newValue } }
+    }
+    private var _beforePageTokenUpdate: (@Sendable (String, Int) -> Void)?
+
     /// Makes the next download stop after this many pages and never finish, like a process that is terminated meanwhile.
     var hangDownloadAfterPages: Int? {
         get { lock.withLock { _hangDownloadAfterPages } }
@@ -733,6 +741,7 @@ final class FakeCloudServer: @unchecked Sendable {
                     pages += 1
 
                     let token = FakeChangeToken.make(.init(incarnation: snapshot.incarnation, sequence: page.last!.sequence))
+                    beforePageTokenUpdate?(device, pages)
                     operation.recordZoneChangeTokensUpdatedBlock?(zoneID, token, nil)
                     pageDelivered?(device, pages)
 

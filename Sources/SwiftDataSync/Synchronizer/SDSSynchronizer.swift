@@ -1303,7 +1303,21 @@ public final class SDSSynchronizer: Sendable {
         }
         return count
     }
-    
+
+    /// The keys that changed locally and weren't uploaded yet, like `pendingLocalChange(of:)`, of the records of many saved
+    /// objects at once, by the URIs of the objects. Objects without records or without such keys are left out.
+    func pendingLocalKeys(ofLocalIds localIds: [String]) -> [String: Set<String>] {
+        let context = self.context
+        return context.performAndWait {
+            let entries = CloudKitLocalEntity.entries(forLocalIds: localIds, in: context)
+            let updates = CloudKitUpdate.find(ids: entries.values.map(\.id), in: context)
+            return entries.compactMapValues { entry in
+                guard let keys = updates[entry.id]?.changedKeys, !keys.isEmpty else { return nil }
+                return Set(keys)
+            }
+        }
+    }
+
     /// A record's changes that weren't uploaded yet: the keys that changed locally, the ones with backfilled values (see
     /// `CloudKitUpdate.backfilledKeys`), and whether it was deleted locally.
     func pendingLocalChange(of id: String) -> PendingLocalChange {
