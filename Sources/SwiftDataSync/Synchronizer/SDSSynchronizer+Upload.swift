@@ -692,13 +692,10 @@ extension SDSSynchronizer {
                 }
 
                 observedUpdateContext.performAndWaitUnchecked {
-                    // Check parent, but only if parent is changed
-                    var expectedParentId: String? = nil
-                    if let parentKey = container.parentKey,
-                       keys.contains(parentKey),
-                       let parent = container.parent {
-                        expectedParentId = self.existingRecordId(of: parent)
-                    }
+                    // Check parent, but only if parent is changed. Otherwise the record doesn't say what the parent is: e.g. one
+                    // saved over a record that existed already keeps the server's parent, see `SDSIdentity.merging`.
+                    guard let parentKey = container.parentKey, keys.contains(parentKey) else { return }
+                    let expectedParentId = container.parent.flatMap { self.existingRecordId(of: $0) }
                     guard record.parent?.recordID.recordName == expectedParentId else {
                         logger.log("Scheduling another upload as parentId \(String(describing: expectedParentId)) does not match \(record.parent)")
                         isDone = false

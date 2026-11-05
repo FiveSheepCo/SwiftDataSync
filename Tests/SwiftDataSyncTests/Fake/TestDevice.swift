@@ -17,6 +17,7 @@ final class ScenarioSubscription {
     var addedAt: Date = Date.distantPast
     var note: String? = nil
     var artwork: Data? = nil
+    @Relationship(deleteRule: .cascade, inverse: \ScenarioLink.subscription) var links: [ScenarioLink]? = []
 
     init(feedLink: String, title: String = "", position: Int = 0) {
         self.feedLink = feedLink
@@ -36,6 +37,17 @@ final class ScenarioEpisode {
     init(feedLink: String, guid: String) {
         self.feedLink = feedLink
         self.guid = guid
+    }
+}
+
+/// A model without an identity that references a subscription, whose delete rule cascades to it.
+@Model
+final class ScenarioLink {
+    var name: String = ""
+    var subscription: ScenarioSubscription?
+
+    init(name: String) {
+        self.name = name
     }
 }
 
@@ -64,6 +76,7 @@ final class ScenarioWorkspace {
 @Model
 final class ScenarioDocument {
     var title: String = ""
+    var body: String = ""
     var workspace: ScenarioWorkspace?
 
     init(title: String) {
@@ -107,6 +120,7 @@ let scenarioConfiguration = SDSConfiguration(swiftDataEntities: [
     .init(entity: ScenarioSubscription.self, description: .sync(.without([]), identity: ["feedLink"])),
     .init(entity: ScenarioEpisode.self, description: .sync(.without([]), identity: ["feedLink", "guid"])),
     .init(entity: ScenarioNote.self, description: .sync(.without([]))),
+    .init(entity: ScenarioLink.self, description: .sync(.without([]))),
     .init(entity: ScenarioWorkspace.self, description: .sync(.without([]))),
     .init(entity: ScenarioDocument.self, description: .sync(.without([]), parentKey: "workspace", identity: ["title"]))
 ])
@@ -137,7 +151,7 @@ final class TestDevice: @unchecked Sendable {
 
     private func makeModelContainer() throws -> ModelContainer {
         try ModelContainer(
-            for: Schema([ScenarioSubscription.self, ScenarioEpisode.self, ScenarioNote.self, ScenarioWorkspace.self, ScenarioDocument.self]),
+            for: Schema([ScenarioLink.self, ScenarioSubscription.self, ScenarioEpisode.self, ScenarioNote.self, ScenarioWorkspace.self, ScenarioDocument.self]),
             configurations: ModelConfiguration(url: storeURL, cloudKitDatabase: .none)
         )
     }
