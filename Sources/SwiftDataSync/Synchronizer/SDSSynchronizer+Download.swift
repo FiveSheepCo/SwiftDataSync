@@ -381,6 +381,38 @@ extension SDSSynchronizer {
     }
 }
 
+/// Records by their IDs, in the order they were added, so every downloaded record can be looked for among the held ones
+/// without going through all of them. A record that is added again replaces its earlier version.
+private struct RecordList: Sequence {
+    private var records: [CKRecord.ID: (order: Int, record: CKRecord)] = [:]
+    private var nextOrder = 0
+
+    init(_ records: [CKRecord] = []) {
+        records.forEach { append($0) }
+    }
+
+    var count: Int { records.count }
+    var isEmpty: Bool { records.isEmpty }
+    var ids: Set<CKRecord.ID> { Set(records.keys) }
+
+    mutating func append(_ record: CKRecord) {
+        records[record.recordID] = (nextOrder, record)
+        nextOrder += 1
+    }
+
+    mutating func remove(_ recordID: CKRecord.ID) {
+        records[recordID] = nil
+    }
+
+    mutating func removeAll(where shouldBeRemoved: (CKRecord) -> Bool) {
+        records = records.filter { !shouldBeRemoved($0.value.record) }
+    }
+
+    func makeIterator() -> IndexingIterator<[CKRecord]> {
+        records.values.sorted { $0.order < $1.order }.map(\.record).makeIterator()
+    }
+}
+
 /// Stores the records of a download.
 ///
 /// What's downloaded is saved at every change token update, together with the token. A long first download thus doesn't
@@ -393,7 +425,7 @@ private final class CKDownloadHandler {
     
     /// Records that can't be stored yet, e.g. as their references weren't downloaded yet, which are tried again once the
     /// records they wait for arrived, and kept for later downloads otherwise.
-    var recordsToAddLater: [CKRecord] = []
+    private var recordsToAddLater = RecordList()
     /// The name of the record each held record waits for, so it's only tried again once that arrived. Unknown for records
     /// held by an earlier download.
     private var heldBlockers: [CKRecord.ID: String] = [:]
@@ -401,7 +433,7 @@ private final class CKDownloadHandler {
     private var storedSinceRetry: Set<String> = []
     /// Records that couldn't be stored as they are, e.g. as their overflow asset is corrupt, or their values are invalid.
     /// They're kept for later downloads, rather than discarding the download over and over.
-    private var setAsideRecords: [CKRecord] = []
+    private var setAsideRecords = RecordList()
     /// The held records whose files exist, with the change tags of the versions in the files, see `SDSHeldRecords`.
     private var persistedHeld: [CKRecord.ID: String] = [:]
     private var persistedHeldIDs: Set<CKRecord.ID> { Set(persistedHeld.keys) }
@@ -496,7 +528,7 @@ private final class CKDownloadHandler {
             let heldRecords = synchronizer.heldRecords(sharedDatabase: forSharedDatabase)
             self.heldRecords = heldRecords
             // Tried again at the first page or at the end
-            recordsToAddLater = heldRecords.load()
+            recordsToAddLater = RecordList(heldRecords.load())
             persistedHeld = Dictionary(recordsToAddLater.map { ($0.recordID, Self.version(of: $0)) }, uniquingKeysWith: { $1 })
             failedRecordIDs = heldRecords.loadFailedIDs()
             persistedFailedRecordIDs = failedRecordIDs
@@ -600,8 +632,8 @@ private final class CKDownloadHandler {
         synchronizer.logger.log("[Download] Changed: \(record)")
         context.performAndWaitUnchecked {
             // A newer version replaces the one that was held
-            recordsToAddLater.removeAll { $0.recordID == record.recordID }
-            setAsideRecords.removeAll { $0.recordID == record.recordID }
+            recordsToAddLater.remove(record.recordID)
+            setAsideRecords.remove(record.recordID)
             failedRecordIDs.remove(record.recordID)
             self._changed(record: record)
         }
@@ -782,7 +814,6 @@ private final class CKDownloadHandler {
             synchronizer.skippedWhileCatchingUp(record.recordID.recordName, isTriedAgain: false)
             return
         }
-        setAsideRecords.removeAll { $0.recordID == record.recordID }
         setAsideRecords.append(record)
     }
     
@@ -961,8 +992,8 @@ private final class CKDownloadHandler {
         }
         
         // Earlier versions that were held are gone too
-        recordsToAddLater.removeAll { $0.recordID == recordID }
-        setAsideRecords.removeAll { $0.recordID == recordID }
+        recordsToAddLater.remove(recordID)
+        setAsideRecords.remove(recordID)
         failedRecordIDs.remove(recordID)
         overflowChanges[recordID.recordName] = []
         
@@ -1050,7 +1081,7 @@ private final class CKDownloadHandler {
             storedSinceRetry = []
             guard !candidates.isEmpty else { return }
             let candidateIDs = Set(candidates.map(\.recordID))
-            recordsToAddLater.removeAll { candidateIDs.contains($0.recordID) }
+            candidateIDs.forEach { recordsToAddLater.remove($0) }
             let heldBefore = recordsToAddLater.count + candidates.count
             for record in candidates {
                 heldBlockers[record.recordID] = nil
@@ -1389,15 +1420,15 @@ private final class CKDownloadHandler {
         // only removed now that the objects are saved.
         if let heldRecords {
             // Also newer versions of records that were held already
-            for record in recordsToAddLater + setAsideRecords where persistedHeld[record.recordID] != Self.version(of: record) {
+            for record in Array(recordsToAddLater) + Array(setAsideRecords) where persistedHeld[record.recordID] != Self.version(of: record) {
                 do {
                     try heldRecords.hold(record)
                     persistedHeld[record.recordID] = Self.version(of: record)
                 } catch {
                     // E.g. its asset can't be copied. It's downloaded again instead.
                     synchronizer.logger.error("Failed to keep `\(record.recordID.recordName)`, downloading it again later: \(error.localizedDescription)")
-                    recordsToAddLater.removeAll { $0.recordID == record.recordID }
-                    setAsideRecords.removeAll { $0.recordID == record.recordID }
+                    recordsToAddLater.remove(record.recordID)
+                    setAsideRecords.remove(record.recordID)
                     failedRecordIDs.insert(record.recordID)
                 }
             }
@@ -1407,7 +1438,7 @@ private final class CKDownloadHandler {
                 synchronizer.logger.error("Failed to keep the records that failed to download: \(error.localizedDescription)")
                 return error
             }
-            let heldIDs = Set((recordsToAddLater + setAsideRecords).map(\.recordID))
+            let heldIDs = recordsToAddLater.ids.union(setAsideRecords.ids)
             for recordID in persistedHeldIDs.subtracting(heldIDs) {
                 heldRecords.release(recordID)
                 persistedHeld[recordID] = nil
