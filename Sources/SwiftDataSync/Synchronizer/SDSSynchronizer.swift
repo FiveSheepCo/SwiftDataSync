@@ -134,6 +134,8 @@ public final class SDSSynchronizer: Sendable {
         var removalsBeingStored: [String: Int] = [:]
         /// Records a catch-up couldn't store, and whether it's tried again for them, see `download(refreshingSharedZones:)`.
         var recordsSkippedWhileCatchingUp: [String: Bool] = [:]
+        /// The keys being caught up on that downloaded records had, by record name, see `noteCaughtUpKeys(_:of:)`.
+        var caughtUpKeysOfRecords: [String: Set<String>] = [:]
     }
     private let mutableState = OSAllocatedUnfairLock(initialState: MutableState())
     
@@ -294,6 +296,20 @@ public final class SDSSynchronizer: Sendable {
     func skippedWhileCatchingUp(_ recordName: String, isTriedAgain: Bool = true) {
         mutableState.withLock { state in
             state.recordsSkippedWhileCatchingUp[recordName] = isTriedAgain || state.recordsSkippedWhileCatchingUp[recordName] == true
+        }
+    }
+
+    /// Remembers the keys being caught up on that a downloaded record had. Their values were downloaded, so they aren't
+    /// uploaded once caught up, which would put them over newer ones that other devices saved meanwhile.
+    func noteCaughtUpKeys(_ keys: Set<String>, of recordName: String) {
+        guard !keys.isEmpty else { return }
+        mutableState.withLock { $0.caughtUpKeysOfRecords[recordName, default: []].formUnion(keys) }
+    }
+
+    func takeCaughtUpKeysOfRecords() -> [String: Set<String>] {
+        mutableState.withLock { state in
+            defer { state.caughtUpKeysOfRecords = [:] }
+            return state.caughtUpKeysOfRecords
         }
     }
 

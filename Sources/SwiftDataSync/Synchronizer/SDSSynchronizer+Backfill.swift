@@ -284,7 +284,9 @@ extension SDSSynchronizer {
     /// - Parameter skippingRecordNames: Records whose objects are left out, e.g. as the catch-up couldn't store them.
     /// - Parameter onlyRecordNames: The records whose objects are uploaded, rather than every object's, e.g. the ones an
     ///   earlier catch-up couldn't store.
-    func uploadLocalObjects(keysByEntity: [String: [String]?], skippingRecordNames: Set<String> = [], onlyRecordNames: Set<String>? = nil) throws {
+    /// - Parameter downloadedKeys: Keys whose values were downloaded from the objects' records, by record name, which aren't
+    ///   uploaded, see `noteCaughtUpKeys(_:of:)`.
+    func uploadLocalObjects(keysByEntity: [String: [String]?], skippingRecordNames: Set<String> = [], onlyRecordNames: Set<String>? = nil, downloadedKeys: [String: Set<String>] = [:]) throws {
         guard let observedUpdateContext else { return }
         let context = self.context
         let localIds = { (recordNames: Set<String>) -> Set<String> in
@@ -298,6 +300,10 @@ extension SDSSynchronizer {
         }
         let onlyLocalIds = onlyRecordNames.map(localIds)
         if onlyLocalIds?.isEmpty == true { return }
+        let downloadedKeysByLocalId: [String: Set<String>] = downloadedKeys.isEmpty ? [:] : context.performAndWait {
+            let entries = context.metadataEntries(of: "CloudKitLocalEntity", withIds: Array(downloadedKeys.keys)).compactMap { $0 as? CloudKitLocalEntity }
+            return Dictionary(entries.compactMap { entry in downloadedKeys[entry.id].map { (entry.localId, $0) } }, uniquingKeysWith: { $0.union($1) })
+        }
 
         var count = 0
         for (entityName, keys) in keysByEntity.sorted(by: { $0.key < $1.key }) {
@@ -321,6 +327,9 @@ extension SDSSynchronizer {
                         var change = change
                         if let keys {
                             change.changedKeys = change.changedKeys.filter(keys.contains)
+                        }
+                        if let downloaded = downloadedKeysByLocalId[change.localId] {
+                            change.changedKeys = change.changedKeys.filter { !downloaded.contains($0) }
                         }
                         return change.changedKeys.isEmpty || skippedLocalIds.contains(change.localId) ? nil : change
                     }

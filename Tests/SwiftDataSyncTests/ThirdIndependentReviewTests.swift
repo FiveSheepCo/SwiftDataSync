@@ -381,5 +381,40 @@ struct ThirdIndependentReviewTests {
         #expect(documents.map { $0.workspace?.title } == ["W2"])
         a.terminate()
     }
+
+    /// A version that doesn't synchronize notes.
+    private static let withoutNotes = SDSConfiguration(swiftDataEntities: [
+        .init(entity: ScenarioSubscription.self, description: .sync(.without(["note"]), identity: ["feedLink"])),
+        .init(entity: ScenarioEpisode.self, description: .sync(.without([]), identity: ["feedLink", "guid"])),
+        .init(entity: ScenarioNote.self, description: .sync(.without([]))),
+        .init(entity: ScenarioWorkspace.self, description: .sync(.without([]))),
+        .init(entity: ScenarioDocument.self, description: .sync(.without([]), parentKey: "workspace", identity: ["title"]))
+    ])
+
+    /// Device B updates to a version that synchronizes notes, which another device synchronized already, and catches up on
+    /// them. The other device changes a note while B catches up. B doesn't upload the note it downloaded over the newer one.
+    @Test func catchUpDoesNotUploadTheValuesItDownloaded() async throws {
+        let server = FakeCloudServer()
+        server.seed([subscriptionRecord("s1", title: "Title of s1", note: "From A")], account: "first")
+        let b = TestDevice("B", server: server)
+        try await b.launch(configuration: Self.withoutNotes)
+        await b.sync()
+        b.terminate()
+
+        // Right after the catch-up's page
+        let pages = OSAllocatedUnfairLock(initialState: 0)
+        server.pageDelivered = { device, _ in
+            guard device == "B", pages.withLock({ $0 += 1; return $0 }) == 1 else { return }
+            server.seed([subscriptionRecord("s1", title: "Title of s1", note: "Newer from A")], account: "first")
+        }
+        try await b.launch()
+        await b.sync()
+        server.pageDelivered = nil
+        await b.sync()
+
+        #expect(b.serverSubscriptions().first?.note == "Newer from A")
+        #expect(try b.subscription("s1")?.note == "Newer from A")
+        b.terminate()
+    }
 }
 
