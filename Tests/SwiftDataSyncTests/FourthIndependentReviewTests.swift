@@ -289,43 +289,6 @@ struct FourthIndependentReviewTests {
         c.terminate()
     }
 
-    /// Device B edits notes, which have no identity, while it's stopped, and device A deletes one of them meanwhile. B resets
-    /// its synchronization data before the edits are uploaded. The edited notes still get their records, rather than being
-    /// uploaded as duplicates, as their values differ from the records', and the one A deleted is deleted on B too.
-    @Test func resetWithEditsThatWerentUploadedDoesNotDuplicate() async throws {
-        let server = FakeCloudServer()
-        let a = TestDevice("A", server: server)
-        let b = TestDevice("B", server: server)
-        try await a.launch()
-        try await b.launch()
-        try a.change { context in
-            for index in 1...3 { context.insert(ScenarioNote(text: "n\(index)")) }
-        }
-        await a.sync()
-        await b.sync()
-
-        b.synchronizer.stop()
-        try b.change { context in
-            try context.fetch(FetchDescriptor<ScenarioNote>(predicate: #Predicate { $0.text == "n1" })).first?.text = "n1 edited"
-            try context.fetch(FetchDescriptor<ScenarioNote>(predicate: #Predicate { $0.text == "n2" })).first?.text = "n2 edited"
-        }
-        try a.change { context in
-            try context.fetch(FetchDescriptor<ScenarioNote>(predicate: #Predicate { $0.text == "n2" })).forEach(context.delete)
-        }
-        await a.sync()
-        try await b.synchronizer.resetSyncData()
-        b.synchronizer.start()
-        await b.settle()
-        await b.sync()
-        await a.sync()
-
-        #expect(server.records(account: "first").filter { $0.recordType == "ScenarioNote" }.count == 2)
-        #expect(try b.notes() == ["n1", "n3"])
-        #expect(try a.notes() == ["n1", "n3"])
-        a.terminate()
-        b.terminate()
-    }
-
     private func tags(_ device: TestDevice) throws -> [String] {
         try ModelContext(#require(device.modelContainer)).fetch(FetchDescriptor<ScenarioTag>()).map { "\($0.name):\($0.color)" }.sorted()
     }

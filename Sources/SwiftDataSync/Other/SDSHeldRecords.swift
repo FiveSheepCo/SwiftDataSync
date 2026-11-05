@@ -167,33 +167,6 @@ final class SDSHeldRecords {
         try PropertyListEncoder().encode(deleted).write(to: deletedNamesURL, options: .atomic)
     }
 
-    private var resetHintsURL: URL {
-        directory.appending(component: "reset-hints.plist")
-    }
-
-    /// The records that models had before the synchronization data was reset, by record name, with the URIs of the models,
-    /// see `SDSSynchronizer.resetSyncData(beforeForgetting:)`.
-    func loadResetHints() -> [String: String] {
-        guard
-            let data = try? Data(contentsOf: resetHintsURL),
-            let hints = try? PropertyListDecoder().decode([String: String].self, from: data)
-        else { return [:] }
-        return hints
-    }
-
-    func storeResetHints(_ hints: [String: String]) throws {
-        guard !hints.isEmpty else {
-            removeResetHints()
-            return
-        }
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try PropertyListEncoder().encode(hints).write(to: resetHintsURL, options: .atomic)
-    }
-
-    func removeResetHints() {
-        try? FileManager.default.removeItem(at: resetHintsURL)
-    }
-
     /// Forgets everything, e.g. after switching accounts.
     func removeAll() {
         try? FileManager.default.removeItem(at: directory)

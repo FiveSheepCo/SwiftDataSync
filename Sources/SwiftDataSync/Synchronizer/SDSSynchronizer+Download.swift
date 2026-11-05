@@ -96,7 +96,7 @@ extension SDSSynchronizer {
             logger.error("Failed to download the shared database: \(error.localizedDescription)")
             // Unless it keeps failing, which would keep anything from being uploaded, see `synchronize()`
             if isRecoveringVanishedObjects && countIncompleteRecovery() >= Self.maximumIncompleteRecoveries {
-                finishRecoveringVanishedObjects(everyRecordWasDownloaded: false)
+                finishRecoveringVanishedObjects()
             }
             return error
         }
@@ -105,12 +105,8 @@ extension SDSSynchronizer {
         // zones. Not while records failed, which local objects without records can be copies of: they'd be uploaded as new
         // records, and the records downloaded as duplicates. Unless they keep failing, which would keep anything from being
         // uploaded, see `synchronize()`.
-        if isRecoveringVanishedObjects {
-            if !takeRecoveryMissedRecords() {
-                finishRecoveringVanishedObjects(everyRecordWasDownloaded: true)
-            } else if countIncompleteRecovery() >= Self.maximumIncompleteRecoveries {
-                finishRecoveringVanishedObjects(everyRecordWasDownloaded: false)
-            }
+        if isRecoveringVanishedObjects && (!takeRecoveryMissedRecords() || countIncompleteRecovery() >= Self.maximumIncompleteRecoveries) {
+            finishRecoveringVanishedObjects()
         }
 
         // Extensions can have little memory and time, so the app catches up
@@ -593,9 +589,6 @@ private final class CKDownloadHandler {
     private let identityIndex: SDSIdentityIndex
     /// Local objects without records by their values, while vanished objects are recovered, see `SDSContentIndex`.
     private var contentIndex: SDSContentIndex?
-    /// The records models had before the synchronization data was reset, by name, with the URIs of the models, which give
-    /// them their records again, also if they changed since they were uploaded. See `SDSSynchronizer.resetSyncData(beforeForgetting:)`.
-    private var resetHints: [String: String] = [:]
     /// The records with pending updates or removals when the download started, so records without any don't need a fetch.
     /// Changes saved while downloading are noticed when saving, see `save()`, and removals are read again once they change.
     private let pendingUpdateIds: Set<String>
@@ -632,12 +625,10 @@ private final class CKDownloadHandler {
             // Also the shared database's, whose local objects are copies of records in other users' zones. It's downloaded
             // after the private one, so the objects that got their records there aren't matched again.
             if synchronizer.isRecoveringVanishedObjects {
-                resetHints = forSharedDatabase ? [:] : heldRecords.loadResetHints()
                 contentIndex = SDSContentIndex(
                     synchronizer: synchronizer,
                     context: synchronizer.observedUpdateContext!,
                     trackedLocalIds: Self.localIdsOfConfirmedRecords(in: synchronizer.context),
-                    excludedLocalIds: Set(resetHints.values),
                     onlyCopiesOfShares: forSharedDatabase
                 )
             }
@@ -1044,20 +1035,6 @@ private final class CKDownloadHandler {
         return values
     }
     
-    /// The object that had the record before the synchronization data was reset, see `resetHints`. Has to be called on
-    /// `context`'s queue.
-    private func objectOfResetHint(for record: CKRecord) -> NSManagedObject? {
-        guard
-            let localId = resetHints[record.recordID.recordName],
-            let objectID = URL(string: localId).flatMap({ context.persistentStoreCoordinator?.managedObjectID(forURIRepresentation: $0) }),
-            objectID.entity.name == record.recordType,
-            let object = try? context.existingObject(with: objectID),
-            !object.isDeleted
-        else { return nil }
-        resetHints[record.recordID.recordName] = nil
-        return object
-    }
-
     /// A failed read isn't taken for a missing object, which could duplicate it or get records deleted.
     /// The download is discarded instead, so the records are downloaded again.
     private func findObject(for recordID: CKRecord.ID) -> SDSSynchronizableContainer? {
@@ -1100,8 +1077,8 @@ private final class CKDownloadHandler {
             // Not the keys a pending catch-up adds, which the records of older versions lack, while the local values don't
             let newKeys = synchronizer.pendingCatchUp?.newKeys ?? []
             let keys = configuration.syncedProperties.filter { !newKeys.contains("\(entityName).\($0)") }
-            matchingObject = { [unowned self] in
-                objectOfResetHint(for: record) ?? contentIndex.object(matching: record, overflowValues: overflowValues, entity: entity, keys: keys)
+            matchingObject = {
+                contentIndex.object(matching: record, overflowValues: overflowValues, entity: entity, keys: keys)
             }
         }
         
