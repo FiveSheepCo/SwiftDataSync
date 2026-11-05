@@ -52,6 +52,9 @@ extension SDSSynchronizer {
     /// failing, as it mustn't keep the private database from being uploaded. Its own changes aren't uploaded then, as they're
     /// only uploaded after a download.
     /// - Parameter refreshingSharedZones: Whether the shared zones have to be refreshed, which `synchronize()` usually did already.
+    /// How many records are downloaded again at once, see `_downloadOnce`. CloudKit fetches at most 400.
+    static let downloadAgainBatchSize = 200
+
     func download(refreshingSharedZones: Bool = true) async throws -> (any Error)? {
         // Downloads skip models and keys this version doesn't synchronize, e.g. ones a newer version added, while their change
         // tokens move on. Once more is synchronized, they are caught up on by downloading every record once more.
@@ -310,10 +313,24 @@ extension SDSSynchronizer {
             // Records of zones that are no longer shared mustn't be stored
             handler.forgetHeldRecords(outside: Set(configurations.keys))
         }
-        // Records that failed to download before are downloaded again, rather than holding back the change token
+        // Records that failed to download before are downloaded again, rather than holding back the change token. In batches,
+        // as CloudKit rejects fetching more than 400 records at once. Ones that fail are tried again by the next download.
         let failedRecordIDs = handler.recordIDsToDownloadAgain
-        if !failedRecordIDs.isEmpty, let results = try? await (sharedDatabase ? cloudSharedDatabase : cloudPrivateDatabase).records(for: failedRecordIDs, desiredKeys: nil) {
-            handler.addDownloadedAgain(results)
+        let database = (sharedDatabase ? cloudSharedDatabase : cloudPrivateDatabase)!
+        var batchSize = Self.downloadAgainBatchSize
+        var start = 0
+        while start < failedRecordIDs.count {
+            let batch = Array(failedRecordIDs[start ..< min(start + batchSize, failedRecordIDs.count)])
+            do {
+                handler.addDownloadedAgain(try await database.records(for: batch, desiredKeys: nil))
+                start += batch.count
+            } catch let error as CKError where error.code == .limitExceeded && batchSize > 1 {
+                batchSize /= 2
+            } catch {
+                logger.error("Failed to download \(failedRecordIDs.count - start) records again, trying later: \(error.localizedDescription)")
+                try checkNotStopped()
+                break
+            }
         }
         
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in

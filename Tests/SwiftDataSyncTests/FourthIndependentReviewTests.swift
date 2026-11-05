@@ -154,6 +154,45 @@ struct FourthIndependentReviewTests {
         #expect(a.serverSubscriptions().isEmpty)
         a.terminate()
     }
+
+    /// An extension that doesn't synchronize notes.
+    private static let extensionConfiguration = SDSConfiguration(swiftDataEntities: [
+        .init(entity: ScenarioSubscription.self, description: .sync(.without([]), identity: ["feedLink"])),
+        .init(entity: ScenarioEpisode.self, description: .sync(.without([]), identity: ["feedLink", "guid"])),
+        .init(entity: ScenarioNote.self, description: .noSync),
+        .init(entity: ScenarioLink.self, description: .sync(.without([]))),
+        .init(entity: ScenarioTag.self, description: .sync(.without([]))),
+        .init(entity: ScenarioWorkspace.self, description: .sync(.without([]))),
+        .init(entity: ScenarioDocument.self, description: .sync(.without([]), parentKey: "workspace", identity: ["title"]))
+    ])
+
+    /// Device B's extension skips 450 notes another device added, more than CloudKit fetches at once. The app still gets them.
+    @Test func appGetsMoreRecordsThanCloudKitFetchesAtOnce() async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try await b.launch()
+        await b.sync()
+        b.terminate()
+
+        try a.change { context in
+            for index in 0..<450 { context.insert(ScenarioNote(text: "n\(index)")) }
+        }
+        await a.sync()
+
+        b.beforeSetup = { $0.isAppExtension = true }
+        try await b.launch(configuration: Self.extensionConfiguration)
+        await b.sync()
+        b.terminate()
+        b.beforeSetup = nil
+        try await b.launch()
+        await b.sync()
+
+        #expect(try b.notes().count == 450)
+        a.terminate()
+        b.terminate()
+    }
 }
 
 /// Runs a block on the context's queue without waiting for it.

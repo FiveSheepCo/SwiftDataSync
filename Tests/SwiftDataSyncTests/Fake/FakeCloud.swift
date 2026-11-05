@@ -952,6 +952,8 @@ final class FakeCloudDatabase: SDSCloudDatabase, @unchecked Sendable {
 
     func records(for ids: [CKRecord.ID], desiredKeys: [CKRecord.FieldKey]?) async throws -> [CKRecord.ID: Result<CKRecord, any Error>] {
         guard let accountName = container.accountName else { throw CKError(.notAuthenticated) }
+        // Like CloudKit, which rejects operations of more than 400 items
+        if ids.count > 400 { throw CKError(.limitExceeded) }
         return Dictionary(uniqueKeysWithValues: ids.map { id in
             let record = isShared ? nil : container.server.record(named: id.recordName, account: accountName, zone: id.zoneID)
             return (id, record.map { .success($0) } ?? .failure(CKError(.unknownItem)))
