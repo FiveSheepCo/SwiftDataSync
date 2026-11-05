@@ -73,7 +73,7 @@ private struct _Footer<T: View>: View {
                 case .savingShare:
                     Text("sync.state.savingShare", bundle: .module)
             }
-            Text("sync.updatesToSend \(model.updatesToSend)")
+            Text("sync.updatesToSend \(model.updatesToSend)", bundle: .module)
         }
     }
 }
