@@ -228,7 +228,8 @@ final class TestDevice: @unchecked Sendable {
         var idleChecks = 0
         for _ in 0..<6000 {
             let isBusy: Bool
-            if synchronizer.hasPendingSaveSync {
+            // Also a synchronization that started without showing its state yet, e.g. the one that follows a save's
+            if synchronizer.hasPendingSaveSync || synchronizer.hasPendingSyncStart || synchronizer.isSynchronizing {
                 isBusy = true
             } else {
                 switch await viewModel.state {

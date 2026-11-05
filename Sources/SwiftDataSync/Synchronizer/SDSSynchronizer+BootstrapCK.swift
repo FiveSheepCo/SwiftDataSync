@@ -227,8 +227,10 @@ extension SDSSynchronizer {
     }
     
     func startSync() {
+        notePendingSyncStart(1)
         Task {
             await synchronize()
+            notePendingSyncStart(-1)
         }
     }
     

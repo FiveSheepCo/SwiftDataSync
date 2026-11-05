@@ -131,6 +131,8 @@ public final class SDSSynchronizer: Sendable {
         /// Saves the synchronization data and synchronizes shortly after the observed store was saved, see `contextSaved`.
         var saveSync: Task<Void, Never>?
         var startedSynchronizationCount = 0
+        /// See `hasPendingSyncStart`.
+        var pendingSyncStarts = 0
         /// Counts the objects without records that were queued as a record references them, see `container(for:)`.
         var queuedReferencedObjectCount = 0
         /// The deletions a context is saving to the store, by object. Read when the save starts, and taken when it's done,
@@ -527,6 +529,16 @@ public final class SDSSynchronizer: Sendable {
     
     var isSynchronizing: Bool {
         mutableState.withLock { $0.activity == .synchronizing }
+    }
+
+    /// Whether `startSync()` started a synchronization whose task didn't run yet, or didn't end yet. Tests wait for it, as
+    /// the state doesn't show a synchronization until it runs.
+    var hasPendingSyncStart: Bool {
+        mutableState.withLock { $0.pendingSyncStarts > 0 }
+    }
+
+    func notePendingSyncStart(_ change: Int) {
+        mutableState.withLock { $0.pendingSyncStarts += change }
     }
     
     /// Waits until nothing else runs, e.g. a synchronization, and keeps synchronizations from starting until
