@@ -2,6 +2,18 @@ import Foundation
 import CoreData
 import CloudKit
 
+/// A local object that a downloaded record would duplicate under a uniqueness constraint of its entity, see
+/// `SDSSynchronizer.retrieve`. Saving both would fold them into one row, with the downloaded values over the local object's.
+enum SDSUniqueMatch {
+    /// A saved object, which gets the record. Its own record, if it has one, is replaced.
+    case saved(NSManagedObject, replacingOwnRecord: Bool)
+    /// An object this download inserted for another record, which gets this one instead.
+    case inserted(NSManagedObject)
+    /// The local object keeps its record, and the downloaded record is left alone. The device that has it as its own record
+    /// gives its object the local object's record once it downloads that.
+    case keepsItsRecord
+}
+
 extension SDSSynchronizer {
     /// The record id of a saved object, given by the URI of its object ID, if it has a record. Has to be called on `context`'s queue.
     ///
@@ -124,11 +136,13 @@ extension SDSSynchronizer {
     ///   - identityRecordName: The name the record's identity values give it, if its entity has an identity.
     ///   - matchingObject: Finds a saved local object with the record's identity values, for a record that isn't known yet,
     ///     see `SDSIdentityIndex`.
+    ///   - uniqueMatch: Finds a local object the record would duplicate under a uniqueness constraint, see `SDSUniqueMatch`.
     func retrieve(
         for id: String,
         entityName: String,
         identityRecordName: String? = nil,
         matchingObject: (() throws -> NSManagedObject?)? = nil,
+        uniqueMatch: (() throws -> SDSUniqueMatch?)? = nil,
         context: NSManagedObjectContext,
         preliminaryUpdateHandler: (SDSSynchronizableContainer?, _ movedPendingKeys: Set<String>) -> Void
     ) throws -> SDSSynchronizableContainer? {
@@ -141,6 +155,28 @@ extension SDSSynchronizer {
         {
             preliminaryUpdateHandler(match, movedKeys)
             return match
+        } else if let match = try uniqueMatch?() {
+            switch match {
+            case .saved(let object, let replacingOwnRecord):
+                guard let (match, movedKeys) = adoptObject(object, recordName: id, identityRecordName: identityRecordName, replacingOwnRecord: replacingOwnRecord) else {
+                    preliminaryUpdateHandler(nil, [])
+                    return nil
+                }
+                preliminaryUpdateHandler(match, movedKeys)
+                return match
+            case .inserted(let object):
+                logger.log("[Download] Giving `\(id)` to an object of the same unique values this download inserted")
+                self.context.performAndWaitUnchecked {
+                    self.setTemporaryId(id, for: object)
+                }
+                let match = container(id: { id }, object: object)
+                preliminaryUpdateHandler(match, [])
+                return match
+            case .keepsItsRecord:
+                logger.log("[Download] Leaving `\(id)` alone, as a local object of the same unique values keeps its own record")
+                preliminaryUpdateHandler(nil, [])
+                return nil
+            }
         } else if self.context.performAndWaitUnchecked({
             // On `context`'s queue, where removals are stored, so a deletion is either pending or stored
             self.context.metadataEntries(of: "CloudKitLocalEntity", withIds: [id]).contains { isDeletionPending(localId: ($0 as? CloudKitLocalEntity)?.localId ?? "") }
@@ -173,7 +209,8 @@ extension SDSSynchronizer {
     ///
     /// Returns the keys the object changed locally, which weren't uploaded yet: they move from its own record to this one, and
     /// win over the record's values like other local changes.
-    private func adoptObject(_ object: NSManagedObject, recordName: String, identityRecordName: String?) -> (SDSSynchronizableContainer, Set<String>)? {
+    /// - Parameter replacingOwnRecord: Whether an object that has a record of its own gets this one anyway, see `SDSUniqueMatch`.
+    private func adoptObject(_ object: NSManagedObject, recordName: String, identityRecordName: String?, replacingOwnRecord: Bool = false) -> (SDSSynchronizableContainer, Set<String>)? {
         let localId = object.objectID.uriRepresentation().absoluteString
         let entityName = object.entity.name ?? ""
         let isNamedAfterIdentity = recordName == identityRecordName
@@ -183,7 +220,7 @@ extension SDSSynchronizer {
             let hasUnconfirmedRecord = identityRecordName == nil && CloudKitLocalEntity.entry(forLocalId: localId, in: self.context).flatMap { entry in
                 CloudKitUpdate.find(for: entry.id).map { $0.isLocalInsert && !$0.backfilledKeys.isEmpty }
             } == true
-            let (adopted, previousId) = CloudKitLocalEntity.adopt(recordName: recordName, forLocalId: localId, replacingOwnRecord: isNamedAfterIdentity || hasUnconfirmedRecord, in: self.context)
+            let (adopted, previousId) = CloudKitLocalEntity.adopt(recordName: recordName, forLocalId: localId, replacingOwnRecord: replacingOwnRecord || isNamedAfterIdentity || hasUnconfirmedRecord, in: self.context)
             var movedKeys: [String] = []
             if let previousId {
                 // The object's own record is a duplicate of this one. Its pending changes would be deleted with it.

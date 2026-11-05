@@ -40,6 +40,18 @@ final class ScenarioEpisode {
     }
 }
 
+/// A model whose name is unique in the store, without an identity, e.g. one that existed before identities.
+@Model
+final class ScenarioTag {
+    @Attribute(.unique) var name: String = ""
+    var color: String = ""
+
+    init(name: String, color: String = "") {
+        self.name = name
+        self.color = color
+    }
+}
+
 /// A model without an identity that references a subscription, whose delete rule cascades to it.
 @Model
 final class ScenarioLink {
@@ -121,6 +133,7 @@ let scenarioConfiguration = SDSConfiguration(swiftDataEntities: [
     .init(entity: ScenarioEpisode.self, description: .sync(.without([]), identity: ["feedLink", "guid"])),
     .init(entity: ScenarioNote.self, description: .sync(.without([]))),
     .init(entity: ScenarioLink.self, description: .sync(.without([]))),
+    .init(entity: ScenarioTag.self, description: .sync(.without([]))),
     .init(entity: ScenarioWorkspace.self, description: .sync(.without([]))),
     .init(entity: ScenarioDocument.self, description: .sync(.without([]), parentKey: "workspace", identity: ["title"]))
 ])
@@ -151,7 +164,7 @@ final class TestDevice: @unchecked Sendable {
 
     private func makeModelContainer() throws -> ModelContainer {
         try ModelContainer(
-            for: Schema([ScenarioLink.self, ScenarioSubscription.self, ScenarioEpisode.self, ScenarioNote.self, ScenarioWorkspace.self, ScenarioDocument.self]),
+            for: Schema([ScenarioTag.self, ScenarioLink.self, ScenarioSubscription.self, ScenarioEpisode.self, ScenarioNote.self, ScenarioWorkspace.self, ScenarioDocument.self]),
             configurations: ModelConfiguration(url: storeURL, cloudKitDatabase: .none)
         )
     }
