@@ -16,8 +16,27 @@ extension CloudKitUpdate {
     /// Stands in `rawChangedKeys` for an update whose record this device named, and doesn't know to exist, see `isLocalInsert`.
     static let insertMarker = "+"
     
+    /// Prefixes the names of records in `rawChangedKeys` that the record referenced before, see `previousReferences`. Record
+    /// names that the synchronizer gives don't contain commas.
+    static let referenceMarker = "<"
+
     private var storedKeys: [String] {
-        rawChangedKeys.components(separatedBy: ",").filter({ !$0.isEmpty && $0 != Self.insertMarker })
+        rawChangedKeys.components(separatedBy: ",").filter({ !$0.isEmpty && $0 != Self.insertMarker && !$0.hasPrefix(Self.referenceMarker) })
+    }
+
+    /// The records that the record referenced before its relationships changed, e.g. a model's previous parent. Its record in
+    /// iCloud still references them until it's uploaded, so their removals wait for it: CloudKit deletes records with their
+    /// parents, and other devices delete models with what they reference through delete rules.
+    var previousReferences: [String] {
+        rawChangedKeys.components(separatedBy: ",").filter { $0.hasPrefix(Self.referenceMarker) }.map { String($0.dropFirst(Self.referenceMarker.count)) }
+    }
+
+    func addPreviousReferences(_ names: [String]) {
+        var references = previousReferences
+        for name in names where !references.contains(name) && !name.contains(",") {
+            references.append(name)
+        }
+        setKeys(changed: changedKeys, backfilled: backfilledKeys, isLocalInsert: isLocalInsert, previousReferences: references)
     }
     
     /// Keys that changed locally. Their local values win over downloaded ones, as they're uploaded over them next.
@@ -82,8 +101,9 @@ extension CloudKitUpdate {
         setKeys(changed: changedKeys, backfilled: [], isLocalInsert: false)
     }
     
-    private func setKeys(changed: [String], backfilled: [String], isLocalInsert: Bool) {
-        let raw = ((isLocalInsert ? [Self.insertMarker] : []) + changed + backfilled.map { Self.backfillMarker + $0 }).joined(separator: ",")
+    private func setKeys(changed: [String], backfilled: [String], isLocalInsert: Bool, previousReferences: [String]? = nil) {
+        let references = (previousReferences ?? self.previousReferences).map { Self.referenceMarker + $0 }
+        let raw = ((isLocalInsert ? [Self.insertMarker] : []) + changed + backfilled.map { Self.backfillMarker + $0 } + references).joined(separator: ",")
         guard raw != rawChangedKeys else { return }
         rawChangedKeys = raw
         touch()

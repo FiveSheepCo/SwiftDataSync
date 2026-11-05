@@ -117,7 +117,7 @@ extension SDSSynchronizer {
         // is only deleted once the records that referenced it reference the model's new record, see `storeUpdates`. A device
         // that downloads in between would otherwise delete the model, and what its delete rules cascade to. CloudKit also
         // rejects saving and deleting a record in one operation. While iCloud is full, only removals are uploaded, which free
-        // up storage, unless updates that are left out change references, see `synchronizableDeletes`.
+        // up storage, except ones that updates which are left out still reference, see `synchronizableDeletes`.
         let isQuotaPaused = quotaPauseEnd(sharedDatabase: sharedDatabase) != nil
         var round = try synchronizableUpdates(sharedDatabase: sharedDatabase, maximum: isQuotaPaused ? 0 : maximumRecords)
         var skipsEditsDeletedElsewhere = false
@@ -600,22 +600,21 @@ extension SDSSynchronizer {
         // Quarantined removals are fetched too, so as many more are fetched
         let quarantinedCount = quarantinedRecordCount
         return context.performAndWait {
-            // Updates that aren't uploaded now, e.g. as CloudKit rejected them or iCloud is full, can change what their records
-            // reference, which their records in iCloud still reference until they're uploaded: a model's previous parent,
-            // which CloudKit deletes them with, or the record a model's identity moved away from, which other devices delete
-            // their models with. The removal could be any of them, as removals don't know their entities, so they wait.
-            if Self.hasPendingReferenceChanges(sharedDatabase: sharedDatabase, model: self.observedStore?.managedObjectModel, in: self.context) {
-                logger.log("Not uploading removals before changed references, which their records might be referenced by")
-                return ([], 0)
-            }
+            // Updates that aren't uploaded now, e.g. as CloudKit rejected them or iCloud is full, can move their records away
+            // from records that they still reference in iCloud until they're uploaded: a model's previous parent, which
+            // CloudKit deletes them with, or the record a model's identity moved away from, which other devices delete their
+            // models with. Those records' removals wait for them, see `CloudKitUpdate.previousReferences`.
+            let referenced = Self.previouslyReferencedRecordIds(sharedDatabase: sharedDatabase, in: self.context)
             var ids: [CKRecord.ID] = []
             var names: Set<String> = []
             var quarantined = 0
-            for removal in CloudKitRemoval.retrieve(sharedDatabase: sharedDatabase, maximum: maximum + quarantinedCount) {
+            // As many more are fetched as are held back
+            for removal in CloudKitRemoval.retrieve(sharedDatabase: sharedDatabase, maximum: maximum + quarantinedCount + referenced.count) {
                 guard !isQuarantined(removal.id, lastChangeDate: SDSRecordQuarantine.removalChangeDate) else {
                     quarantined += 1
                     continue
                 }
+                guard !referenced.contains(removal.id) else { continue }
                 // E.g. two processes stored the same removal at once. CloudKit rejects deleting a record twice in an operation.
                 guard ids.count < maximum, names.insert(removal.id).inserted else { continue }
                 ids.append(removal.recordId(defaultZoneID: defaultZoneID))
@@ -624,19 +623,16 @@ extension SDSSynchronizer {
         }
     }
 
-    /// Whether a pending update changes a relationship of a record that exists, see `synchronizableDeletes`. Has to be
-    /// called on `context`'s queue.
-    private static func hasPendingReferenceChanges(sharedDatabase: Bool, model: NSManagedObjectModel?, in context: NSManagedObjectContext) -> Bool {
-        guard let model else { return false }
+    /// The records that pending updates of records that exist referenced before, see `CloudKitUpdate.previousReferences`.
+    /// Has to be called on `context`'s queue.
+    private static func previouslyReferencedRecordIds(sharedDatabase: Bool, in context: NSManagedObjectContext) -> Set<String> {
         let request = CloudKitUpdate.fetchRequest()
         request.sortDescriptors = []
-        request.predicate = NSPredicate(format: sharedDatabase ? "sharedZone != nil" : "sharedZone == nil")
-        request.propertiesToFetch = ["rawChangedKeys", "recordType"]
-        let updates = (try? context.fetch(request)) ?? []
-        return updates.contains { update in
-            guard !update.isLocalInsert, let relationships = model.entitiesByName[update.recordType]?.relationshipsByName else { return false }
-            return update.changedKeys.contains { relationships[$0] != nil }
-        }
+        request.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
+            NSPredicate(format: sharedDatabase ? "sharedZone != nil" : "sharedZone == nil"),
+            NSPredicate(format: "rawChangedKeys CONTAINS %@", CloudKitUpdate.referenceMarker)
+        ])
+        return Set(((try? context.fetch(request)) ?? []).flatMap(\.previousReferences))
     }
 
     struct UploadProgress: Sendable {

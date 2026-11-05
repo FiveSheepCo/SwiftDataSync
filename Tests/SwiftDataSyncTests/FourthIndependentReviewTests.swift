@@ -122,6 +122,38 @@ struct FourthIndependentReviewTests {
         #expect(a.serverSubscriptions().first?.position == 42)
         a.terminate()
     }
+
+    /// CloudKit keeps rejecting a document that moved to another workspace, e.g. in a share the user may only read. Deleting
+    /// a subscription, which has nothing to do with it, is still uploaded. Only the previous workspace's removal would wait.
+    @Test func rejectedMoveDoesNotHoldBackOtherRemovals() async throws {
+        let server = FakeCloudServer()
+        server.freshRecordsConflict = false
+        let a = TestDevice("A", server: server)
+        try await a.launch()
+        try a.change { context in
+            let workspace = ScenarioWorkspace(title: "W1")
+            context.insert(workspace)
+            let document = ScenarioDocument(title: "D")
+            context.insert(document)
+            document.workspace = workspace
+            context.insert(ScenarioSubscription(feedLink: "unrelated"))
+        }
+        await a.sync()
+
+        server.failSaving(where: { $0.recordName == documentRecordName("D") }, with: CKError(.permissionFailure))
+        try a.change { context in
+            let document = try #require(try context.fetch(FetchDescriptor<ScenarioDocument>()).first)
+            let new = ScenarioWorkspace(title: "W2")
+            context.insert(new)
+            document.workspace = new
+        }
+        await a.sync()
+        try a.deleteSubscription("unrelated")
+        await a.sync()
+        await a.sync()
+        #expect(a.serverSubscriptions().isEmpty)
+        a.terminate()
+    }
 }
 
 /// Runs a block on the context's queue without waiting for it.
