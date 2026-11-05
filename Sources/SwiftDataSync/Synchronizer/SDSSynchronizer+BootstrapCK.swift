@@ -325,10 +325,7 @@ extension SDSSynchronizer {
             }
 
             await set(state: .uploading)
-            let upload = try await upload(
-                includingSharedDatabase: downloadError == nil && sharedDownloadError == nil,
-                checkingRecordsExist: downloadError != nil
-            )
+            let upload = try await upload(includingSharedDatabase: downloadError == nil && sharedDownloadError == nil)
             try checkNotStopped()
             if let error = downloadError ?? sharedDownloadError {
                 throw error
