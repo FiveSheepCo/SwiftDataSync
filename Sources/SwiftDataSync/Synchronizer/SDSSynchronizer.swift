@@ -137,6 +137,8 @@ public final class SDSSynchronizer: Sendable {
         /// Models and keys that other processes synchronize, but this one doesn't, e.g. an extension that synchronizes less.
         /// See `CKDownloadHandler.skippedRecordIDs`.
         var keysOnlyOthersSynchronize: Set<String> = []
+        /// Whether a download of every record missed records while recovering vanished objects, see `download(refreshingSharedZones:)`.
+        var recoveryMissedRecords = false
         /// The keys being caught up on that downloaded records had, by record name, see `noteCaughtUpKeys(_:of:)`.
         var caughtUpKeysOfRecords: [String: Set<String>] = [:]
     }
@@ -307,6 +309,17 @@ public final class SDSSynchronizer: Sendable {
     func noteCaughtUpKeys(_ keys: Set<String>, of recordName: String) {
         guard !keys.isEmpty else { return }
         mutableState.withLock { $0.caughtUpKeysOfRecords[recordName, default: []].formUnion(keys) }
+    }
+
+    func noteRecoveryMissedRecords() {
+        mutableState.withLock { $0.recoveryMissedRecords = true }
+    }
+
+    func takeRecoveryMissedRecords() -> Bool {
+        mutableState.withLock { state in
+            defer { state.recoveryMissedRecords = false }
+            return state.recoveryMissedRecords
+        }
     }
 
     func takeCaughtUpKeysOfRecords() -> [String: Set<String>] {
