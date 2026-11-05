@@ -321,5 +321,43 @@ struct ThirdIndependentReviewTests {
         #expect(server.records(account: "first").filter { $0.recordType == "ScenarioDocument" }.count == 1)
         a.terminate()
     }
+
+    /// Device B renames a subscription. Device A renames it too, while saving the page with B's rename, either before the
+    /// download looks for local changes, or right after. A's rename wins, as it's later, rather than being overwritten with
+    /// B's, which A would then upload.
+    @Test(arguments: [false, true]) func editSavedWhileAPageIsSavedWins(afterLookingForLocalChanges: Bool) async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try a.insertSubscriptions(["s1"])
+        await a.sync()
+        try await b.launch()
+        await b.sync()
+        try b.editSubscription("s1") { $0.title = "B" }
+        await b.sync()
+
+        let isDone = OSAllocatedUnfairLock(initialState: false)
+        let edit: @Sendable () -> Void = { [a] in
+            guard isDone.withLock({ done in defer { done = true }; return !done }) else { return }
+            try? a.editSubscription("s1") { $0.title = "A later" }
+        }
+        if afterLookingForLocalChanges {
+            a.synchronizer.beforeSavingDownloadedObjects = edit
+        } else {
+            a.synchronizer.afterSavingDownloadedRecords = edit
+        }
+        await a.sync()
+        await a.settle()
+        await a.sync()
+        await b.sync()
+
+        #expect(isDone.withLock { $0 })
+        #expect(try a.subscription("s1")?.title == "A later")
+        #expect(a.serverSubscriptions().map(\.title) == ["A later"])
+        #expect(try b.subscription("s1")?.title == "A later")
+        a.terminate()
+        b.terminate()
+    }
 }
 

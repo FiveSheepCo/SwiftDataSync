@@ -602,9 +602,23 @@ public final class SDSSynchronizer: Sendable {
         }
     }
 
-    /// Returns and forgets the synchronized keys a context saved to the store.
-    func takeKeysBeingSaved(by context: NSManagedObjectContext) -> [NSManagedObjectID: Set<String>] {
-        mutableState.withLock { $0.keysBeingSaved.removeValue(forKey: ObjectIdentifier(context)) ?? [:] }
+    /// The synchronized keys a context saved to the store.
+    func keysBeingSaved(by context: NSManagedObjectContext) -> [NSManagedObjectID: Set<String>] {
+        mutableState.withLock { $0.keysBeingSaved[ObjectIdentifier(context)] ?? [:] }
+    }
+
+    /// Forgets the keys a context saved, once they're stored.
+    func forgetKeysBeingSaved(by contextId: ObjectIdentifier) {
+        mutableState.withLock { _ = $0.keysBeingSaved.removeValue(forKey: contextId) }
+    }
+
+    /// The keys that contexts are saving, or saved and aren't stored yet, of every context, by object.
+    func keysBeingSavedByAnyContext() -> [NSManagedObjectID: Set<String>] {
+        mutableState.withLock { state in
+            state.keysBeingSaved.values.reduce(into: [:]) { keys, contextKeys in
+                keys.merge(contextKeys) { $0.union($1) }
+            }
+        }
     }
     
     func rememberServerRecordsOfConflicts(_ records: [String: CKRecord]) {
@@ -679,6 +693,9 @@ public final class SDSSynchronizer: Sendable {
     /// records were saved, before the objects. Tests use them to simulate a process that is terminated in between.
     nonisolated(unsafe) var afterSavingDownloadedObjects: (@Sendable () -> Void)?
     nonisolated(unsafe) var afterSavingDownloadedRecords: (@Sendable () -> Void)?
+    /// Called by downloads right before the downloaded objects are saved, once local changes were looked for. Tests use it to
+    /// save a local change in between.
+    nonisolated(unsafe) var beforeSavingDownloadedObjects: (@Sendable () -> Void)?
 
     /// The record ids of objects that weren't saved yet, e.g. ones a download inserted. They get their `CloudKitLocalEntity`
     /// once they have permanent IDs, see `CKDownloadHandler.fetchOverallCompletion`.
@@ -1142,7 +1159,7 @@ public final class SDSSynchronizer: Sendable {
         
         let observedUpdateContext = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
         observedUpdateContext.persistentStoreCoordinator = storeToObserve
-        observedUpdateContext.mergePolicy = NSMergePolicy.mergeByPropertyObjectTrump
+        observedUpdateContext.mergePolicy = SDSDownloadMergePolicy()
         observedUpdateContext.automaticallyMergesChangesFromParent = true
         // Other processes can change the observed store, so cached values cannot be trusted
         observedUpdateContext.stalenessInterval = 0

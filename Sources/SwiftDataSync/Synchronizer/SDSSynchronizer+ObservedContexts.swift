@@ -135,7 +135,14 @@ extension SDSSynchronizer {
             // A child context only saves to its parent, whose save is handled. Its inserted objects don't have permanent IDs yet.
             savingContext.parent == nil
         else { return }
-        let savedChanges = takeKeysBeingSaved(by: savingContext)
+        let savedChanges = keysBeingSaved(by: savingContext)
+        // Forgotten only once they're stored, as blocks on `context`'s queue run in order, so a download that looks for local
+        // changes finds them in one place or the other, see `CKDownloadHandler.keepLocalChanges(in:)`
+        defer {
+            let context = self.context
+            let contextId = ObjectIdentifier(savingContext)
+            context.perform { self.forgetKeysBeingSaved(by: contextId) }
+        }
         // Deletions are stored once they're saved, rather than when they're made, so ones that are discarded aren't uploaded
         let configuration = self.configuration
         let deletedObjectIDs = (userInfo[NSDeletedObjectsKey] as? NSSet ?? []).compactMap { ($0 as? NSManagedObject)?.objectID }.filter { objectID in

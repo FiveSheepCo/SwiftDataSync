@@ -1390,32 +1390,6 @@ private final class CKDownloadHandler {
         
         var fixCount = 0
         while true {
-            // Keys that were changed locally while downloading keep their changes, which would otherwise be overwritten with
-            // the downloaded values. They're uploaded next. The object's other keys keep the downloaded values, like local
-            // changes win key by key over records that are downloaded, see `_changed(record:)`.
-            // A catch-up downloads every record, which can take long, and it's done again later, after they're uploaded.
-            let hasLocalChanges = observedContext.performAndWaitUnchecked {
-                let updatedObjects = observedContext.updatedObjects.filter { !$0.objectID.isTemporaryID }
-                guard !updatedObjects.isEmpty else { return false }
-                let localIds = Dictionary(updatedObjects.map { ($0, $0.objectID.uriRepresentation().absoluteString) }, uniquingKeysWith: { $1 })
-                // One lookup for the page, rather than several for each object
-                let pendingKeys = synchronizer.pendingLocalKeys(ofLocalIds: Array(localIds.values))
-                var hasLocalChanges = false
-                for object in updatedObjects {
-                    guard let keys = localIds[object].flatMap({ pendingKeys[$0] }) else { continue }
-                    let downloaded = object.changedValues()
-                    guard !keys.isDisjoint(with: downloaded.keys) else { continue }
-                    // The object reads its saved values again, with the local changes, and gets the other downloaded values back
-                    observedContext.refresh(object, mergeChanges: false)
-                    for (key, value) in downloaded where !keys.contains(key) {
-                        object.setValue(value is NSNull ? nil : value, forKey: key)
-                    }
-                    hasLocalChanges = true
-                }
-                return hasLocalChanges
-            }
-            hadLocalChanges = hadLocalChanges || hasLocalChanges
-
             // Inserted objects get their permanent IDs before they are saved, so their local entities know them once other contexts
             // can change the objects. Otherwise a change could find no record id for an object, and give it a second one.
             let permanentIdError: (any Error)? = observedContext.performAndWait {
@@ -1463,7 +1437,11 @@ private final class CKDownloadHandler {
             }
             synchronizer.afterSavingDownloadedRecords?()
             
-            let saveError: (any Error)? = observedContext.performAndWait {
+            // Local changes are looked for right before saving, on the context's queue, so the app's saves aren't merged into
+            // it in between, and one that's saved meanwhile conflicts, see `SDSDownloadMergePolicy`
+            let saveError: (any Error)? = observedContext.performAndWaitUnchecked {
+                hadLocalChanges = keepLocalChanges(in: observedContext) || hadLocalChanges
+                synchronizer.beforeSavingDownloadedObjects?()
                 do {
                     try synchronizer.saveObservedUpdateContext(observedContext)
                     return nil
@@ -1609,6 +1587,35 @@ private final class CKDownloadHandler {
         return nil
     }
     
+    /// Keys that were changed locally while downloading keep their changes, which would otherwise be overwritten with the
+    /// downloaded values. They're uploaded next. The object's other keys keep the downloaded values, like local changes win
+    /// key by key over records that are downloaded, see `_changed(record:)`. Returns whether there were any.
+    /// A catch-up downloads every record, which can take long, and it's done again later, after they're uploaded.
+    ///
+    /// Also keys of saves that started, or that aren't stored yet: they're read first, as they're forgotten once they're
+    /// stored. Has to be called on the queue of the observed update context.
+    private func keepLocalChanges(in observedContext: NSManagedObjectContext) -> Bool {
+        let updatedObjects = observedContext.updatedObjects.filter { !$0.objectID.isTemporaryID }
+        guard !updatedObjects.isEmpty else { return false }
+        let keysBeingSaved = synchronizer.keysBeingSavedByAnyContext()
+        let localIds = Dictionary(updatedObjects.map { ($0, $0.objectID.uriRepresentation().absoluteString) }, uniquingKeysWith: { $1 })
+        // One lookup for the page, rather than several for each object
+        let pendingKeys = synchronizer.pendingLocalKeys(ofLocalIds: Array(localIds.values))
+        var hasLocalChanges = false
+        for object in updatedObjects {
+            let keys = (localIds[object].flatMap { pendingKeys[$0] } ?? []).union(keysBeingSaved[object.objectID] ?? [])
+            let downloaded = object.changedValues()
+            guard !keys.isDisjoint(with: downloaded.keys) else { continue }
+            // The object reads its saved values again, with the local changes, and gets the other downloaded values back
+            observedContext.refresh(object, mergeChanges: false)
+            for (key, value) in downloaded where !keys.contains(key) {
+                object.setValue(value is NSNull ? nil : value, forKey: key)
+            }
+            hasLocalChanges = true
+        }
+        return hasLocalChanges
+    }
+
     /// Discards the downloaded objects and their placeholders that weren't saved, and doesn't save the change tokens, so the
     /// records are downloaded again.
     private func discardDownload(observedContext: NSManagedObjectContext) {
