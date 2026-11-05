@@ -247,5 +247,79 @@ struct ThirdIndependentReviewTests {
         device.terminate()
         b.terminate()
     }
+
+    /// Moves a document to a new workspace and deletes its previous one, in one save.
+    private func moveDocumentAndDeleteItsWorkspace(on device: TestDevice) throws {
+        try device.change { context in
+            let old = try #require(try context.fetch(FetchDescriptor<ScenarioWorkspace>()).first)
+            let document = try #require(try context.fetch(FetchDescriptor<ScenarioDocument>()).first)
+            let new = ScenarioWorkspace(title: "W2")
+            context.insert(new)
+            document.workspace = new
+            context.delete(old)
+        }
+    }
+
+    private func insertDocumentInAWorkspace(on device: TestDevice) throws {
+        try device.change { context in
+            let workspace = ScenarioWorkspace(title: "W1")
+            context.insert(workspace)
+            let document = ScenarioDocument(title: "D")
+            context.insert(document)
+            document.workspace = workspace
+        }
+    }
+
+    /// A document is moved to a new workspace, and its previous workspace deleted. CloudKit rejects the document's record
+    /// for now. The previous workspace's removal waits for it, as the document's record still references the workspace as
+    /// its parent, which CloudKit would delete it with.
+    @Test func removalWaitsForARejectedRecordThatReferencesIt() async throws {
+        let server = FakeCloudServer()
+        server.freshRecordsConflict = false
+        server.cascadesDeleteSelf = true
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try await b.launch()
+        try insertDocumentInAWorkspace(on: a)
+        await a.sync()
+        await b.sync()
+
+        server.failSaving(where: { $0.recordName == documentRecordName("D") }, with: CKError(.invalidArguments), count: 1)
+        try moveDocumentAndDeleteItsWorkspace(on: a)
+        await a.settle()
+        await b.sync()
+        #expect(try b.count(ScenarioDocument.self) == 1)
+
+        // The rejected record is uploaded again once it changes
+        try a.change { try #require(try $0.fetch(FetchDescriptor<ScenarioDocument>()).first).body = "Edited" }
+        await a.sync()
+        await b.sync()
+        #expect(try a.count(ScenarioDocument.self) == 1)
+        #expect(try b.count(ScenarioDocument.self) == 1)
+        #expect(server.records(account: "first").filter { $0.recordType == "ScenarioWorkspace" }.map { $0["title"] as? String } == ["W2"])
+        a.terminate()
+        b.terminate()
+    }
+
+    /// Like above, but iCloud is full, so only removals are uploaded. The previous workspace's waits for the document.
+    @Test func removalWaitsWhileICloudIsFullForARecordThatReferencesIt() async throws {
+        let server = FakeCloudServer()
+        server.freshRecordsConflict = false
+        server.cascadesDeleteSelf = true
+        let a = TestDevice("A", server: server)
+        try await a.launch()
+        try insertDocumentInAWorkspace(on: a)
+        await a.sync()
+
+        server.failNextModify(with: CKError(.quotaExceeded))
+        try moveDocumentAndDeleteItsWorkspace(on: a)
+        await a.settle()
+        await a.sync()
+        await a.sync()
+        #expect(try a.count(ScenarioDocument.self) == 1)
+        #expect(server.records(account: "first").filter { $0.recordType == "ScenarioDocument" }.count == 1)
+        a.terminate()
+    }
 }
 

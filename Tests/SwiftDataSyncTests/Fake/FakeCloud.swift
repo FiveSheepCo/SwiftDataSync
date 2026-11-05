@@ -127,6 +127,13 @@ final class FakeCloudServer: @unchecked Sendable {
     }
     private var _freshRecordsConflict = true
 
+    /// Whether deleting a record deletes the records whose `.deleteSelf` references point at it, like CloudKit does.
+    var cascadesDeleteSelf: Bool {
+        get { lock.withLock { _cascadesDeleteSelf } }
+        set { lock.withLock { _cascadesDeleteSelf = newValue } }
+    }
+    private var _cascadesDeleteSelf = false
+
     /// How many changes a download receives per page, between change token updates.
     var pageSize: Int {
         get { lock.withLock { _pageSize } }
@@ -486,6 +493,20 @@ final class FakeCloudServer: @unchecked Sendable {
                 zone.log.append(LogEntry(sequence: zone.sequence, recordName: recordID.recordName, recordType: existing.recordType, isDeletion: true))
                 event.deletedNames.append(recordID.recordName)
                 deleteResults.append((recordID, .success(())))
+                guard _cascadesDeleteSelf else { continue }
+                var deletedNames = [recordID.recordName]
+                while let deletedName = deletedNames.popLast() {
+                    for (name, stored) in zone.records {
+                        let references = stored.values.values.compactMap { value -> CKRecord.Reference? in
+                            if case .value(let value) = value { value as? CKRecord.Reference } else { nil }
+                        }
+                        guard references.contains(where: { $0.action == .deleteSelf && $0.recordID.recordName == deletedName }) else { continue }
+                        zone.records[name] = nil
+                        zone.sequence += 1
+                        zone.log.append(LogEntry(sequence: zone.sequence, recordName: name, recordType: stored.recordType, isDeletion: true))
+                        deletedNames.append(name)
+                    }
+                }
             }
         }
 
