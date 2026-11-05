@@ -55,7 +55,10 @@ them. So does switching to another iCloud account, and a missing zone, with ever
 values are, they never overwrite what's in iCloud: if a record of the same name exists, e.g. because another device created
 the same identity (see below), the record wins completely, also over values it lacks, which another device might have
 cleared. Only models whose records don't exist are uploaded with their values. If such a model is edited before it's
-uploaded, the edited keys are uploaded like any change.
+uploaded, the edited keys are uploaded like any change. When the synchronization data is new while the store has models,
+e.g. on a device that never synchronized, or when an extension created it in the app group before the app moved its own
+there, every record is downloaded first, and models without an identity are given the records whose values they have,
+like after a store was rebuilt (see below), rather than being uploaded as duplicates.
 
 Deletions are only recorded when models are deleted through a context, e.g. `ModelContext.delete(_:)`, once the deletion is
 saved: one that's discarded before, e.g. by a rollback, isn't uploaded. Batch deletes, like
