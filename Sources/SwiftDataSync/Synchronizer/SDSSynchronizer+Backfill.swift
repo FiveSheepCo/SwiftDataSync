@@ -73,6 +73,7 @@ extension SDSSynchronizer {
             removedIds: removedIds,
             synchronizedEntities: Set(configuration.entities.keys)
         )
+        try lookForRecordsOfModelsWithoutSyncData(hasTrackedObjects: !trackedLocalIds.isEmpty || !removedIds.isEmpty, hasObjects: !existingLocalIds.isEmpty)
         let isRecovering = isRecoveringVanishedObjects
         // Objects that lack one of their identity values get records named like objects without an identity, see
         // `SDSIdentity.identityRecordName(entityName:values:)`, so they're matched by their values too
@@ -196,6 +197,22 @@ extension SDSSynchronizer {
         return forgotten
     }
     
+    /// Synchronization data that starts over next to models, e.g. an empty one that an extension created in the app group
+    /// before the app moved its own there (see `moveSyncData(from:to:coordinator:)`), or one that was lost, looks like none
+    /// of them were ever synchronized. Uploading the ones without an identity would duplicate them, so their records are
+    /// looked for first, like after objects vanished: every record is downloaded, which gives the models with the same
+    /// values their records, and the others are uploaded afterwards, see `SDSContentIndex`. A device that never synchronized
+    /// does the same, which also matches the models another device uploaded already.
+    private func lookForRecordsOfModelsWithoutSyncData(hasTrackedObjects: Bool, hasObjects: Bool) throws {
+        guard hasObjects, !hasTrackedObjects, !isRecoveringVanishedObjects else { return }
+        let isNew = !hasCompletedADownload && accessState(\.changeToken) == nil
+        guard isNew else { return }
+
+        logger.log("Looking for the records of the local models first, as the synchronization data is new")
+        // Written first, so the models aren't uploaded as duplicates if the app is terminated before every record is downloaded
+        updateFileState { $0.isRecoveringVanishedObjects = true }
+    }
+
     /// Repairs what a download's page save left when the app was terminated in between, see `FileState.interruptedPageSave`.
     ///
     /// Only the entities the page created for objects that weren't saved are removed, whose records are downloaded again as

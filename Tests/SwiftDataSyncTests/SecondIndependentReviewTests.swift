@@ -198,6 +198,39 @@ struct SecondIndependentReviewTests {
         b.terminate()
     }
 
+    /// The app's synchronization data is replaced with new, empty data next to its synchronized store, e.g. one a widget
+    /// created in the app group before the app moved its own there. Notes, which have no identity, aren't uploaded again as
+    /// new records: they're matched with their records first. Synchronizing goes on afterwards.
+    @Test func newSyncDataNextToASynchronizedStoreDoesNotDuplicate() async throws {
+        let server = FakeCloudServer()
+        let device = TestDevice("A", server: server)
+        try await device.launch()
+        try device.change { context in
+            context.insert(ScenarioNote(text: "n1"))
+            context.insert(ScenarioNote(text: "n2"))
+        }
+        try device.insertSubscriptions(["s1"])
+        await device.settle()
+        #expect(device.serverNotes() == ["n1", "n2"])
+        device.terminate()
+
+        let syncDirectory = device.directory.appending(path: "Sync")
+        try FileManager.default.removeItem(at: syncDirectory)
+        try FileManager.default.createDirectory(at: syncDirectory, withIntermediateDirectories: true)
+        try await device.launch()
+        await device.sync()
+
+        #expect(device.serverNotes() == ["n1", "n2"])
+        #expect(try device.notes() == ["n1", "n2"])
+        #expect(device.serverSubscriptions().map(\.feedLink) == ["s1"])
+        #expect(device.synchronizer.hasDownloadedOnce)
+
+        try device.change { $0.insert(ScenarioNote(text: "n3")) }
+        await device.settle()
+        #expect(device.serverNotes() == ["n1", "n2", "n3"])
+        device.terminate()
+    }
+
     /// Documents below sharable workspaces, without an identity, which can't be below a sharable entity.
     private static let sharableConfiguration = SDSConfiguration(swiftDataEntities: [
         .init(entity: ScenarioSubscription.self, description: .sync(.without([]), identity: ["feedLink"])),

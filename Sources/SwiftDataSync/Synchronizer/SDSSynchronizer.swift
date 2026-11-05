@@ -369,6 +369,11 @@ public final class SDSSynchronizer: Sendable {
         }
     }
     
+    /// Whether a private database was downloaded completely with this synchronization data, with any account.
+    var hasCompletedADownload: Bool {
+        mutableState.withLock { $0.fileState.downloadedOnceUserRecordName != nil }
+    }
+
     /// Remembers that the current account's private database was downloaded completely, see `hasDownloadedOnce`.
     func markDownloadedOnce() {
         let userRecordName = accessState(\.userId)?.recordName ?? ""
