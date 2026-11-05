@@ -72,6 +72,41 @@ nonisolated(unsafe) private let folderModel: NSManagedObjectModel = {
     return model
 }()
 
+/// Episodes, and local information about them that isn't synchronized, which can't exist without its episode. Its relationship
+/// is required, while the episode's delete rule only nullifies it. It isn't changed after it's made.
+nonisolated(unsafe) private let episodeInfoModel: NSManagedObjectModel = {
+    let episode = NSEntityDescription()
+    episode.name = "Episode"
+    let info = NSEntityDescription()
+    info.name = "EpisodeInfo"
+
+    let title = NSAttributeDescription()
+    title.name = "title"
+    title.type = .string
+    title.isOptional = true
+    let toInfo = NSRelationshipDescription()
+    toInfo.name = "info"
+    toInfo.destinationEntity = info
+    toInfo.maxCount = 1
+    toInfo.isOptional = true
+    toInfo.deleteRule = .nullifyDeleteRule
+    let toEpisode = NSRelationshipDescription()
+    toEpisode.name = "episode"
+    toEpisode.destinationEntity = episode
+    toEpisode.maxCount = 1
+    toEpisode.minCount = 1
+    toEpisode.isOptional = false
+    toEpisode.deleteRule = .nullifyDeleteRule
+    toInfo.inverseRelationship = toEpisode
+    toEpisode.inverseRelationship = toInfo
+
+    episode.properties = [title, toInfo]
+    info.properties = [toEpisode]
+    let model = NSManagedObjectModel()
+    model.entities = [episode, info]
+    return model
+}()
+
 /// A device whose store is a Core Data store, set up with its coordinator.
 private final class CoreDataDevice: @unchecked Sendable {
     let synchronizer: SDSSynchronizer
@@ -163,5 +198,59 @@ struct CoreDataScenarioTests {
         try await device.synchronizer.initializeSchema()
         #expect(server.schema["Folder"]?.isSuperset(of: ["name", "parent", SDSSynchronizer.Constants.parentWorkaroundKey]) == true)
         device.synchronizer.invalidate()
+    }
+
+    /// Device B has local information about an episode, which requires it. Device A deletes the episode. The download of the
+    /// deletion deletes the information too, rather than failing to save again and again, which would keep every later
+    /// change from being downloaded.
+    @Test func downloadedDeletionTakesObjectsThatRequireItWithIt() async throws {
+        let server = FakeCloudServer()
+        let configuration = SDSConfiguration(rawEntities: [
+            "Episode": .sync(.without(["info"])),
+            "EpisodeInfo": .noSync
+        ])
+        let first = try await CoreDataDevice("A", server: server, model: episodeInfoModel, configuration: configuration)
+        let second = try await CoreDataDevice("B", server: server, model: episodeInfoModel, configuration: configuration)
+        let count = { (device: CoreDataDevice, entityName: String) in
+            let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+            context.persistentStoreCoordinator = device.coordinator
+            return context.performAndWait { (try? context.count(for: NSFetchRequest<NSManagedObject>(entityName: entityName))) ?? -1 }
+        }
+        let titles = { (device: CoreDataDevice) in
+            let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+            context.persistentStoreCoordinator = device.coordinator
+            return context.performAndWait {
+                ((try? context.fetch(NSFetchRequest<NSManagedObject>(entityName: "Episode"))) ?? []).compactMap { $0.value(forKey: "title") as? String }
+            }
+        }
+
+        try first.change { context in
+            NSEntityDescription.insertNewObject(forEntityName: "Episode", into: context).setValue("First", forKey: "title")
+        }
+        await first.sync()
+        await second.sync()
+        try second.change { context in
+            let episode = try #require(try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "Episode")).first)
+            NSEntityDescription.insertNewObject(forEntityName: "EpisodeInfo", into: context).setValue(episode, forKey: "episode")
+        }
+        await second.sync()
+
+        try first.change { context in
+            try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "Episode")).forEach(context.delete)
+        }
+        await first.sync()
+        await second.sync()
+        #expect(count(second, "Episode") == 0)
+        #expect(count(second, "EpisodeInfo") == 0)
+
+        // Later changes are downloaded
+        try first.change { context in
+            NSEntityDescription.insertNewObject(forEntityName: "Episode", into: context).setValue("Second", forKey: "title")
+        }
+        await first.sync()
+        await second.sync()
+        #expect(titles(second) == ["Second"])
+        first.synchronizer.invalidate()
+        second.synchronizer.invalidate()
     }
 }
