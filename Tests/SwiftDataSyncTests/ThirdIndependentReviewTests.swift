@@ -359,5 +359,27 @@ struct ThirdIndependentReviewTests {
         a.terminate()
         b.terminate()
     }
+
+    /// Documents only synchronize their title and body, so the workspace's unordered `documents` is the side that's
+    /// synchronized, which uploads leave out. Downloading the workspace's record doesn't take that for an empty relationship.
+    @Test func unorderedRelationshipIsNotClearedByDownloads() async throws {
+        let configuration = SDSConfiguration(swiftDataEntities: [
+            .init(entity: ScenarioSubscription.self, description: .sync(.without([]), identity: ["feedLink"])),
+            .init(entity: ScenarioWorkspace.self, description: .sync(.without([]))),
+            .init(entity: ScenarioDocument.self, description: .sync(.with(["title", "body"])))
+        ])
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        try await a.launch(configuration: configuration)
+        try insertDocumentInAWorkspace(on: a)
+        await a.sync()
+        try a.change { try #require(try $0.fetch(FetchDescriptor<ScenarioWorkspace>()).first).title = "W2" }
+        await a.sync()
+        await a.sync()
+
+        let documents = try ModelContext(#require(a.modelContainer)).fetch(FetchDescriptor<ScenarioDocument>())
+        #expect(documents.map { $0.workspace?.title } == ["W2"])
+        a.terminate()
+    }
 }
 
