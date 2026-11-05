@@ -49,6 +49,17 @@ extension SDSSynchronizer {
         guard !object.objectID.isTemporaryID else {
             throw SDSSyncError(title: "share.error.couldNotFindObject")
         }
+        // The object is read in the observed update context rather than its own, e.g. the app's main context. The record id is
+        // read on the object's queue, and waits for the synchronizer's context, which the main thread must never do, see `context`.
+        guard
+            let observedUpdateContext,
+            let objectID = observedStore?.managedObjectID(forURIRepresentation: object.objectID.uriRepresentation())
+        else {
+            throw SDSSyncError(title: "share.error.couldNotFindObject")
+        }
+        let object = observedUpdateContext.performAndWait {
+            observedUpdateContext.object(with: objectID)
+        }
         guard let container = container(for: object) as? SDSSharableContainer else {
             throw SDSSyncError(title: "share.error.objectIsNotSharable")
         }
