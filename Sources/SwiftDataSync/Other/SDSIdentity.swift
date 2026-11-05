@@ -278,12 +278,18 @@ final class SDSContentIndex {
     private let context: NSManagedObjectContext
     /// The URIs of the objects that have records.
     private let trackedLocalIds: Set<String>
+    /// Whether only objects below sharable roots without records are matched, see `init`.
+    private let onlyCopiesOfShares: Bool
     private var objectIDs: [String: [String: [NSManagedObjectID]]] = [:]
 
-    init(synchronizer: SDSSynchronizer, context: NSManagedObjectContext, trackedLocalIds: Set<String>) {
+    /// - Parameter onlyCopiesOfShares: Whether only objects below sharable roots without records are matched, for the records
+    ///   of other users' shares: the user's own objects, which aren't below sharable roots, or whose roots got records from
+    ///   the private database, never become copies of records in someone else's share.
+    init(synchronizer: SDSSynchronizer, context: NSManagedObjectContext, trackedLocalIds: Set<String>, onlyCopiesOfShares: Bool = false) {
         self.synchronizer = synchronizer
         self.context = context
         self.trackedLocalIds = trackedLocalIds
+        self.onlyCopiesOfShares = onlyCopiesOfShares
     }
 
     /// An object without a record whose synchronized attributes have the record's values, which isn't matched again.
@@ -322,6 +328,9 @@ final class SDSContentIndex {
         let objects = (try? context.fetch(request)) ?? []
         for object in objects where !trackedLocalIds.contains(object.objectID.uriRepresentation().absoluteString) {
             guard let container = synchronizer.container(for: object) else { continue }
+            if onlyCopiesOfShares {
+                guard let rootLocalId = container.sharableRootLocalId, !trackedLocalIds.contains(rootLocalId) else { continue }
+            }
             let assetKeys = Set(container.assetKeys)
             // The values as records store them, e.g. strings for URLs, without writing assets
             let values = (try? container.changeDictionary(for: keys.filter { !assetKeys.contains($0) })) ?? [:]

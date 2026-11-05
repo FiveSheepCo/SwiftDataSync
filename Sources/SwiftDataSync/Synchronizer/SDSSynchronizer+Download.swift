@@ -602,7 +602,12 @@ private final class CKDownloadHandler {
             // Also the shared database's, whose local objects are copies of records in other users' zones. It's downloaded
             // after the private one, so the objects that got their records there aren't matched again.
             if synchronizer.isRecoveringVanishedObjects {
-                contentIndex = SDSContentIndex(synchronizer: synchronizer, context: synchronizer.observedUpdateContext!, trackedLocalIds: Self.localIdsOfConfirmedRecords(in: synchronizer.context))
+                contentIndex = SDSContentIndex(
+                    synchronizer: synchronizer,
+                    context: synchronizer.observedUpdateContext!,
+                    trackedLocalIds: Self.localIdsOfConfirmedRecords(in: synchronizer.context),
+                    onlyCopiesOfShares: forSharedDatabase
+                )
             }
         } else {
             heldRecords = nil
