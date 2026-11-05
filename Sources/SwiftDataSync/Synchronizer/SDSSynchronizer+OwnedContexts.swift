@@ -65,6 +65,11 @@ extension SDSSynchronizer {
         }
         let vacatedByMoving = vacating
 
+        // The records that changed relationships referenced before, read before models move to other records here, so the
+        // records they move away from are found, see `CloudKitUpdate.previousReferences`
+        let previousReferenceLocalIds = Array(Set(changes.flatMap(\.previousReferenceLocalIds)))
+        let previousReferenceIds = previousReferenceLocalIds.isEmpty ? [:] : CloudKitLocalEntity.entries(forLocalIds: previousReferenceLocalIds, in: context).mapValues(\.id)
+
         // The names models moved away from, which are deleted once every batch is stored, unless another model of these
         // changes took them, also one of another batch
         var vacatedIds: [(id: String, zoneId: CKRecordZone.ID?)] = []
@@ -227,6 +232,8 @@ extension SDSSynchronizer {
                 // The record was named here, and isn't known to exist, see `CloudKitUpdate.isLocalInsert`
                 if backfilled || previousId != nil || !hadRecord.contains(change.localId) {
                     update.markAsLocalInsert()
+                } else {
+                    update.addPreviousReferences(change.previousReferenceLocalIds.compactMap { previousReferenceIds[$0] })
                 }
                 if let zoneId {
                     update.sharedZone = CloudKitZone.getZone(with: zoneId, context: context)

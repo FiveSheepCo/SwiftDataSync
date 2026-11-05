@@ -17,6 +17,8 @@ struct SDSObjectChange: Sendable {
     var identityChanged = false
     /// Every synchronized key, uploaded when the object is moved to another record, or doesn't have one yet.
     var allKeys: [String] = []
+    /// The URIs of the objects the object referenced before its relationships changed, see `CloudKitUpdate.previousReferences`.
+    var previousReferenceLocalIds: [String] = []
 }
 
 /// A deletion of a synchronizable object, read while the object can still be read, when its save starts. It's stored once
@@ -78,6 +80,7 @@ extension SDSSynchronizer {
         // an ordered relationship that loses a deleted object
         context.processPendingChanges()
         var keys: [NSManagedObjectID: Set<String>] = [:]
+        var previousReferences: [NSManagedObjectID: Set<String>] = [:]
         for object in context.updatedObjects where !object.objectID.isTemporaryID {
             guard let container = container(for: object) else { continue }
             let synchronizedKeys = Set(container.syncKeys + [container.parentKey].compactMap { $0 })
@@ -85,8 +88,22 @@ extension SDSSynchronizer {
             if !savedKeys.isEmpty {
                 keys[object.objectID] = savedKeys
             }
+            // What the record in iCloud might still reference, as it's read from the saved values
+            let relationshipKeys = savedKeys.filter { object.entity.relationshipsByName[$0] != nil }
+            if !relationshipKeys.isEmpty {
+                let referenced = object.committedValues(forKeys: Array(relationshipKeys)).values.flatMap { value -> [NSManagedObject] in
+                    if let object = value as? NSManagedObject { return [object] }
+                    if let objects = value as? NSOrderedSet { return objects.array.compactMap { $0 as? NSManagedObject } }
+                    if let objects = value as? NSSet { return objects.allObjects.compactMap { $0 as? NSManagedObject } }
+                    return []
+                }
+                let localIds = Set(referenced.filter { !$0.objectID.isTemporaryID }.map { $0.objectID.uriRepresentation().absoluteString })
+                if !localIds.isEmpty {
+                    previousReferences[object.objectID] = localIds
+                }
+            }
         }
-        let token = rememberKeysBeingSaved(keys, by: context)
+        let token = rememberKeysBeingSaved(keys, previousReferences: previousReferences, by: context)
         // Runs once the save is over, as blocks on the context's queue run one after another. A save that failed didn't post
         // `NSManagedObjectContextDidSave`, so its keys are still there, and would keep downloaded values from being stored.
         // Contexts confined to a thread don't have a queue, and their keys expire instead.
@@ -155,6 +172,7 @@ extension SDSSynchronizer {
         }
         guard let userInfo = userInfo(from: notification) else { return }
         let savedChanges = saved?.keys ?? [:]
+        let previousReferences = saved?.previousReferences ?? [:]
         // Deletions are stored once they're saved, rather than when they're made, so ones that are discarded aren't uploaded
         let configuration = self.configuration
         let deletedObjectIDs = (userInfo[NSDeletedObjectsKey] as? NSSet ?? []).compactMap { ($0 as? NSManagedObject)?.objectID }.filter { objectID in
@@ -188,16 +206,22 @@ extension SDSSynchronizer {
         var updatedChanges: [SDSObjectChange] = []
         for object in updatedObjects {
             guard let keys = savedChanges[object.objectID], let container = container(for: object) else { continue }
-            let change = identifying(SDSObjectChange(
+            var change = identifying(SDSObjectChange(
                 localId: object.objectID.uriRepresentation().absoluteString,
                 sharableRootLocalId: container.sharableRootLocalId,
                 entityName: object.entity.name!,
                 changedKeys: Array(keys),
                 allKeys: container.syncKeys + [container.parentKey].compactMap { $0 }
             ), of: container, inserted: false)
+            change.previousReferenceLocalIds = Array(previousReferences[object.objectID] ?? [])
             updatedChanges.append(change)
             if change.identityChanged {
-                updatedChanges += referencingChanges(to: object)
+                // Their records reference the record the object moves away from until they're uploaded
+                updatedChanges += referencingChanges(to: object).map { referencing in
+                    var referencing = referencing
+                    referencing.previousReferenceLocalIds = [change.localId]
+                    return referencing
+                }
             }
         }
 

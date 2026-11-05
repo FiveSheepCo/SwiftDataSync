@@ -629,16 +629,18 @@ public final class SDSSynchronizer: Sendable {
         let token: Int
         let date: Date
         var keys: [NSManagedObjectID: Set<String>]
+        /// The URIs of the objects that changed relationships referenced before, by object, see `SDSObjectChange.previousReferenceLocalIds`.
+        var previousReferences: [NSManagedObjectID: Set<String>] = [:]
 
         /// Saves are short. An older one failed.
         var isCurrent: Bool { Date.now.timeIntervalSince(date) < 60 }
     }
 
     /// Remembers the synchronized keys a context is about to save to the store, see `contextWillSave`. Returns the save's token.
-    func rememberKeysBeingSaved(_ keys: [NSManagedObjectID: Set<String>], by context: NSManagedObjectContext) -> Int {
+    func rememberKeysBeingSaved(_ keys: [NSManagedObjectID: Set<String>], previousReferences: [NSManagedObjectID: Set<String>], by context: NSManagedObjectContext) -> Int {
         mutableState.withLock { state in
             state.lastSaveToken += 1
-            state.keysBeingSaved[ObjectIdentifier(context)] = KeysBeingSaved(token: state.lastSaveToken, date: .now, keys: keys)
+            state.keysBeingSaved[ObjectIdentifier(context)] = KeysBeingSaved(token: state.lastSaveToken, date: .now, keys: keys, previousReferences: previousReferences)
             return state.lastSaveToken
         }
     }
@@ -666,11 +668,11 @@ public final class SDSSynchronizer: Sendable {
 
     /// Takes the synchronized keys a context saved to the store, which are kept by the save's token until they're stored,
     /// see `forgetSavedKeys(_:)`. Returns the keys and the token.
-    func takeKeysBeingSaved(by context: NSManagedObjectContext) -> (keys: [NSManagedObjectID: Set<String>], token: Int)? {
+    func takeKeysBeingSaved(by context: NSManagedObjectContext) -> KeysBeingSaved? {
         mutableState.withLock { state in
             guard let save = state.keysBeingSaved.removeValue(forKey: ObjectIdentifier(context)) else { return nil }
             state.keysSavedNotStored[save.token] = save.keys
-            return (save.keys, save.token)
+            return save
         }
     }
 
