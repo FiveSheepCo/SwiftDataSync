@@ -170,6 +170,11 @@ extension SDSSynchronizer {
                     let identityName = change.identityRecordName.flatMap { name in
                         (vacating.contains(name) || !takenIds.contains(name)) && self.temporaryObject(for: name) == nil ? name : nil
                     }
+                    // A download inserts an object of the same identity, which the app couldn't see yet. The download merges
+                    // them, rather than the record being duplicated, see `CKDownloadHandler.mergeIdentityCollisions()`.
+                    if let name = change.identityRecordName, identityName == nil, self.temporaryObject(for: name) != nil {
+                        self.identityCollisions[change.localId] = name
+                    }
                     id = identityName ?? UUID().uuidString
                     entries[change.localId] = CloudKitLocalEntity(id: id, localId: change.localId, context: context)
                     if removedIds.contains(id) {
