@@ -325,6 +325,45 @@ struct FourthIndependentReviewTests {
         a.terminate()
         b.terminate()
     }
+
+    private func tags(_ device: TestDevice) throws -> [String] {
+        try ModelContext(#require(device.modelContainer)).fetch(FetchDescriptor<ScenarioTag>()).map { "\($0.name):\($0.color)" }.sorted()
+    }
+
+    /// Device B deletes a tag whose name is unique, and creates a new one with the same name, whose record's name comes
+    /// after the deleted one's. Device A gets the new tag with the same download that deletes its old one.
+    @Test func uniqueValueDeletedAndCreatedAgainIsStoredInOneDownload() async throws {
+        for _ in 0..<20 {
+            let server = FakeCloudServer()
+            let a = TestDevice("A", server: server)
+            let b = TestDevice("B", server: server)
+            try await a.launch()
+            try await b.launch()
+            try a.change { $0.insert(ScenarioTag(name: "work", color: "red")) }
+            await a.sync()
+            await b.sync()
+            let oldName = try #require(server.records(account: "first").first { $0.recordType == "ScenarioTag" }).recordID.recordName
+
+            try b.change { context in
+                for tag in try context.fetch(FetchDescriptor<ScenarioTag>()) { context.delete(tag) }
+            }
+            try b.change { $0.insert(ScenarioTag(name: "work", color: "blue")) }
+            await b.sync()
+            let newName = try #require(server.records(account: "first").first { $0.recordType == "ScenarioTag" }).recordID.recordName
+            // Only a new record whose name comes after loses to the old one until its deletion is applied
+            guard newName > oldName else {
+                a.terminate()
+                b.terminate()
+                continue
+            }
+            await a.sync()
+            #expect(try tags(a) == ["work:blue"])
+            a.terminate()
+            b.terminate()
+            return
+        }
+        Issue.record("The new record never got a name that comes after the deleted one's")
+    }
 }
 
 /// Runs a block on the context's queue without waiting for it.

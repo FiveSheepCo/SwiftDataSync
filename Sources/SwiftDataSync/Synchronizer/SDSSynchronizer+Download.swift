@@ -1346,9 +1346,15 @@ private final class CKDownloadHandler {
             isAtEndOfZone = true
             retryHeldRecords(all: true)
             storeRecordsThatReferenceEachOther(in: zoneID)
+            var appliedDeletions = false
             for recordID in deferredDeletions where !isForSharedDatabase || recordID.zoneID == zoneID {
                 deferredDeletions.remove(recordID)
                 applyDeletion(of: recordID)
+                appliedDeletions = true
+            }
+            // A deletion can free unique values for a record that was held for them, e.g. one deleted and created again
+            if appliedDeletions {
+                retryHeldRecords(all: true)
             }
             isAtEndOfZone = false
         }
