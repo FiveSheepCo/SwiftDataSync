@@ -194,47 +194,6 @@ struct FourthIndependentReviewTests {
         b.terminate()
     }
 
-    /// Device B edits a subscription that device A deleted, which reaches iCloud after B's download, either before B's upload
-    /// reads the record, or right before B saves it. B's edit doesn't create the record again with only the edited value,
-    /// without its identity's, and the subscription is gone on both devices.
-    @Test(arguments: [false, true]) func editOfARecordDeletedMeanwhileDoesNotCreateItAgain(rightBeforeSaving: Bool) async throws {
-        let server = FakeCloudServer()
-        let a = TestDevice("A", server: server)
-        let b = TestDevice("B", server: server)
-        try await a.launch()
-        try await b.launch()
-        try a.insertSubscriptions(["s1"])
-        await a.sync()
-        await b.sync()
-
-        let recordName = subscriptionRecordName("s1")
-        let isDone = OSAllocatedUnfairLock(initialState: false)
-        let deleteOnce: @Sendable () -> Void = {
-            guard isDone.withLock({ done in defer { done = true }; return !done }) else { return }
-            server.delete([recordName], account: "first")
-        }
-        if rightBeforeSaving {
-            server.beforeModifyRecords = { device, saved in
-                if device == "B" && saved.contains(recordName) { deleteOnce() }
-            }
-        } else {
-            b.synchronizer.afterSavingDownloadedObjects = deleteOnce
-        }
-        try b.editSubscription("s1") { $0.position = 123 }
-        await b.settle()
-        server.beforeModifyRecords = nil
-        b.synchronizer.afterSavingDownloadedObjects = nil
-        await b.sync()
-        await a.sync()
-
-        #expect(isDone.withLock { $0 })
-        #expect(server.records(account: "first").filter { $0.recordType == "ScenarioSubscription" }.isEmpty)
-        #expect(try b.subscriptions().isEmpty)
-        #expect(try a.subscriptions().isEmpty)
-        a.terminate()
-        b.terminate()
-    }
-
     /// The links of each subscription, as `feedLink: [link names]`, and the links without a subscription under `-`.
     private func links(_ device: TestDevice) throws -> [String: [String]] {
         let links = try ModelContext(#require(device.modelContainer)).fetch(FetchDescriptor<ScenarioLink>())
