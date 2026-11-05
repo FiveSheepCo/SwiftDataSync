@@ -958,6 +958,12 @@ public final class SDSSynchronizer: Sendable {
     }
 
     private func forgetSyncData(beforeForgetting: @MainActor @Sendable () async -> Void) async throws {
+        // Without its data, e.g. as it couldn't be loaded at launch, saving the context would raise an exception rather than
+        // throw. It's loaded again, e.g. once data protection allows it, and the reset fails if it still can't be.
+        if let error = loadSyncData() {
+            logger.error("Failed to load the synchronization data, not resetting it: \(error)")
+            throw error
+        }
         // Waits until a running synchronization, or a save's, noticed it's stopped. None starts until the reset is done.
         try await beginExclusiveActivity()
         defer { endActivity() }
