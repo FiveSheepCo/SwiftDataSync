@@ -52,4 +52,15 @@ struct IndependentReviewTests {
         a.terminate()
         b.terminate()
     }
+
+    /// Text that reads the same names the same record, whether its characters are composed or decomposed, e.g. typed on one
+    /// device and read from a file name on another.
+    @Test func identityIgnoresTheUnicodeNormalization() {
+        let composed = "Caf\u{E9}"
+        let decomposed = "Cafe\u{301}"
+        #expect(composed.utf8.count != decomposed.utf8.count)
+        #expect(SDSIdentity.recordName(entityName: "Feed", values: [composed]) == SDSIdentity.recordName(entityName: "Feed", values: [decomposed]))
+        // Other text still names other records
+        #expect(SDSIdentity.recordName(entityName: "Feed", values: [composed]) != SDSIdentity.recordName(entityName: "Feed", values: ["Cafe"]))
+    }
 }

@@ -36,10 +36,13 @@ enum SDSIdentity {
 
     /// The text of a value, the same for the value of a model and the one its record returns: CloudKit stores booleans as
     /// numbers and dates to the millisecond. `nil` for no value.
+    ///
+    /// Strings are normalized (NFC), as text that reads the same can be stored with composed or decomposed characters, e.g.
+    /// "é" typed on one device and read from a file name on another, which would otherwise give two records.
     static func canonicalString(_ value: Any?) -> String? {
         switch value {
         case nil, is NSNull: nil
-        case let string as String: string
+        case let string as String: string.precomposedStringWithCanonicalMapping
         // Dates too far away for milliseconds as an integer can't be in records anyway
         case let date as Date: Int64(exactly: (date.timeIntervalSince1970 * 1000).rounded()).map(String.init) ?? String(date.timeIntervalSince1970)
         case let number as NSNumber: number.stringValue
