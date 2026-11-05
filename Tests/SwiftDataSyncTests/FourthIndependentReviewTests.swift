@@ -403,6 +403,31 @@ struct FourthIndependentReviewTests {
         a.terminate()
         b.terminate()
     }
+
+    /// A subscription is deleted elsewhere while this device's change token expires, so this device never downloads the
+    /// deletion, and keeps the subscription, with an edit that can't be uploaded. Changes of other models, e.g. a link, which
+    /// is uploaded after subscriptions as it references them, are still uploaded.
+    @Test func editOfARecordWhoseDeletionIsNeverDownloadedDoesNotStallUploads() async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        try await a.launch()
+        try a.insertSubscriptions(["s1", "s2"])
+        await a.sync()
+        server.deleteWhileTokensExpire([subscriptionRecordName("s1")], account: "first")
+        try a.editSubscription("s1") { $0.title = "Edited" }
+        await a.sync()
+
+        try a.change { context in
+            let link = ScenarioLink(name: "L")
+            context.insert(link)
+            link.subscription = try context.fetch(FetchDescriptor<ScenarioSubscription>(predicate: #Predicate { $0.feedLink == "s2" })).first
+        }
+        await a.sync()
+        await a.sync()
+        #expect(server.records(account: "first").filter { $0.recordType == "ScenarioLink" }.count == 1)
+        #expect(server.records(account: "first").filter { $0.recordType == "ScenarioSubscription" }.count == 1)
+        a.terminate()
+    }
 }
 
 /// Runs a block on the context's queue without waiting for it.

@@ -143,6 +143,9 @@ public final class SDSSynchronizer: Sendable {
         var keysOnlyOthersSynchronize: Set<String> = []
         /// Whether a download of every record missed records while recovering vanished objects, see `download(refreshingSharedZones:)`.
         var recoveryMissedRecords = false
+        /// The records of edits that turned out to be gone during the running upload, which it leaves out from then on, see
+        /// `SDSSynchronizer.upload(includingSharedDatabase:)`.
+        var editsOfRecordsGone: Set<String> = []
         /// The keys being caught up on that downloaded records had, by record name, see `noteCaughtUpKeys(_:of:)`.
         var caughtUpKeysOfRecords: [String: Set<String>] = [:]
     }
@@ -324,6 +327,12 @@ public final class SDSSynchronizer: Sendable {
             defer { state.recoveryMissedRecords = false }
             return state.recoveryMissedRecords
         }
+    }
+
+    /// The records of edits the running upload found to be gone, see `MutableState.editsOfRecordsGone`.
+    var editsOfRecordsGone: Set<String> {
+        get { mutableState.withLock { $0.editsOfRecordsGone } }
+        set { mutableState.withLock { $0.editsOfRecordsGone = newValue } }
     }
 
     func takeCaughtUpKeysOfRecords() -> [String: Set<String>] {
