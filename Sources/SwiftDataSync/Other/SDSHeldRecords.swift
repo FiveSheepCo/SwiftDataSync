@@ -89,6 +89,29 @@ final class SDSHeldRecords {
         try NSKeyedArchiver.archivedData(withRootObject: Array(ids) as NSArray, requiringSecureCoding: true).write(to: failedIDsURL, options: .atomic)
     }
 
+    private var deferredDeletionsURL: URL {
+        directory.appending(component: "deferred-deletions.archive")
+    }
+
+    /// The IDs of deleted records whose objects are deleted at the end of a zone's download, see
+    /// `CKDownloadHandler.deferredDeletions`.
+    func loadDeferredDeletions() -> Set<CKRecord.ID> {
+        guard
+            let data = try? Data(contentsOf: deferredDeletionsURL),
+            let ids = try? NSKeyedUnarchiver.unarchivedArrayOfObjects(ofClass: CKRecord.ID.self, from: data)
+        else { return [] }
+        return Set(ids)
+    }
+
+    func storeDeferredDeletions(_ ids: Set<CKRecord.ID>) throws {
+        guard !ids.isEmpty else {
+            try? FileManager.default.removeItem(at: deferredDeletionsURL)
+            return
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try NSKeyedArchiver.archivedData(withRootObject: Array(ids) as NSArray, requiringSecureCoding: true).write(to: deferredDeletionsURL, options: .atomic)
+    }
+
     /// Forgets everything, e.g. after switching accounts.
     func removeAll() {
         try? FileManager.default.removeItem(at: directory)

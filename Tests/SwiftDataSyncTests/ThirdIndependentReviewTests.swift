@@ -37,4 +37,140 @@ struct ThirdIndependentReviewTests {
         #expect(device.serverSubscriptions().first?.title == "Edited")
         device.terminate()
     }
+
+    private func tagNames(_ device: TestDevice) throws -> [String] {
+        let context = ModelContext(try #require(device.modelContainer))
+        return try context.fetch(FetchDescriptor<ScenarioTag>()).map(\.name).sorted()
+    }
+
+    private func serverTagNames(_ server: FakeCloudServer) -> [String] {
+        server.records(account: "first").filter { $0.recordType == "ScenarioTag" }.compactMap { $0["name"] as? String }.sorted()
+    }
+
+    /// Device B renames a tag whose name is unique, and creates a new tag with the old name. Device A downloads both, in
+    /// either order. Neither is taken for a duplicate of the other, which would delete the renamed tag everywhere, or never
+    /// give A the new one.
+    @Test(arguments: [false, true]) func renamedUniqueValueUsedAgainKeepsBothTags(newRecordFirst: Bool) async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try await b.launch()
+        try a.change { $0.insert(ScenarioTag(name: "work", color: "red")) }
+        await a.sync()
+        await b.sync()
+
+        try b.change { context in
+            try #require(try context.fetch(FetchDescriptor<ScenarioTag>()).first).name = "job"
+        }
+        if !newRecordFirst {
+            await b.sync()
+        }
+        try b.change { $0.insert(ScenarioTag(name: "work", color: "blue")) }
+        await b.sync()
+        if newRecordFirst {
+            // The renamed tag changes again, so its record comes after the new one
+            try b.change { context in
+                try #require(try context.fetch(FetchDescriptor<ScenarioTag>(predicate: #Predicate { $0.name == "job" })).first).color = "green"
+            }
+            await b.sync()
+        }
+
+        for _ in 0..<3 {
+            await a.sync()
+            await b.sync()
+        }
+        #expect(serverTagNames(server) == ["job", "work"])
+        #expect(try tagNames(a) == ["job", "work"])
+        #expect(try tagNames(b) == ["job", "work"])
+        a.terminate()
+        b.terminate()
+    }
+
+    /// Tags identified by their name and color, whose name is unique.
+    private static let identifiedTags = SDSConfiguration(swiftDataEntities: [
+        .init(entity: ScenarioSubscription.self, description: .sync(.without([]), identity: ["feedLink"])),
+        .init(entity: ScenarioTag.self, description: .sync(.without([]), identity: ["name", "color"]))
+    ])
+
+    /// Two devices create a tag of the same unique name, whose identities differ, so both records are named after their
+    /// identities. Both devices keep the same one, rather than each the other's, which would delete both.
+    @Test func duplicatesNamedAfterTheirIdentitiesKeepOne() async throws {
+        let server = FakeCloudServer()
+        server.freshRecordsConflict = false
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch(configuration: Self.identifiedTags)
+        try await b.launch(configuration: Self.identifiedTags)
+        try a.change { $0.insert(ScenarioTag(name: "swift", color: "red")) }
+        await a.sync()
+        try b.change { $0.insert(ScenarioTag(name: "swift", color: "blue")) }
+        server.failNextFetch(with: CKError(.networkFailure))
+        await b.settle()
+
+        // A's upload fails once, so both devices download the other's record before either removes its own
+        server.failNextModify(with: CKError(.networkFailure))
+        await a.sync()
+        for _ in 0..<3 {
+            await b.sync()
+            await a.sync()
+        }
+        #expect(serverTagNames(server) == ["swift"])
+        #expect(try a.count(ScenarioTag.self) == 1)
+        #expect(try b.count(ScenarioTag.self) == 1)
+        a.terminate()
+        b.terminate()
+    }
+
+    /// Devices X and Y create the same tag, whose name is unique, before they synchronize with each other. Device C, which
+    /// had X's record, downloads Y's, which is kept, and deletes X's. X downloads that deletion before Y's record, which
+    /// changed since. X's tag is given Y's record, rather than deleted and inserted again, which would lose what isn't
+    /// synchronized, and its children.
+    @Test func duplicateDeletedElsewhereKeepsTheLocalObject() async throws {
+        for _ in 0..<20 {
+            let server = FakeCloudServer()
+            server.freshRecordsConflict = false
+            let x = TestDevice("X", server: server)
+            let y = TestDevice("Y", server: server)
+            let c = TestDevice("C", server: server)
+            try await x.launch()
+            try await y.launch()
+            try x.change { $0.insert(ScenarioTag(name: "swift", color: "red")) }
+            await x.sync()
+            let xName = try #require(server.records(account: "first").first { $0.recordType == "ScenarioTag" }).recordID.recordName
+            try await c.launch()
+            await c.sync()
+            try y.change { $0.insert(ScenarioTag(name: "swift", color: "blue")) }
+            server.failNextFetch(with: CKError(.networkFailure))
+            await y.settle()
+            // Y's record has to be the one that's kept. Y has none if another device's download took the failure.
+            guard
+                let yName = server.records(account: "first").first(where: { $0.recordType == "ScenarioTag" && $0.recordID.recordName != xName })?.recordID.recordName,
+                yName < xName
+            else {
+                x.terminate()
+                y.terminate()
+                c.terminate()
+                continue
+            }
+
+            await c.sync()
+            #expect(server.record(named: xName, account: "first") == nil)
+            let before = try ModelContext(#require(x.modelContainer)).fetch(FetchDescriptor<ScenarioTag>()).first?.persistentModelID
+            try y.change { try #require(try $0.fetch(FetchDescriptor<ScenarioTag>()).first).color = "edited on Y" }
+            await y.settle()
+            await x.sync()
+
+            let tags = try ModelContext(#require(x.modelContainer)).fetch(FetchDescriptor<ScenarioTag>())
+            #expect(tags.map(\.persistentModelID) == [before])
+            #expect(tags.map(\.color) == ["edited on Y"])
+            #expect(serverTagNames(server) == ["swift"])
+            x.terminate()
+            y.terminate()
+            c.terminate()
+            return
+        }
+        Issue.record("Y's record never got the name that's kept")
+    }
 }
+

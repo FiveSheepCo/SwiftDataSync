@@ -445,6 +445,17 @@ private final class CKDownloadHandler {
     private static func version(of record: CKRecord) -> String {
         record.recordChangeTag ?? record.modificationDate.map { "\($0.timeIntervalSince1970)" } ?? UUID().uuidString
     }
+    /// Downloaded deletions of objects whose entities have uniqueness constraints, which are applied at the end of their
+    /// zone's download. Another record of the same unique values can still give the object a record there, e.g. when the
+    /// device that merged two duplicate records deleted the one this device's object has. Kept in a file once a page is
+    /// saved, like held records. See `SDSUniqueMatch`.
+    private var deferredDeletions: Set<CKRecord.ID> = []
+    private var persistedDeferredDeletions: Set<CKRecord.ID> = []
+    /// Whether the zone's download ended, so records of the same unique values as local objects with records of their own
+    /// are decided on, and deferred deletions applied, see `SDSUniqueMatch`.
+    private var isAtEndOfZone = false
+    /// Records `uniqueMatch(for:...)` held, see `SDSUniqueMatch.keepsItsRecord`.
+    private var heldForUniqueValues: Set<CKRecord.ID> = []
     /// Records that failed to download, which later downloads download again.
     private var failedRecordIDs: Set<CKRecord.ID> = []
     private var persistedFailedRecordIDs: Set<CKRecord.ID> = []
@@ -532,6 +543,8 @@ private final class CKDownloadHandler {
             persistedHeld = Dictionary(recordsToAddLater.map { ($0.recordID, Self.version(of: $0)) }, uniquingKeysWith: { $1 })
             failedRecordIDs = heldRecords.loadFailedIDs()
             persistedFailedRecordIDs = failedRecordIDs
+            deferredDeletions = heldRecords.loadDeferredDeletions()
+            persistedDeferredDeletions = deferredDeletions
             if !forSharedDatabase && synchronizer.isRecoveringVanishedObjects {
                 contentIndex = SDSContentIndex(synchronizer: synchronizer, context: synchronizer.observedUpdateContext!, trackedLocalIds: Self.localIdsOfConfirmedRecords(in: synchronizer.context))
             }
@@ -544,6 +557,7 @@ private final class CKDownloadHandler {
     func forgetHeldRecords(outside zoneIDs: Set<CKRecordZone.ID>) {
         recordsToAddLater.removeAll { !zoneIDs.contains($0.recordID.zoneID) }
         failedRecordIDs = failedRecordIDs.filter { zoneIDs.contains($0.zoneID) }
+        deferredDeletions = deferredDeletions.filter { zoneIDs.contains($0.zoneID) }
     }
     
     /// The records that failed to download before, which are downloaded again before the zone's changes.
@@ -635,6 +649,8 @@ private final class CKDownloadHandler {
             recordsToAddLater.remove(record.recordID)
             setAsideRecords.remove(record.recordID)
             failedRecordIDs.remove(record.recordID)
+            // E.g. a record of an identity that was created again
+            deferredDeletions.remove(record.recordID)
             self._changed(record: record)
         }
         failIfNotApplied()
@@ -791,7 +807,12 @@ private final class CKDownloadHandler {
             }
 
             synchronizer.logger.log("Object updated: \(object)")
-        }) else { return }
+        }) else {
+            if heldForUniqueValues.remove(record.recordID) != nil {
+                recordsToAddLater.append(record)
+            }
+            return
+        }
         
         pageRecords[recordName] = record
         storedSinceRetry.insert(recordName)
@@ -955,8 +976,13 @@ private final class CKDownloadHandler {
                 entityName: entityName,
                 identityRecordName: identityRecordName,
                 matchingObject: matchingObject,
-                uniqueMatch: entity.uniquenessConstraints.isEmpty ? nil : { [unowned self] in
-                    try self.uniqueMatch(for: record, entity: entity, overflowValues: overflowValues, identityRecordName: identityRecordName)
+                // Not records of other users' shares, whose objects never take the place of the user's own
+                uniqueMatch: entity.uniquenessConstraints.isEmpty || isForSharedDatabase ? nil : { [unowned self] in
+                    let match = try self.uniqueMatch(for: record, entity: entity, overflowValues: overflowValues, identityRecordName: identityRecordName)
+                    if case .keepsItsRecord = match {
+                        heldForUniqueValues.insert(record.recordID)
+                    }
+                    return match
                 },
                 context: context,
                 preliminaryUpdateHandler: preliminaryUpdateHandler
@@ -976,9 +1002,11 @@ private final class CKDownloadHandler {
     /// A local object the record would duplicate under a uniqueness constraint of its entity, e.g. as two devices created the
     /// same thing before they had identities, which gave them records of their own. See `SDSUniqueMatch`.
     ///
-    /// Of two records, the one named after the identity, if the entity has one, or else the one whose name comes first, is
-    /// kept, the same on every device. An object without a record gets the downloaded one. Only constraints of attributes that
-    /// records store are looked at. Has to be called on `context`'s queue.
+    /// An object without a record gets the downloaded one. One with a record of its own is only decided on at the end of the
+    /// zone's download, as its record can still change in it, e.g. to other unique values when the unique value was renamed
+    /// and used again. Of two records, the one named after its identity, if only one of them is, or else the one whose name
+    /// comes first, is kept, the same on every device. Only constraints of attributes that records store are looked at.
+    /// Has to be called on `context`'s queue.
     private func uniqueMatch(for record: CKRecord, entity: NSEntityDescription, overflowValues: [String: Any], identityRecordName: String?) throws -> SDSUniqueMatch? {
         guard let entityName = entity.name else { return nil }
         let syncedKeys = synchronizer.configuration?.entities[entityName]?.syncedProperties ?? []
@@ -1008,7 +1036,12 @@ private final class CKDownloadHandler {
                 return .saved(object, replacingOwnRecord: false)
             }
             guard ownName != recordName else { return nil }
-            let isKept = identityRecordName.map { recordName == $0 || (ownName != $0 && recordName < ownName) } ?? (recordName < ownName)
+            guard isAtEndOfZone else { return .keepsItsRecord }
+            // Each by its own values: two records can each be named after an identity, e.g. one whose keys differ from the
+            // constraint's
+            let isNamedAfterIdentity = identityRecordName == recordName
+            let ownIsNamedAfterIdentity = synchronizer.identityRecordName(for: object) == ownName
+            let isKept = isNamedAfterIdentity != ownIsNamedAfterIdentity ? isNamedAfterIdentity : recordName < ownName
             if !isKept {
                 return .keepsItsRecord
             }
@@ -1043,6 +1076,16 @@ private final class CKDownloadHandler {
         setAsideRecords.remove(recordID)
         failedRecordIDs.remove(recordID)
         overflowChanges[recordID.recordName] = []
+        applyDeletion(of: recordID)
+    }
+
+    /// Deletes the object of a record that was deleted elsewhere, unless it was created here again. Objects whose entities
+    /// have uniqueness constraints are deleted at the end of the zone's download, see `deferredDeletions`.
+    private func applyDeletion(of recordID: CKRecord.ID) {
+        if !isAtEndOfZone, heldRecords != nil, let object = findObject(for: recordID), !object.object.entity.uniquenessConstraints.isEmpty {
+            deferredDeletions.insert(recordID)
+            return
+        }
         
         // A model that was created here with the record's name, e.g. when the user subscribes again after unsubscribing,
         // stays: its record is uploaded again next. Edits of a record that was deleted elsewhere don't keep it. Read for
@@ -1148,7 +1191,20 @@ private final class CKDownloadHandler {
         fetchFailed: Bool = false
     ) {
         retryHeldRecords(all: finalCompletion)
-        
+
+        // Records held for their unique values are decided on once every other record of the zone is stored, and deferred
+        // deletions applied afterwards, so objects that got other records keep them. Not when the zone failed, as later
+        // records of it are missing.
+        if finalCompletion && !fetchFailed {
+            isAtEndOfZone = true
+            retryHeldRecords(all: true)
+            for recordID in deferredDeletions where !isForSharedDatabase || recordID.zoneID == zoneID {
+                deferredDeletions.remove(recordID)
+                applyDeletion(of: recordID)
+            }
+            isAtEndOfZone = false
+        }
+
         if finalCompletion {
             for reference in parentReferences {
                 guard
@@ -1481,6 +1537,7 @@ private final class CKDownloadHandler {
             }
             do {
                 try heldRecords.storeFailedIDs(failedRecordIDs)
+                try heldRecords.storeDeferredDeletions(deferredDeletions)
             } catch {
                 synchronizer.logger.error("Failed to keep the records that failed to download: \(error.localizedDescription)")
                 return error
@@ -1491,6 +1548,7 @@ private final class CKDownloadHandler {
                 persistedHeld[recordID] = nil
             }
             persistedFailedRecordIDs = failedRecordIDs
+            persistedDeferredDeletions = deferredDeletions
         }
         
         // Written before the token moves past the records it describes
@@ -1590,6 +1648,8 @@ private final class CKDownloadHandler {
         recordsToAddLater.removeAll { !persistedHeldIDs.contains($0.recordID) }
         setAsideRecords.removeAll { !persistedHeldIDs.contains($0.recordID) }
         failedRecordIDs = persistedFailedRecordIDs
+        deferredDeletions = persistedDeferredDeletions
+        heldForUniqueValues = []
         identityIndex.discardInsertedObjects()
     }
 
