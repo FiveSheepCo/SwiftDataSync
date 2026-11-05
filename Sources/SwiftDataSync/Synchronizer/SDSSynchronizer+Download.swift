@@ -1741,8 +1741,10 @@ private final class CKDownloadHandler {
             let saveError: (any Error)? = observedContext.performAndWaitUnchecked {
                 hadLocalChanges = keepLocalChanges(in: observedContext) || hadLocalChanges
                 synchronizer.beforeSavingDownloadedObjects?()
+                let removals = removalsOfObjectsMovedIntoDeletedOnes(in: observedContext)
                 do {
                     try synchronizer.saveObservedUpdateContext(observedContext)
+                    synchronizer.storeRemovals(removals)
                     return nil
                 } catch {
                     return error
@@ -1895,6 +1897,42 @@ private final class CKDownloadHandler {
         return nil
     }
     
+    /// The removals of objects that delete rules delete with downloaded deletions, which this device moved into the deleted
+    /// objects, e.g. a link moved into a subscription another device deleted. Other devices don't know about the move, as it
+    /// wasn't uploaded, so they'd keep the object where it was, while this device deleted it. As it was moved into an object
+    /// that's gone, it's gone everywhere instead. Objects that were already there are deleted by the other devices too.
+    /// Has to be called on the queue of the observed update context, before it's saved.
+    private func removalsOfObjectsMovedIntoDeletedOnes(in observedContext: NSManagedObjectContext) -> [SDSObjectDeletion] {
+        observedContext.processPendingChanges()
+        let deleted = observedContext.deletedObjects.filter { !$0.objectID.isTemporaryID }
+        guard !deleted.isEmpty else { return [] }
+        let localIds = Dictionary(deleted.map { ($0.objectID.uriRepresentation().absoluteString, $0) }, uniquingKeysWith: { first, _ in first })
+        let deletedHere = deletedRecordIds
+        let syncContext = synchronizer.context
+        // The keys of objects that changed locally, which weren't uploaded, of objects whose records weren't deleted elsewhere
+        let pendingKeys: [String: [String]] = syncContext.performAndWaitUnchecked {
+            let entries = CloudKitLocalEntity.entries(forLocalIds: Array(localIds.keys), in: syncContext).filter { !deletedHere.contains($0.value.id) }
+            let updates = CloudKitUpdate.find(ids: entries.values.map(\.id), in: syncContext)
+            return entries.compactMapValues { updates[$0.id].map(\.changedKeys) }
+        }
+        var removals: [SDSObjectDeletion] = []
+        for (localId, keys) in pendingKeys {
+            guard let object = localIds[localId] else { continue }
+            let relationshipKeys = keys.filter { object.entity.relationshipsByName[$0] != nil }
+            guard !relationshipKeys.isEmpty else { continue }
+            let movedIntoDeleted = object.committedValues(forKeys: relationshipKeys).values.contains { value in
+                if let object = value as? NSManagedObject { return object.isDeleted }
+                if let objects = value as? NSOrderedSet { return objects.contains { ($0 as? NSManagedObject)?.isDeleted == true } }
+                if let objects = value as? NSSet { return objects.contains { ($0 as? NSManagedObject)?.isDeleted == true } }
+                return false
+            }
+            guard movedIntoDeleted, let container = synchronizer.container(for: object) else { continue }
+            synchronizer.logger.log("Deleting `\(localId)` everywhere, as it was moved into an object that was deleted elsewhere")
+            removals.append(SDSObjectDeletion(localId: localId, sharableRootLocalId: container.sharableRootLocalId, isSharable: container is SDSSharableContainer))
+        }
+        return removals
+    }
+
     /// Keys that were changed locally while downloading keep their changes, which would otherwise be overwritten with the
     /// downloaded values. They're uploaded next. The object's other keys keep the downloaded values, like local changes win
     /// key by key over records that are downloaded, see `_changed(record:)`. Returns whether there were any.

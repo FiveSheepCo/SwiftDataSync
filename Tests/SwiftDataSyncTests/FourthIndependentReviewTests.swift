@@ -364,6 +364,43 @@ struct FourthIndependentReviewTests {
         }
         Issue.record("The new record never got a name that comes after the deleted one's")
     }
+
+    /// Device B moves a link into another subscription while it's stopped, and device A deletes that subscription. B gets the
+    /// deletion before it uploads the move, so its delete rule deletes the link, which A doesn't know is in the subscription.
+    /// The link is deleted everywhere, rather than only on B, while A and iCloud keep it at its previous subscription.
+    @Test func linkMovedIntoASubscriptionDeletedBeforeTheMoveWasUploadedIsGoneEverywhere() async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try await b.launch()
+        try a.insertSubscriptions(["s1", "s2"])
+        try a.change { context in
+            let link = ScenarioLink(name: "l1")
+            context.insert(link)
+            link.subscription = try context.fetch(FetchDescriptor<ScenarioSubscription>(predicate: #Predicate { $0.feedLink == "s1" })).first
+        }
+        await a.sync()
+        await b.sync()
+
+        b.synchronizer.stop()
+        try b.change { context in
+            let link = try #require(try context.fetch(FetchDescriptor<ScenarioLink>()).first)
+            link.subscription = try context.fetch(FetchDescriptor<ScenarioSubscription>(predicate: #Predicate { $0.feedLink == "s2" })).first
+        }
+        try a.deleteSubscription("s2")
+        await a.sync()
+        b.synchronizer.start()
+        await b.settle()
+        await b.sync()
+        await a.sync()
+
+        #expect(try links(a).isEmpty)
+        #expect(try links(b).isEmpty)
+        #expect(server.records(account: "first").filter { $0.recordType == "ScenarioLink" }.isEmpty)
+        a.terminate()
+        b.terminate()
+    }
 }
 
 /// Runs a block on the context's queue without waiting for it.
