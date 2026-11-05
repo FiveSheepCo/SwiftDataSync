@@ -118,13 +118,21 @@ extension SDSSynchronizableContainer {
     var sharableRootLocalId: String? {
         var root: SDSSynchronizableContainer = self
 
-        while let newParent = root.parent.flatMap(container(for:)) {
+        while let newParent = root.savedParent.flatMap(container(for:)) {
             root = newParent
         }
 
         // A root that wasn't saved yet isn't shared. The app's contexts have no downloaded objects without saved ones.
         guard root is SDSSharableContainer, !root.object.objectID.isTemporaryID else { return nil }
         return root.object.objectID.uriRepresentation().absoluteString
+    }
+
+    /// The parent, or for a deleted object the one it had when it was last saved: deleting an object nullifies its
+    /// relationships before `NSManagedObjectContextWillSave` is posted, where deletions are read, see `contextWillSave`.
+    /// Without it, the deletion of a child of another user's share would be sent to the private database.
+    private var savedParent: NSManagedObject? {
+        guard object.isDeleted, let parentKey else { return parent }
+        return object.committedValues(forKeys: [parentKey])[parentKey] as? NSManagedObject ?? parent
     }
 
     var zoneId: CKRecordZone.ID {
