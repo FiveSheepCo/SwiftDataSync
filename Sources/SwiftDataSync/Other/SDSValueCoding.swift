@@ -110,7 +110,10 @@ enum SDSValueCoding {
             guard !recordKeys.contains(rawKey), !recordKeys.contains(key) else { continue }
 
             if let relationship = property as? NSRelationshipDescription, relationship.isToMany {
-                values[rawKey] = relationship.isOrdered ? NSOrderedSet() as Any : NSSet() as Any
+                // Uploads leave out unordered relationships with objects, which are synchronized through their inverse
+                // relationships, see `SDSSynchronizableContainer.changeDictionary(for:)`, so a missing one isn't empty
+                guard relationship.isOrdered else { continue }
+                values[rawKey] = NSOrderedSet() as Any
             } else {
                 values[rawKey] = .some(nil)
             }
