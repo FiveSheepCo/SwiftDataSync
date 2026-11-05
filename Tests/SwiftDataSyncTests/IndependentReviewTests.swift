@@ -83,4 +83,24 @@ struct IndependentReviewTests {
         #expect(!quarantine.contains("a", lastChangeDate: changeDate, now: now))
         #expect(quarantine.contains("b", lastChangeDate: changeDate, now: later))
     }
+
+    /// An upload that's rejected as a whole, e.g. a backfill of a field the production schema lacks, adds all its records at
+    /// once, and still forgets the ones whose time is up.
+    @Test func quarantineAddsAWholeUploadAtOnce() {
+        var quarantine = SDSRecordQuarantine()
+        let changeDate = Date(timeIntervalSinceReferenceDate: 1_000)
+        let now = Date(timeIntervalSinceReferenceDate: 2_000)
+        let later = now.addingTimeInterval(SDSRecordQuarantine.duration)
+
+        quarantine.add("old", lastChangeDate: changeDate, now: now)
+        let rejections = Dictionary(uniqueKeysWithValues: (0..<10_000).map {
+            ("r\($0)", SDSRecordQuarantine.Rejection(lastChangeDate: changeDate, error: CKError(.invalidArguments)))
+        })
+        quarantine.add(rejections, now: later)
+
+        #expect(quarantine.count(now: later) == 10_000)
+        #expect(!quarantine.contains("old", lastChangeDate: changeDate, now: later))
+        #expect(quarantine.contains("r9999", lastChangeDate: changeDate, now: later))
+        #expect(quarantine.latestError(now: later) != nil)
+    }
 }
