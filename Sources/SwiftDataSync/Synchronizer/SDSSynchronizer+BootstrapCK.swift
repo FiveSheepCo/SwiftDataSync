@@ -108,8 +108,12 @@ extension SDSSynchronizer {
         // Nothing of this device is in the new account yet. Its data isn't overwritten, see `backfill(onlyUntracked:)`.
         // Written first, so it's also done if the app is terminated before the reset is saved.
         updateFileState { state in
+            // A page save that was interrupted is still repaired before the backfill (see `repairInterruptedPageSave()`), as
+            // its local entities without objects would otherwise be taken for objects that vanished
+            let interruptedPageSave = state.interruptedPageSave
             state = FileState()
             state.needsFullBackfill = true
+            state.interruptedPageSave = interruptedPageSave
         }
         heldRecords(sharedDatabase: false).removeAll()
         heldRecords(sharedDatabase: true).removeAll()
