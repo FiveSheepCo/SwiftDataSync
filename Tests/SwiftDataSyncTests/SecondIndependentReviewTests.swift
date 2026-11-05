@@ -54,6 +54,39 @@ struct SecondIndependentReviewTests {
         device.terminate()
     }
 
+    /// Device B renames a podcast. Device A starts renaming it too and cancels, e.g. in an edit sheet whose changes are rolled
+    /// back. A's discarded edit isn't uploaded, so B's title stays on every device.
+    @Test func discardedEditDoesNotOverwriteAnotherDevicesEdit() async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try a.insertSubscriptions(["s1"])
+        await a.sync()
+        try await b.launch()
+        await b.sync()
+        try b.editSubscription("s1") { $0.title = "Edited on B" }
+        await b.sync()
+
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = a.synchronizer.observedStore
+        try context.performAndWait {
+            let subscription = try #require(try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "ScenarioSubscription")).first)
+            subscription.setValue("Draft on A", forKey: "title")
+            context.processPendingChanges()
+            context.rollback()
+        }
+        await a.settle()
+        await a.sync()
+        await b.sync()
+
+        #expect(b.serverSubscriptions().map(\.title) == ["Edited on B"])
+        #expect(try a.subscriptions().map(\.title) == ["Edited on B"])
+        #expect(try b.subscriptions().map(\.title) == ["Edited on B"])
+        a.terminate()
+        b.terminate()
+    }
+
     /// Documents below sharable workspaces, without an identity, which can't be below a sharable entity.
     private static let sharableConfiguration = SDSConfiguration(swiftDataEntities: [
         .init(entity: ScenarioSubscription.self, description: .sync(.without([]), identity: ["feedLink"])),
