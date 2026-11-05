@@ -134,6 +134,39 @@ final class SDSHeldRecords {
         try NSKeyedArchiver.archivedData(withRootObject: Array(ids) as NSArray, requiringSecureCoding: true).write(to: skippedIDsURL, options: .atomic)
     }
 
+    private var deletedNamesURL: URL {
+        directory.appending(component: "deleted.archive")
+    }
+
+    /// How long the names of deleted records are kept, see `noteDeleted(_:)`.
+    static let deletedNamesLifetime: TimeInterval = 90 * 24 * 60 * 60
+    /// How many names of deleted records are kept at most, the newest ones.
+    static let maximumDeletedNames = 20_000
+
+    /// The names of records this device knows to be deleted, as it downloaded their deletions, or uploaded them, with when,
+    /// see `CKDownloadHandler.resolveReferences(toDeleted:current:)`.
+    func loadDeletedNames() -> [String: Date] {
+        guard
+            let data = try? Data(contentsOf: deletedNamesURL),
+            let names = try? PropertyListDecoder().decode([String: Date].self, from: data)
+        else { return [:] }
+        return names
+    }
+
+    /// Remembers that records were deleted, and forgets the ones deleted long ago.
+    func noteDeleted(_ names: [String], now: Date = .now) throws {
+        guard !names.isEmpty else { return }
+        var deleted = loadDeletedNames().filter { now.timeIntervalSince($0.value) < Self.deletedNamesLifetime }
+        for name in names {
+            deleted[name] = now
+        }
+        if deleted.count > Self.maximumDeletedNames {
+            deleted = Dictionary(uniqueKeysWithValues: deleted.sorted { $0.value > $1.value }.prefix(Self.maximumDeletedNames).map { ($0.key, $0.value) })
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try PropertyListEncoder().encode(deleted).write(to: deletedNamesURL, options: .atomic)
+    }
+
     /// Forgets everything, e.g. after switching accounts.
     func removeAll() {
         try? FileManager.default.removeItem(at: directory)
