@@ -24,4 +24,33 @@ struct SecondIndependentReviewTests {
             try await synchronizer.resetSyncData()
         }
     }
+
+    /// A document, which has a parent, is edited. Saving its record conflicts, as with `.changedKeys` for a record that exists,
+    /// so the edit is saved over the server's record, which keeps its parent. The upload finishes.
+    @Test func childEditAfterAConflictFinishes() async throws {
+        let server = FakeCloudServer()
+        let device = TestDevice("A", server: server)
+        try await device.launch()
+        try device.change { context in
+            let workspace = ScenarioWorkspace(title: "W")
+            context.insert(workspace)
+            let document = ScenarioDocument(title: "D")
+            context.insert(document)
+            document.workspace = workspace
+        }
+        await device.sync()
+        try device.change { context in
+            let document = try #require(try context.fetch(FetchDescriptor<ScenarioDocument>()).first)
+            document.body = "Edited"
+        }
+        await device.sync()
+
+        #expect(await device.state.error == nil)
+        #expect(server.record(named: documentRecordName("D"), account: "first")?["body"] as? String == "Edited")
+        let pendingCount = device.synchronizer.context.performAndWait {
+            (try? device.synchronizer.context.count(for: CloudKitUpdate.fetchRequest())) ?? -1
+        }
+        #expect(pendingCount == 0)
+        device.terminate()
+    }
 }
