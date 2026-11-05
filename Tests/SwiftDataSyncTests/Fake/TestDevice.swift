@@ -186,6 +186,11 @@ final class TestDevice: @unchecked Sendable {
         }
         #expect(synchronizer.isObservingStore, "\(name) doesn't observe its store")
         if waitForSync {
+            // The first synchronization starts in a task, after the state is idle already, which `settle()` would take for
+            // one that's done, e.g. while other tests keep the machine busy
+            for _ in 0..<100 where !stopped && synchronizer.startedSynchronizationCount == 0 {
+                try await Task.sleep(for: .milliseconds(10))
+            }
             await settle()
         }
     }
