@@ -1545,7 +1545,22 @@ private final class CKDownloadHandler {
         failedRecordIDs = persistedFailedRecordIDs
         identityIndex.discardInsertedObjects()
     }
-    
+
+    /// Whether a required to-one relationship of a saved object lost its object, as the object was deleted, e.g. by a
+    /// downloaded deletion. Has to be called on `context`'s queue.
+    private func lostRequiredRelationship(_ key: String, of object: NSManagedObject) -> Bool {
+        guard
+            !object.isDeleted,
+            !object.isInserted,
+            let relationship = object.entity.relationshipsByName[key],
+            !relationship.isToMany,
+            !relationship.isOptional,
+            object.value(forKey: key) == nil,
+            let previous = object.committedValues(forKeys: [key])[key] as? NSManagedObject
+        else { return false }
+        return previous.isDeleted
+    }
+
     /// Tries fixing the given error and returns whether the context should try to save again or a fix was not possible.
     /// Has to be called on `context`'s queue.
     ///
@@ -1593,6 +1608,21 @@ private final class CKDownloadHandler {
             return false
         }
         
+        // An object that can't exist without an object this download deleted, through a required relationship whose delete rule
+        // only nullifies it, goes with it, like through a cascade rule. Otherwise every download would fail on the deletion,
+        // whose change token would never be saved. Synchronized or not: refreshing a synchronized one would keep it pointing
+        // at the deleted row. The device that deleted the object couldn't save without deleting it or moving it to another
+        // object too, which is downloaded as well, and gives it back its record's values if it still exists.
+        if let key = nsError.userInfo[NSValidationKeyErrorKey] as? String, lostRequiredRelationship(key, of: object) {
+            let recordName = synchronizer.existingRecordId(of: object)
+            context.delete(object)
+            if let recordName {
+                deletedRecordIds.insert(recordName)
+            }
+            synchronizer.logger.error("tryFixingObservedContext: Deleting a `\(object.entity.name ?? "Unknown")` that requires a deleted object")
+            return true
+        }
+
         guard let container = synchronizer.container(for: object) else {
             synchronizer.logger.log("tryFixingObservedContext: Object is not a synchronizable object: \(object.entity.name ?? "Unknown")")
             return false
