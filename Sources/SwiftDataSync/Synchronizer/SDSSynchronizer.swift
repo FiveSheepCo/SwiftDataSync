@@ -340,7 +340,7 @@ public final class SDSSynchronizer: Sendable {
     func isDeletionPending(localId: String) -> Bool {
         mutableState.withLock { state in
             state.removalsBeingStored[localId] != nil || state.deletionsBeingSaved.values.contains { saving in
-                saving.isCurrent && saving.deletions.values.contains { $0.localId == localId }
+                saving.isCurrent && saving.localIds.contains(localId)
             }
         }
     }
@@ -354,6 +354,14 @@ public final class SDSSynchronizer: Sendable {
     struct DeletionsBeingSaved {
         let date: Date
         let deletions: [NSManagedObjectID: SDSObjectDeletion]
+        /// The URIs of the deleted objects, so `isDeletionPending(localId:)` doesn't go through every deletion for each object.
+        let localIds: Set<String>
+
+        init(date: Date, deletions: [NSManagedObjectID: SDSObjectDeletion]) {
+            self.date = date
+            self.deletions = deletions
+            self.localIds = Set(deletions.values.map(\.localId))
+        }
 
         /// Whether the save may still be running. One that failed doesn't say so, and is left behind.
         var isCurrent: Bool {
