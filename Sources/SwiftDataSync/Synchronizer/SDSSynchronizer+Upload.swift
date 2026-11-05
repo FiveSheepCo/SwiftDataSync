@@ -14,12 +14,11 @@ extension SDSSynchronizer {
     }
 
     /// Uploads the pending changes.
-    ///
-    /// Edits are only uploaded for records that exist, and saved over the versions of them that were read, so a record that's
-    /// deleted elsewhere meanwhile, e.g. after the download, isn't created again with only the edited values, see `_upload`.
     /// - Parameters:
     ///   - includingSharedDatabase: Whether the shared database's changes are uploaded, which only happens after it was downloaded.
-    func upload(includingSharedDatabase: Bool = true) async throws -> UploadSummary {
+    ///   - checkingRecordsExist: Whether edits are only uploaded for records that exist, e.g. as the download failed, which
+    ///     would have deleted the edited objects of records that were deleted elsewhere.
+    func upload(includingSharedDatabase: Bool = true, checkingRecordsExist: Bool = false) async throws -> UploadSummary {
         // Records that keep changing in one database don't keep the other's changes from being uploaded
         var changesStillPending: ChangesStillPendingError?
         var summary = UploadSummary()
@@ -28,7 +27,7 @@ extension SDSSynchronizer {
         do {
             for sharedDatabase in includingSharedDatabase ? [false, true] : [false] {
                 do {
-                    summary.rejectedCount += try await _upload(sharedDatabase: sharedDatabase)
+                    summary.rejectedCount += try await _upload(sharedDatabase: sharedDatabase, checkingRecordsExist: checkingRecordsExist)
                 } catch let error as ChangesStillPendingError {
                     changesStillPending = error
                 } catch let error as QuotaExceededError {
@@ -82,27 +81,17 @@ extension SDSSynchronizer {
         /// The error of a record whose zone is gone, or one that says the user isn't signed in anymore. CloudKit only reports
         /// errors of single records for each record, while the operation's result is a success.
         var zoneOrAccountError: CKError?
-        /// Edits of records that were deleted elsewhere meanwhile, which aren't uploaded, see `_upload`.
-        var deletedElsewhere: Set<String> = []
     }
     
-    /// The records in iCloud that edits are saved over, without their values, and the edits of records that don't exist
-    /// anymore, which aren't uploaded: they stay pending until a download deletes their objects. See `_upload`.
-    private func serverVersions(in round: UploadRound, database: any SDSCloudDatabase) async throws -> (records: [CKRecord.ID: CKRecord], deleted: Set<CKRecord.ID>) {
-        // Not records that are based on the ones in iCloud already, e.g. ones that existed when they were saved
-        let edited = round.records.filter { !round.localInserts.contains($0.recordID.recordName) && $0.recordChangeTag == nil }.map(\.recordID)
-        guard !edited.isEmpty else { return ([:], []) }
-        var records: [CKRecord.ID: CKRecord] = [:]
-        var deleted: Set<CKRecord.ID> = []
-        for (recordID, result) in try await database.records(for: edited, desiredKeys: []) {
-            switch result {
-            case .success(let record): records[recordID] = record
-            case .failure(let error as CKError) where error.code == .unknownItem: deleted.insert(recordID)
-            // E.g. CloudKit asks to wait. The record is saved like a new one, which conflicts if it exists.
-            case .failure: break
-            }
-        }
-        return (records, deleted)
+    /// Edits of records that don't exist anymore, which aren't uploaded, see `upload(includingSharedDatabase:checkingRecordsExist:)`.
+    /// They stay pending until a download deletes their objects.
+    private func recordsDeletedElsewhere(in round: UploadRound, database: any SDSCloudDatabase) async throws -> Set<CKRecord.ID> {
+        let edited = round.records.map(\.recordID).filter { !round.localInserts.contains($0.recordName) }
+        guard !edited.isEmpty else { return [] }
+        let results = try await database.records(for: edited, desiredKeys: [])
+        return Set(results.compactMap { recordID, result in
+            if case .failure(let error as CKError) = result, error.code == .unknownItem { recordID } else { nil }
+        })
     }
 
     /// Returns how many records are left for later as CloudKit rejected them, see `SDSRecordQuarantine`.
@@ -111,6 +100,7 @@ extension SDSSynchronizer {
     /// - Parameter deferredSelections: How often in a row every selected record was left for later, see `UploadRound.hasDeferredRecords`.
     private func _upload(
         sharedDatabase: Bool,
+        checkingRecordsExist: Bool,
         maximumRecords: Int = CKModifyRecordsOperation.maximumRecords,
         roundsOfChangedRecords: Int = 0,
         didRetryConflicts: Bool = false,
@@ -130,29 +120,14 @@ extension SDSSynchronizer {
         // up storage, except ones that updates which are left out still reference, see `synchronizableDeletes`.
         let isQuotaPaused = quotaPauseEnd(sharedDatabase: sharedDatabase) != nil
         var round = try synchronizableUpdates(sharedDatabase: sharedDatabase, maximum: isQuotaPaused ? 0 : maximumRecords)
-        // Edits are saved over the records in iCloud, as they were read now, rather than as new records. A record that's
-        // deleted elsewhere meanwhile, e.g. since the download, would otherwise be created again with only the edited
-        // values, and without its identity's. Saving over it fails then, see `classify(_:of:lastChangeDates:into:)`, like
-        // saving over one that changed meanwhile, which is saved over again.
         var skipsEditsDeletedElsewhere = false
-        if !round.insertsBackfilledValues {
-            let (serverRecords, deleted): ([CKRecord.ID: CKRecord], Set<CKRecord.ID>)
-            do {
-                (serverRecords, deleted) = try await serverVersions(in: round, database: database)
-            } catch {
-                CKAsset.removeTemporaryFiles(of: round.records)
-                throw error
-            }
+        if checkingRecordsExist && !round.insertsBackfilledValues {
+            let deleted = try await recordsDeletedElsewhere(in: round, database: database)
             if !deleted.isEmpty {
                 logger.log("Not uploading edits of \(deleted.count) records that were deleted elsewhere")
                 CKAsset.removeTemporaryFiles(of: round.records.filter { deleted.contains($0.recordID) })
                 round.records.removeAll { deleted.contains($0.recordID) }
                 skipsEditsDeletedElsewhere = true
-            }
-            for index in round.records.indices {
-                if let serverRecord = serverRecords[round.records[index].recordID] {
-                    round.records[index] = SDSIdentity.merging(round.records[index], into: serverRecord)
-                }
             }
         }
         do {
@@ -183,7 +158,7 @@ extension SDSSynchronizer {
                     logger.log("Records keep waiting for the records they reference, uploading them later")
                     throw ChangesStillPendingError()
                 }
-                return try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords, deferredSelections: deferredSelections + 1)
+                return try await _upload(sharedDatabase: sharedDatabase, checkingRecordsExist: checkingRecordsExist, maximumRecords: maximumRecords, deferredSelections: deferredSelections + 1)
             }
             self.lastCompletedUpload = Date()
             logger.log("No remaining changed records")
@@ -195,11 +170,10 @@ extension SDSSynchronizer {
             progress = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<UploadProgress, Error>) in
 
                 let operation = CKModifyRecordsOperation(recordsToSave: records, recordIDsToDelete: deletes)
-                // Records that are based on the ones in iCloud are only saved if those didn't change meanwhile, and fail if
-                // they were deleted. Others are inserted, which fails for ones that exist, e.g. another device saved the
-                // same identity first. They're saved over the record in iCloud then, see `retryConflicts`, except that
-                // backfilled values mustn't overwrite what's in iCloud: they're only saved over the keys it lacks.
-                operation.savePolicy = .ifServerRecordUnchanged
+                // Backfilled values mustn't overwrite what's in iCloud, so their records are inserted, which fails for
+                // ones that exist. Their values are then only saved over the keys they lack, see `record(for:)`.
+                // Other changes are saved over the records, also over records another device saved first.
+                operation.savePolicy = round.insertsBackfilledValues ? .ifServerRecordUnchanged : .changedKeys
                 // A record that fails doesn't keep the others from being saved, e.g. one CloudKit rejects
                 operation.isAtomic = false
 
@@ -261,11 +235,6 @@ extension SDSSynchronizer {
                     progress.conflictCount = conflicts.retried
                     progress.completedCount += conflicts.completed
                     progress.rejectedCount = self.quarantineRejectedRecords(outcome.rejected)
-                    progress.deletedElsewhereCount = outcome.deletedElsewhere.count
-                    if !outcome.deletedElsewhere.isEmpty {
-                        self.logger.log("Not uploading edits of \(outcome.deletedElsewhere.count) records that were deleted elsewhere meanwhile")
-                        self.requestSynchronization()
-                    }
                     self.logger.log("Operation completed: \(outcome.doneRecords.count) \(outcome.doneDeletes.count)")
 
                     if let error = outcome.zoneOrAccountError {
@@ -298,28 +267,27 @@ extension SDSSynchronizer {
             let count = records.count + deletes.count
             if count > 1 {
                 logger.log("Operation too large, retrying with at most \(count / 2) records")
-                return try await _upload(sharedDatabase: sharedDatabase, maximumRecords: count / 2, roundsOfChangedRecords: roundsOfChangedRecords)
+                return try await _upload(sharedDatabase: sharedDatabase, checkingRecordsExist: checkingRecordsExist, maximumRecords: count / 2, roundsOfChangedRecords: roundsOfChangedRecords)
             }
             // A single record that is too large on its own is left for later, see `SDSRecordQuarantine`
             guard let record = records.first, let lastChangeDate = lastChangeDates[record.recordID.recordName] else { throw error }
             lastRecordFailure = error
             _ = quarantineRejectedRecords([record.recordID.recordName: .init(lastChangeDate: lastChangeDate, error: error)])
-            return try await _upload(sharedDatabase: sharedDatabase, roundsOfChangedRecords: roundsOfChangedRecords)
+            return try await _upload(sharedDatabase: sharedDatabase, checkingRecordsExist: checkingRecordsExist, roundsOfChangedRecords: roundsOfChangedRecords)
         }
 
-        // A round whose edits turned out to be of deleted records selects them again, which leaves them out then
-        if progress.completedCount > 0 || progress.rejectedCount > 0 || progress.deletedElsewhereCount > 0 {
-            return try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords)
+        if progress.completedCount > 0 || progress.rejectedCount > 0 {
+            return try await _upload(sharedDatabase: sharedDatabase, checkingRecordsExist: checkingRecordsExist, maximumRecords: maximumRecords)
         } else if progress.conflictCount > 0 && !didRetryConflicts {
             // Once more with the records that existed already, but not indefinitely if they keep changing
-            return try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords, roundsOfChangedRecords: roundsOfChangedRecords, didRetryConflicts: true)
+            return try await _upload(sharedDatabase: sharedDatabase, checkingRecordsExist: checkingRecordsExist, maximumRecords: maximumRecords, roundsOfChangedRecords: roundsOfChangedRecords, didRetryConflicts: true)
         } else if progress.changedAgainCount > 0 {
             // The newer changes are uploaded next, but not indefinitely while the app keeps changing the records
             guard roundsOfChangedRecords + 1 < Self.maximumRoundsOfChangedRecords else {
                 logger.log("Records keep changing while uploading, uploading them later")
                 throw ChangesStillPendingError()
             }
-            return try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords, roundsOfChangedRecords: roundsOfChangedRecords + 1)
+            return try await _upload(sharedDatabase: sharedDatabase, checkingRecordsExist: checkingRecordsExist, maximumRecords: maximumRecords, roundsOfChangedRecords: roundsOfChangedRecords + 1)
         } else {
             // E.g. records that keep failing, or keep differing from what was uploaded. They are uploaded with a later synchronization.
             logger.log("No changes completed, uploading the remaining ones later")
@@ -335,10 +303,6 @@ extension SDSSynchronizer {
 
         if let serverRecord = serverRecordOfConflict(error) {
             outcome.conflicts[recordName] = serverRecord
-        } else if ckError?.code == .unknownItem {
-            // A record that was deleted after it was read, see `_upload`. The edit waits for a download to delete its object.
-            // Removals of records that are gone are done, and never get here.
-            outcome.deletedElsewhere.insert(recordName)
         } else if let ckError, [.zoneNotFound, .userDeletedZone, .notAuthenticated].contains(ckError.code) {
             outcome.zoneOrAccountError = ckError
         } else if ckError?.code == .quotaExceeded {
@@ -680,8 +644,6 @@ extension SDSSynchronizer {
         var conflictCount = 0
         /// Records CloudKit rejected, which are uploaded later, see `SDSRecordQuarantine`.
         var rejectedCount = 0
-        /// Edits of records that were deleted elsewhere meanwhile, see `UploadOutcome.deletedElsewhere`.
-        var deletedElsewhereCount = 0
     }
 
     /// Places the values that can be large into the records' fields or their overflow assets, see `SDSOverflow.place`.
