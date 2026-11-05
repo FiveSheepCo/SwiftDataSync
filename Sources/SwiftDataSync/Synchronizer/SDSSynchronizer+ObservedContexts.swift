@@ -32,7 +32,6 @@ struct SDSObjectDeletion: Sendable {
 extension SDSSynchronizer {
     
     func setupNotifications() {
-        NotificationCenter.default.addObserver(self, selector: #selector(contextChanged(_:)), name: .NSManagedObjectContextObjectsDidChange, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(contextWillSave(_:)), name: .NSManagedObjectContextWillSave, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(contextSaved(_:)), name: .NSManagedObjectContextDidSave, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(accountChanged(_:)), name: .CKAccountChanged, object: nil)
@@ -61,23 +60,10 @@ extension SDSSynchronizer {
         return userInfo
     }
     
-    @objc func contextChanged(_ notification:Notification) {
-        guard let userInfo = userInfo(from: notification), !isForgetting else { return }
-        
-        // Only changes are handled here so that the update works. Deletions are stored once they're saved, see `contextWillSave`.
-        // Objects that weren't saved yet are reported too. They don't have a record, and must not get a record id now,
-        // as saving them gives them another one. They are uploaded with all keys once they are saved.
-        let savedObjects = { (key: String) in
-            (userInfo[key] as? NSSet ?? []).compactMap { $0 as? NSManagedObject }.filter { !$0.objectID.isTemporaryID }
-        }
-        // An object that was inserted, but has a permanent ID already, isn't saved yet either
-        let updatedObjects = savedObjects(NSUpdatedObjectsKey).filter { !$0.isInserted }.compactMap(onlyIfSyncronizable)
-        setUpdates(for: changes(of: updatedObjects, inserted: false, beforeSave: true))
-    }
-    
-    /// Changes are stored when they are made, but uploads read the values from the store, so ones that were uploaded
-    /// before they were saved are stored again once they are, see `contextSaved`.
-    /// The keys are read from what is being saved, so changes that were discarded, e.g. by a rollback, aren't stored again.
+    /// Changes are stored once they're saved, see `contextSaved`. The keys are read from what is being saved, rather than
+    /// when changes are made: uploads read the values from the store, and changes that are discarded, e.g. by a rollback,
+    /// an undo or a child context that isn't saved, would otherwise be uploaded with the store's values, over newer ones of
+    /// other devices, and keep the downloaded values of those keys from being stored meanwhile.
     @objc func contextWillSave(_ notification: Notification) {
         guard
             let context = notification.object as? NSManagedObjectContext,
@@ -86,7 +72,10 @@ extension SDSSynchronizer {
             // A child context only saves to its parent, whose save is handled
             context.parent == nil
         else { return }
-        
+
+        // Pending changes are processed first, so the changes and deletions that delete rules cascade to are included, e.g.
+        // an ordered relationship that loses a deleted object
+        context.processPendingChanges()
         var keys: [NSManagedObjectID: Set<String>] = [:]
         for object in context.updatedObjects where !object.objectID.isTemporaryID {
             guard let container = container(for: object) else { continue }
@@ -100,8 +89,6 @@ extension SDSSynchronizer {
 
         // Deletions are read now, as their objects can't be read anymore once they're saved, see `contextSaved`. Only the
         // ones being saved, rather than all that are made, which can still be discarded, e.g. by a rollback.
-        // Pending changes are processed first, so the deletions that delete rules cascade to are included.
-        context.processPendingChanges()
         var deletions: [NSManagedObjectID: SDSObjectDeletion] = [:]
         for object in context.deletedObjects where !object.objectID.isTemporaryID && !wasDeletedBySynchronizer(object.objectID) {
             guard let deleted = onlyIfSyncronizable(object: object) else { continue }
@@ -260,8 +247,7 @@ extension SDSSynchronizer {
     }
     
     /// Has to be called on the queue of the objects' context.
-    /// - Parameter beforeSave: Whether the changes aren't saved yet, so they can still be discarded, see `contextChanged`.
-    func changes(of objects: [SDSSynchronizableContainer], inserted: Bool, beforeSave: Bool = false) -> [SDSObjectChange] {
+    func changes(of objects: [SDSSynchronizableContainer], inserted: Bool) -> [SDSObjectChange] {
         objects.compactMap { updated in
             let parentKey = updated.parentKey
             let syncKeys = updated.syncKeys
@@ -285,7 +271,7 @@ extension SDSSynchronizer {
             // Make sure there are keys that have changed
             guard !keysToSync.isEmpty else { return nil }
 
-            // Callers only pass saved objects. Others don't have a record yet, see `contextChanged`.
+            // Callers only pass saved objects. Others don't have a record yet, see `contextSaved`.
             guard !updated.object.objectID.isTemporaryID else { return nil }
 
             let entityName = updated.object.entity.name!
@@ -296,27 +282,20 @@ extension SDSSynchronizer {
                 entityName: entityName,
                 changedKeys: keysToSync,
                 allKeys: allSyncKeys
-            ), of: updated, inserted: inserted, beforeSave: beforeSave)
+            ), of: updated, inserted: inserted)
         }
     }
 
     /// Adds what the identity of the object's entity, if it has one, needs to the change. Has to be called on the queue of the object's context.
-    /// - Parameter beforeSave: Whether the change isn't saved yet. It can still be discarded, e.g. by a rollback, so the object
-    ///   keeps the record of its saved identity values until it's saved, see `contextSaved`.
-    private func identifying(_ change: SDSObjectChange, of container: SDSSynchronizableContainer, inserted: Bool, beforeSave: Bool = false) -> SDSObjectChange {
+    private func identifying(_ change: SDSObjectChange, of container: SDSSynchronizableContainer, inserted: Bool) -> SDSObjectChange {
         guard
             let identity = configuration?.entities[change.entityName]?.identity,
             !identity.isEmpty
         else { return change }
 
         var change = change
-        if beforeSave {
-            let saved = container.object.committedValues(forKeys: identity)
-            change.identityRecordName = SDSIdentity.identityRecordName(entityName: change.entityName, values: identity.map { saved[$0] })
-        } else {
-            change.identityRecordName = identityRecordName(for: container.object)
-            change.identityChanged = !inserted && identity.contains(where: change.changedKeys.contains)
-        }
+        change.identityRecordName = identityRecordName(for: container.object)
+        change.identityChanged = !inserted && identity.contains(where: change.changedKeys.contains)
         change.allKeys = container.syncKeys + [container.parentKey].compactMap { $0 }
         return change
     }
