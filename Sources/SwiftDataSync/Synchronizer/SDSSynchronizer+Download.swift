@@ -1060,9 +1060,14 @@ private final class CKDownloadHandler {
                 entityName: entityName,
                 identityRecordName: identityRecordName,
                 matchingObject: matchingObject,
-                // Not records of other users' shares, whose objects never take the place of the user's own
-                uniqueMatch: entity.uniquenessConstraints.isEmpty || isForSharedDatabase ? nil : { [unowned self] in
-                    let match = try self.uniqueMatch(for: record, entity: entity, overflowValues: overflowValues, identityRecordName: identityRecordName)
+                uniqueMatch: entity.uniquenessConstraints.isEmpty ? nil : { [unowned self] in
+                    var match = try self.uniqueMatch(for: record, entity: entity, overflowValues: overflowValues, identityRecordName: identityRecordName)
+                    // A record of another user's share never takes the place of the user's own object. Inserting it would make
+                    // Core Data fold it into that object, with the share's values, so it's held instead, until the values differ.
+                    if isForSharedDatabase, match != nil {
+                        synchronizer.logger.error("Holding `\(record.recordID.recordName)` of a share, as a local model has the same unique values")
+                        match = .keepsItsRecord
+                    }
                     if case .keepsItsRecord = match {
                         heldForUniqueValues.insert(record.recordID)
                     }
