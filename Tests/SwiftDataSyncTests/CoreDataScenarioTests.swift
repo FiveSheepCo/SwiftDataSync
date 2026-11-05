@@ -137,6 +137,54 @@ nonisolated(unsafe) private let revisedNoteModel: NSManagedObjectModel = {
     return model
 }()
 
+/// Podcasts with their episodes, and the episode each currently plays, so their records reference each other.
+nonisolated(unsafe) private let currentEpisodeModel: NSManagedObjectModel = {
+    let podcast = NSEntityDescription()
+    podcast.name = "Podcast"
+    let episode = NSEntityDescription()
+    episode.name = "Episode"
+    let title = NSAttributeDescription()
+    title.name = "title"
+    title.type = .string
+    title.isOptional = true
+    let name = NSAttributeDescription()
+    name.name = "name"
+    name.type = .string
+    name.isOptional = true
+
+    let episodes = NSRelationshipDescription()
+    episodes.name = "episodes"
+    episodes.destinationEntity = episode
+    episodes.maxCount = 0
+    episodes.deleteRule = .cascadeDeleteRule
+    let toPodcast = NSRelationshipDescription()
+    toPodcast.name = "podcast"
+    toPodcast.destinationEntity = podcast
+    toPodcast.maxCount = 1
+    toPodcast.deleteRule = .nullifyDeleteRule
+    episodes.inverseRelationship = toPodcast
+    toPodcast.inverseRelationship = episodes
+
+    let current = NSRelationshipDescription()
+    current.name = "current"
+    current.destinationEntity = episode
+    current.maxCount = 1
+    current.deleteRule = .nullifyDeleteRule
+    let currentOf = NSRelationshipDescription()
+    currentOf.name = "currentOf"
+    currentOf.destinationEntity = podcast
+    currentOf.maxCount = 1
+    currentOf.deleteRule = .nullifyDeleteRule
+    current.inverseRelationship = currentOf
+    currentOf.inverseRelationship = current
+
+    podcast.properties = [title, episodes, current]
+    episode.properties = [name, toPodcast, currentOf]
+    let model = NSManagedObjectModel()
+    model.entities = [podcast, episode]
+    return model
+}()
+
 /// A device whose store is a Core Data store, set up with its coordinator.
 private final class CoreDataDevice: @unchecked Sendable {
     let synchronizer: SDSSynchronizer
@@ -307,4 +355,44 @@ struct CoreDataScenarioTests {
         #expect(remote == 1)
         device.synchronizer.invalidate()
     }
+
+    /// A podcast references the episode it currently plays, and the episode references its podcast, so each record waits
+    /// for the other's object. Both are downloaded, with both references.
+    @Test func recordsThatReferenceEachOtherAreDownloaded() async throws {
+        let server = FakeCloudServer()
+        let configuration = SDSConfiguration(rawEntities: [
+            "Podcast": .sync(.all),
+            "Episode": .sync(.without(["currentOf"]))
+        ])
+        let first = try await CoreDataDevice("A", server: server, model: currentEpisodeModel, configuration: configuration)
+        let second = try await CoreDataDevice("B", server: server, model: currentEpisodeModel, configuration: configuration)
+        try first.change { context in
+            let podcast = NSEntityDescription.insertNewObject(forEntityName: "Podcast", into: context)
+            podcast.setValue("P", forKey: "title")
+            let episode = NSEntityDescription.insertNewObject(forEntityName: "Episode", into: context)
+            episode.setValue("E", forKey: "name")
+            episode.setValue(podcast, forKey: "podcast")
+            podcast.setValue(episode, forKey: "current")
+        }
+        await first.sync()
+        await second.sync()
+
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = second.coordinator
+        let (podcastTitles, current, episodePodcast) = try context.performAndWait {
+            let podcasts = try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "Podcast"))
+            let episodes = try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "Episode"))
+            return (
+                podcasts.map { $0.value(forKey: "title") as? String },
+                podcasts.map { ($0.value(forKey: "current") as? NSManagedObject)?.value(forKey: "name") as? String },
+                episodes.map { ($0.value(forKey: "podcast") as? NSManagedObject)?.value(forKey: "title") as? String }
+            )
+        }
+        #expect(podcastTitles == ["P"])
+        #expect(current == ["E"])
+        #expect(episodePodcast == ["P"])
+        first.synchronizer.invalidate()
+        second.synchronizer.invalidate()
+    }
 }
+

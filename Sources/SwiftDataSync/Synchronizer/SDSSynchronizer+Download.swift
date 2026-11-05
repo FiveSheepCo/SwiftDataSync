@@ -458,6 +458,17 @@ private final class CKDownloadHandler {
     private var isAtEndOfZone = false
     /// Records `uniqueMatch(for:...)` held, see `SDSUniqueMatch.keepsItsRecord`.
     private var heldForUniqueValues: Set<CKRecord.ID> = []
+    /// Held records that reference each other, which are stored without those references first, see
+    /// `storeRecordsThatReferenceEachOther(in:)`.
+    private var referencesSetLater: Set<CKRecord.ID> = []
+    /// A reference of a record to records of `referencesSetLater`, set once they're stored.
+    private struct LaterReference {
+        let recordID: CKRecord.ID
+        let rawKey: String
+        let targets: [CKRecord.ID]
+        let isList: Bool
+    }
+    private var laterReferences: [LaterReference] = []
     /// Records and deletions an extension that synchronizes less skipped, as their models or keys are only synchronized by
     /// the app, see `SDSSynchronizer.keysOnlyOthersSynchronize`. The change token moves past them, so the app downloads them
     /// again by their IDs, and deletes the objects of the ones that are gone. Kept in a file once a page is saved.
@@ -935,12 +946,18 @@ private final class CKDownloadHandler {
             if let reference = value as? CKRecord.Reference {
                 if let object = findObject(for: reference.recordID) {
                     values[key] = object
+                } else if referencesSetLater.contains(reference.recordID) {
+                    laterReferences.append(LaterReference(recordID: record.recordID, rawKey: key, targets: [reference.recordID], isList: false))
                 } else {
                     synchronizer.logger.log("noObject1: \(reference.recordID) for \(key)")
                     heldBlockers[record.recordID] = reference.recordID.recordName
                     return nil
                 }
             } else if let references = value as? [CKRecord.Reference] {
+                if references.contains(where: { referencesSetLater.contains($0.recordID) && findObject(for: $0.recordID) == nil }) {
+                    laterReferences.append(LaterReference(recordID: record.recordID, rawKey: key, targets: references.map(\.recordID), isList: true))
+                    continue
+                }
                 var objects = [SDSSynchronizableContainer]()
                 for reference in references {
                     if let container = findObject(for: reference.recordID) {
@@ -1242,6 +1259,7 @@ private final class CKDownloadHandler {
         if finalCompletion && !fetchFailed {
             isAtEndOfZone = true
             retryHeldRecords(all: true)
+            storeRecordsThatReferenceEachOther(in: zoneID)
             for recordID in deferredDeletions where !isForSharedDatabase || recordID.zoneID == zoneID {
                 deferredDeletions.remove(recordID)
                 applyDeletion(of: recordID)
@@ -1288,6 +1306,61 @@ private final class CKDownloadHandler {
         }
     }
     
+    /// Stores held records that only wait for each other, e.g. a podcast that references its current episode, which
+    /// references the podcast, rather than holding them forever: each waits for the other to be stored. They're stored without
+    /// those references first, which are set once all of them are, before the page is saved, so required relationships have
+    /// their objects when it's saved.
+    private func storeRecordsThatReferenceEachOther(in zoneID: CKRecordZone.ID) {
+        var candidates: [CKRecord.ID: (record: CKRecord, missing: Set<CKRecord.ID>)] = [:]
+        for record in recordsToAddLater where isRecord(record, in: zoneID) {
+            let missing = missingReferences(of: record)
+            if !missing.isEmpty {
+                candidates[record.recordID] = (record, missing)
+            }
+        }
+        // Only ones whose missing references are all held themselves, rather than e.g. deleted
+        while true {
+            let ids = Set(candidates.keys)
+            let waiting = candidates.filter { !$0.value.missing.isSubset(of: ids) }.keys
+            guard !waiting.isEmpty else { break }
+            waiting.forEach { candidates[$0] = nil }
+        }
+        guard !candidates.isEmpty else { return }
+
+        synchronizer.logger.log("Storing \(candidates.count) records that reference each other")
+        referencesSetLater = Set(candidates.keys)
+        for (recordID, candidate) in candidates {
+            recordsToAddLater.remove(recordID)
+            _changed(record: candidate.record)
+        }
+        referencesSetLater = []
+        for reference in laterReferences {
+            guard let object = findObject(for: reference.recordID)?.object else { continue }
+            let targets = reference.targets.compactMap { findObject(for: $0)?.object }
+            // E.g. one of them couldn't be stored. The relationship stays as it is.
+            guard targets.count == reference.targets.count else { continue }
+            let key = findCorrespondingKey(entity: object.entity, rawKey: reference.rawKey)
+            object.setValue(reference.isList ? NSOrderedSet(array: targets) : targets.first, forKey: key)
+        }
+        laterReferences = []
+    }
+
+    /// The records a record references that aren't stored, in the keys that are stored. Has to be called on `context`'s queue.
+    private func missingReferences(of record: CKRecord) -> Set<CKRecord.ID> {
+        guard
+            let entity = context.persistentStoreCoordinator?.managedObjectModel.entitiesByName[record.recordType],
+            let syncedKeys = synchronizer.configuration?.entities[record.recordType]?.syncedProperties
+        else { return [] }
+        var missing: Set<CKRecord.ID> = []
+        for key in record.allKeys() where isStored(key, entity: entity, syncedKeys: syncedKeys) {
+            let references = (record[key] as? CKRecord.Reference).map { [$0] } ?? (record[key] as? [CKRecord.Reference]) ?? []
+            for reference in references where findObject(for: reference.recordID) == nil {
+                missing.insert(reference.recordID)
+            }
+        }
+        return missing
+    }
+
     private func isRecord(_ record: CKRecord, in zoneID: CKRecordZone.ID) -> Bool {
         // The private database only uses a single zone
         !isForSharedDatabase || record.recordID.zoneID == zoneID
