@@ -117,7 +117,7 @@ extension SDSSynchronizer {
         // is only deleted once the records that referenced it reference the model's new record, see `storeUpdates`. A device
         // that downloads in between would otherwise delete the model, and what its delete rules cascade to. CloudKit also
         // rejects saving and deleting a record in one operation. While iCloud is full, only removals are uploaded, which free
-        // up storage.
+        // up storage, unless updates that are left out change references, see `synchronizableDeletes`.
         let isQuotaPaused = quotaPauseEnd(sharedDatabase: sharedDatabase) != nil
         var round = try synchronizableUpdates(sharedDatabase: sharedDatabase, maximum: isQuotaPaused ? 0 : maximumRecords)
         var skipsEditsDeletedElsewhere = false
@@ -599,7 +599,16 @@ extension SDSSynchronizer {
         let defaultZoneID = self.defaultZoneID!
         // Quarantined removals are fetched too, so as many more are fetched
         let quarantinedCount = quarantinedRecordCount
+        let model = observedStore?.managedObjectModel
         return context.performAndWait {
+            // Updates that aren't uploaded now, e.g. as CloudKit rejected them or iCloud is full, can change what their records
+            // reference, which their records in iCloud still reference until they're uploaded: a model's previous parent,
+            // which CloudKit deletes them with, or the record a model's identity moved away from, which other devices delete
+            // their models with. The removal could be any of them, as removals don't know their entities, so they wait.
+            if Self.hasPendingReferenceChanges(sharedDatabase: sharedDatabase, model: model, in: self.context) {
+                logger.log("Not uploading removals before changed references, which their records might be referenced by")
+                return ([], 0)
+            }
             var ids: [CKRecord.ID] = []
             var names: Set<String> = []
             var quarantined = 0
@@ -613,6 +622,21 @@ extension SDSSynchronizer {
                 ids.append(removal.recordId(defaultZoneID: defaultZoneID))
             }
             return (ids, quarantined)
+        }
+    }
+
+    /// Whether a pending update changes a relationship of a record that exists, see `synchronizableDeletes`. Has to be
+    /// called on `context`'s queue.
+    private static func hasPendingReferenceChanges(sharedDatabase: Bool, model: NSManagedObjectModel?, in context: NSManagedObjectContext) -> Bool {
+        guard let model else { return false }
+        let request = CloudKitUpdate.fetchRequest()
+        request.sortDescriptors = []
+        request.predicate = NSPredicate(format: sharedDatabase ? "sharedZone != nil" : "sharedZone == nil")
+        request.propertiesToFetch = ["rawChangedKeys", "recordType"]
+        let updates = (try? context.fetch(request)) ?? []
+        return updates.contains { update in
+            guard !update.isLocalInsert, let relationships = model.entitiesByName[update.recordType]?.relationshipsByName else { return false }
+            return update.changedKeys.contains { relationships[$0] != nil }
         }
     }
 

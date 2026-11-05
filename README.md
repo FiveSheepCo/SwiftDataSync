@@ -148,9 +148,12 @@ SDSSynchronizer.shared.start()
 - When the user's iCloud storage is full, uploads pause for half an hour, or until `start()`, `forceDownload()` (e.g. a
   "Sync Now" button) or the settings section's button, and the state shows `CKError.Code.quotaExceeded` with a description
   to show. Pushes don't end the pause. Downloads go on, and records
-  aren't set aside. A full storage of the owner of a share only pauses uploads to shares.
+  aren't set aside. A full storage of the owner of a share only pauses uploads to shares. Deletions are still uploaded, as
+  they free up storage, unless a change that waits moves a model to another parent or reference: its record still
+  references the previous one in iCloud, so deleting that first would delete the model with it.
 - Records CloudKit rejects don't keep other changes from being synchronized. They're retried once they change, or after an
-  hour, and the state shows an error until then.
+  hour, and the state shows an error until then. Deletions wait for them if they move a model to another parent or
+  reference, like while iCloud is full.
 
 ### Large Values
 
