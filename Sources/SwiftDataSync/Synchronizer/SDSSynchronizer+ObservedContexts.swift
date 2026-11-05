@@ -33,6 +33,7 @@ extension SDSSynchronizer {
     
     func setupNotifications() {
         NotificationCenter.default.addObserver(self, selector: #selector(contextWillSave(_:)), name: .NSManagedObjectContextWillSave, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(contextChangedWhileSaving(_:)), name: .NSManagedObjectContextObjectsDidChange, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(contextSaved(_:)), name: .NSManagedObjectContextDidSave, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(accountChanged(_:)), name: .CKAccountChanged, object: nil)
     }
@@ -102,6 +103,31 @@ extension SDSSynchronizer {
         rememberDeletionsBeingSaved(deletions, by: context)
     }
     
+    /// Values can still change once a save started, e.g. in `NSManagedObject.willSave()`, which Core Data calls after
+    /// `NSManagedObjectContextWillSave`, or in an app's observer of it that runs after this one's. They're saved too, so their
+    /// keys are added to the ones being saved. Only while the context saves, so changes that are discarded never are.
+    @objc func contextChangedWhileSaving(_ notification: Notification) {
+        guard
+            let context = notification.object as? NSManagedObjectContext,
+            context.persistentStoreCoordinator == observedStore,
+            context != observedUpdateContext,
+            context.parent == nil,
+            isSavingKeys(by: context),
+            let updated = notification.userInfo?[NSUpdatedObjectsKey] as? Set<NSManagedObject>
+        else { return }
+
+        var keys: [NSManagedObjectID: Set<String>] = [:]
+        for object in updated where !object.objectID.isTemporaryID && !object.isInserted {
+            guard let container = container(for: object) else { continue }
+            let synchronizedKeys = Set(container.syncKeys + [container.parentKey].compactMap { $0 })
+            let changedKeys = synchronizedKeys.intersection(object.changedValues().keys)
+            if !changedKeys.isEmpty {
+                keys[object.objectID] = changedKeys
+            }
+        }
+        addKeysBeingSaved(keys, by: context)
+    }
+
     @objc func contextSaved(_ notification:Notification) {
         guard
             let userInfo = userInfo(from: notification),
