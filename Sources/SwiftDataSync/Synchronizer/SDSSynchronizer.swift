@@ -681,6 +681,10 @@ public final class SDSSynchronizer: Sendable {
 
     /// Has to be called on `context`'s queue.
     func setTemporaryId(_ id: String, for object: NSManagedObject) {
+        // An object that gets another record leaves its previous one, see `SDSUniqueMatch.inserted`
+        if let previous = temporaryObjectIds[object], temporaryObjectsById[previous] === object {
+            temporaryObjectsById[previous] = nil
+        }
         temporaryObjectIds[object] = id
         temporaryObjectsById[id] = object
     }

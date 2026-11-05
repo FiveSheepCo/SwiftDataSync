@@ -158,6 +158,46 @@ struct SecondIndependentReviewTests {
         b.terminate()
     }
 
+    /// Two devices create the same tag, whose name is unique, before they synchronize with each other, so each has a record of
+    /// its own. Neither device folds the other's record into its tag again and again: one record is kept on both, and the
+    /// other device's changes reach the tag.
+    @Test func uniqueValuesOfTwoDevicesBecomeOneRecord() async throws {
+        let server = FakeCloudServer()
+        server.freshRecordsConflict = false
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try await b.launch()
+        try a.change { $0.insert(ScenarioTag(name: "swift", color: "red")) }
+        await a.sync()
+        try b.change { $0.insert(ScenarioTag(name: "swift", color: "blue")) }
+        // B's download fails, so it uploads its own record without knowing A's
+        server.failNextFetch(with: CKError(.networkFailure))
+        await b.settle()
+        #expect(server.records(account: "first").filter { $0.recordType == "ScenarioTag" }.count == 2)
+
+        for _ in 0..<3 {
+            await a.sync()
+            await b.sync()
+        }
+        let tags = server.records(account: "first").filter { $0.recordType == "ScenarioTag" }
+        #expect(tags.count == 1)
+        #expect(try a.count(ScenarioTag.self) == 1)
+        #expect(try b.count(ScenarioTag.self) == 1)
+
+        // A change on one device reaches the other
+        try a.change { context in
+            let tag = try #require(try context.fetch(FetchDescriptor<ScenarioTag>()).first)
+            tag.color = "green"
+        }
+        await a.sync()
+        await b.sync()
+        let context = ModelContext(try #require(b.modelContainer))
+        #expect(try context.fetch(FetchDescriptor<ScenarioTag>()).map(\.color) == ["green"])
+        a.terminate()
+        b.terminate()
+    }
+
     /// Documents below sharable workspaces, without an identity, which can't be below a sharable entity.
     private static let sharableConfiguration = SDSConfiguration(swiftDataEntities: [
         .init(entity: ScenarioSubscription.self, description: .sync(.without([]), identity: ["feedLink"])),

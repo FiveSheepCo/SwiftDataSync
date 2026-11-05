@@ -955,6 +955,9 @@ private final class CKDownloadHandler {
                 entityName: entityName,
                 identityRecordName: identityRecordName,
                 matchingObject: matchingObject,
+                uniqueMatch: entity.uniquenessConstraints.isEmpty ? nil : { [unowned self] in
+                    try self.uniqueMatch(for: record, entity: entity, overflowValues: overflowValues, identityRecordName: identityRecordName)
+                },
                 context: context,
                 preliminaryUpdateHandler: preliminaryUpdateHandler
             )
@@ -970,6 +973,50 @@ private final class CKDownloadHandler {
         }
     }
     
+    /// A local object the record would duplicate under a uniqueness constraint of its entity, e.g. as two devices created the
+    /// same thing before they had identities, which gave them records of their own. See `SDSUniqueMatch`.
+    ///
+    /// Of two records, the one named after the identity, if the entity has one, or else the one whose name comes first, is
+    /// kept, the same on every device. An object without a record gets the downloaded one. Only constraints of attributes that
+    /// records store are looked at. Has to be called on `context`'s queue.
+    private func uniqueMatch(for record: CKRecord, entity: NSEntityDescription, overflowValues: [String: Any], identityRecordName: String?) throws -> SDSUniqueMatch? {
+        guard let entityName = entity.name else { return nil }
+        let syncedKeys = synchronizer.configuration?.entities[entityName]?.syncedProperties ?? []
+        for constraint in entity.uniquenessConstraints {
+            let keys = constraint.compactMap { ($0 as? String) ?? ($0 as? NSPropertyDescription)?.name }
+            var predicates: [NSPredicate] = []
+            for key in keys {
+                // Records don't store unsynchronized values, and missing values don't conflict
+                guard
+                    let attribute = entity.attributesByName[key],
+                    syncedKeys.contains(key),
+                    let rawValue = record[attribute.renamingIdentifier ?? key] ?? overflowValues[attribute.renamingIdentifier ?? key]
+                else { break }
+                // E.g. URLs and UUIDs are stored as strings, see `SDSValueCoding`
+                let value = (rawValue is String || rawValue is Data) ? (try? SDSValueCoding.localValue(for: rawValue, attribute: attribute)) ?? rawValue : rawValue
+                predicates.append(NSPredicate(format: "%K == %@", argumentArray: [key, value]))
+            }
+            guard !predicates.isEmpty, predicates.count == keys.count else { continue }
+
+            let request = NSFetchRequest<NSManagedObject>(entityName: entityName)
+            request.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: predicates)
+            // Also objects this download inserted, which aren't saved yet
+            guard let object = try context.fetch(request).first(where: { !$0.isDeleted }) else { continue }
+
+            let recordName = record.recordID.recordName
+            guard let ownName = synchronizer.existingRecordId(of: object) else {
+                return .saved(object, replacingOwnRecord: false)
+            }
+            guard ownName != recordName else { return nil }
+            let isKept = identityRecordName.map { recordName == $0 || (ownName != $0 && recordName < ownName) } ?? (recordName < ownName)
+            if !isKept {
+                return .keepsItsRecord
+            }
+            return object.isInserted ? .inserted(object) : .saved(object, replacingOwnRecord: true)
+        }
+        return nil
+    }
+
     func deleted(recordID: CKRecord.ID, recordType: String) {
         guard failure == nil else { return }
         context.performAndWaitUnchecked {
