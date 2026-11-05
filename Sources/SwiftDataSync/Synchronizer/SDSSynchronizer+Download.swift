@@ -66,7 +66,7 @@ extension SDSSynchronizer {
                 try await refreshSharedZoneIDs()
             }
             try await self._download(sharedDatabase: true, scope: scope)
-        } catch let error where !(error is StoppedError || error is AccountChangedError || error is SDSSyncLease.UnavailableError || Self.isNotAuthenticated(error)) {
+        } catch let error where !Self.endsSynchronization(error) {
             logger.error("Failed to download the shared database: \(error.localizedDescription)")
             return error
         }
@@ -114,7 +114,7 @@ extension SDSSynchronizer {
                     }
                     finishCatchUp(catchUp)
                 }
-            } catch let error where !(error is StoppedError || error is AccountChangedError || error is SDSSyncLease.UnavailableError || Self.isNotAuthenticated(error)) {
+            } catch let error where !Self.endsSynchronization(error) {
                 // The synchronization itself succeeded
                 logger.log("Failed to catch up, retrying later: \(error.localizedDescription)")
                 catchUpLater()
@@ -125,9 +125,20 @@ extension SDSSynchronizer {
             // Their zones' change tokens weren't saved, so they are downloaded again now.
             let isCatchUpPending = pendingCatchUp != nil
             try await _download(scope: .all(catchUpIsPending: isCatchUpPending))
-            try await _download(sharedDatabase: true, scope: .all(catchUpIsPending: isCatchUpPending))
+            do {
+                try await _download(sharedDatabase: true, scope: .all(catchUpIsPending: isCatchUpPending))
+            } catch let error where !Self.endsSynchronization(error) {
+                // Like the shared database's download above, it doesn't keep the private database from being uploaded
+                logger.error("Failed to download the shared database after catching up: \(error.localizedDescription)")
+                return error
+            }
         }
         return nil
+    }
+
+    /// Whether an error ends the synchronization, rather than only the download of the shared database or a catch-up.
+    private static func endsSynchronization(_ error: any Error) -> Bool {
+        error is StoppedError || error is AccountChangedError || error is SDSSyncLease.UnavailableError || isNotAuthenticated(error)
     }
     
     /// Registers newly shared zones, and cleans up after zones that are no longer shared with the current user.
