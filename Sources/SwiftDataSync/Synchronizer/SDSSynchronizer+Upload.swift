@@ -257,13 +257,6 @@ extension SDSSynchronizer {
                     }
 
                     var progress = self.deleteObjects(for: outcome.doneRecords, deletes: outcome.doneDeletes, round: round)
-                    // So records that still reference them are known to wait for records that are gone, see
-                    // `CKDownloadHandler.resolveReferences(toDeleted:current:)`
-                    do {
-                        try self.heldRecords(sharedDatabase: sharedDatabase).noteDeleted(outcome.doneDeletes.map(\.recordName))
-                    } catch {
-                        self.logger.error("Failed to remember deleted records: \(error.localizedDescription)")
-                    }
                     let conflicts = self.retryConflicts(outcome.conflicts, ofBackfilledValues: round.insertsBackfilledValues)
                     progress.conflictCount = conflicts.retried
                     progress.completedCount += conflicts.completed
