@@ -134,6 +134,9 @@ public final class SDSSynchronizer: Sendable {
         var removalsBeingStored: [String: Int] = [:]
         /// Records a catch-up couldn't store, and whether it's tried again for them, see `download(refreshingSharedZones:)`.
         var recordsSkippedWhileCatchingUp: [String: Bool] = [:]
+        /// Models and keys that other processes synchronize, but this one doesn't, e.g. an extension that synchronizes less.
+        /// See `CKDownloadHandler.skippedRecordIDs`.
+        var keysOnlyOthersSynchronize: Set<String> = []
         /// The keys being caught up on that downloaded records had, by record name, see `noteCaughtUpKeys(_:of:)`.
         var caughtUpKeysOfRecords: [String: Set<String>] = [:]
     }
@@ -709,6 +712,14 @@ public final class SDSSynchronizer: Sendable {
     /// records were saved, before the objects. Tests use them to simulate a process that is terminated in between.
     nonisolated(unsafe) var afterSavingDownloadedObjects: (@Sendable () -> Void)?
     nonisolated(unsafe) var afterSavingDownloadedRecords: (@Sendable () -> Void)?
+    /// Whether this process is an app extension, e.g. a widget's, which can have little memory and time. Tests set it.
+    nonisolated(unsafe) var isAppExtension = Bundle.main.bundleURL.pathExtension == "appex"
+
+    /// Models and keys that other processes synchronize, but this one doesn't, see `CKDownloadHandler.skippedRecordIDs`.
+    var keysOnlyOthersSynchronize: Set<String> {
+        mutableState.withLock { $0.keysOnlyOthersSynchronize }
+    }
+
     /// Called by downloads right before the downloaded objects are saved, once local changes were looked for. Tests use it to
     /// save a local change in between.
     nonisolated(unsafe) var beforeSavingDownloadedObjects: (@Sendable () -> Void)?
@@ -1309,11 +1320,23 @@ public final class SDSSynchronizer: Sendable {
             storeSynchronizedKeys(keys)
             return
         }
-        // The stored keys aren't reduced, as another process using the same synchronization data, e.g. an extension,
-        // can synchronize less, which would make the others catch up again every time
-        guard !keys.isSubset(of: previousKeys) else { return }
-        
-        mutableState.withLock { $0.catchUp = CatchUp(keys: keys.union(previousKeys), newKeys: keys.subtracting(previousKeys)) }
+        if isAppExtension {
+            // An extension can synchronize less than the app, which uses the same synchronization data. It doesn't reduce the
+            // stored keys, which would make the app catch up again every time, but keeps the records it skips for the app.
+            let skippedKeys = previousKeys.subtracting(keys)
+            mutableState.withLock { $0.keysOnlyOthersSynchronize = skippedKeys }
+            guard !keys.isSubset(of: previousKeys) else { return }
+            mutableState.withLock { $0.catchUp = CatchUp(keys: keys.union(previousKeys), newKeys: keys.subtracting(previousKeys)) }
+        } else {
+            // The app forgets what it doesn't synchronize anymore, as downloads skip it, so a later version that synchronizes
+            // it again catches up on it
+            let keptKeys = previousKeys.intersection(keys)
+            if keptKeys != previousKeys {
+                storeSynchronizedKeys(keptKeys)
+            }
+            guard !keys.isSubset(of: keptKeys) else { return }
+            mutableState.withLock { $0.catchUp = CatchUp(keys: keys, newKeys: keys.subtracting(keptKeys)) }
+        }
     }
     
     private var synchronizedKeysURL: URL? {

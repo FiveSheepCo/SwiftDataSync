@@ -416,5 +416,76 @@ struct ThirdIndependentReviewTests {
         #expect(try b.subscription("s1")?.note == "Newer from A")
         b.terminate()
     }
+
+    /// A version of the app stops synchronizing notes for a while, and a later one synchronizes them again. The later one
+    /// catches up on what another device changed meanwhile, which the version in between skipped.
+    @Test func keyThatWasSkippedForAWhileIsCaughtUpOn() async throws {
+        let server = FakeCloudServer()
+        let b = TestDevice("B", server: server)
+        try await b.launch()
+        try b.insertSubscriptions(["s1"])
+        try b.editSubscription("s1") { $0.note = "First" }
+        await b.sync()
+        b.terminate()
+
+        try await b.launch(configuration: Self.withoutNotes)
+        server.seed([subscriptionRecord("s1", title: "Title of s1", note: "Changed elsewhere")], account: "first")
+        await b.sync()
+        b.terminate()
+
+        try await b.launch()
+        await b.sync()
+        #expect(try b.subscription("s1")?.note == "Changed elsewhere")
+        #expect(b.serverSubscriptions().first?.note == "Changed elsewhere")
+        b.terminate()
+    }
+
+    /// An extension that doesn't synchronize notes, neither the model nor the subscriptions' key.
+    private static let extensionConfiguration = SDSConfiguration(swiftDataEntities: [
+        .init(entity: ScenarioSubscription.self, description: .sync(.without(["note"]), identity: ["feedLink"])),
+        .init(entity: ScenarioEpisode.self, description: .sync(.without([]), identity: ["feedLink", "guid"])),
+        .init(entity: ScenarioNote.self, description: .noSync),
+        .init(entity: ScenarioLink.self, description: .sync(.without([]))),
+        .init(entity: ScenarioTag.self, description: .sync(.without([]))),
+        .init(entity: ScenarioWorkspace.self, description: .sync(.without([]))),
+        .init(entity: ScenarioDocument.self, description: .sync(.without([]), parentKey: "workspace", identity: ["title"]))
+    ])
+
+    /// Device B's extension, which synchronizes less, downloads with the app's synchronization data while another device
+    /// changes a subscription's note, adds a note, and deletes another. B's app gets what the extension skipped.
+    @Test func appGetsWhatAnExtensionSkipped() async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try a.insertSubscriptions(["s1"])
+        try a.change { $0.insert(ScenarioNote(text: "gone")) }
+        await a.sync()
+        try await b.launch()
+        await b.sync()
+        #expect(try b.notes() == ["gone"])
+        b.terminate()
+
+        try a.editSubscription("s1") { $0.note = "N"; $0.title = "T2" }
+        try a.change { context in
+            context.insert(ScenarioNote(text: "n1"))
+            try context.fetch(FetchDescriptor<ScenarioNote>(predicate: #Predicate { $0.text == "gone" })).forEach(context.delete)
+        }
+        await a.sync()
+
+        b.beforeSetup = { $0.isAppExtension = true }
+        try await b.launch(configuration: Self.extensionConfiguration)
+        await b.sync()
+        b.terminate()
+        b.beforeSetup = nil
+        try await b.launch()
+        await b.sync()
+
+        #expect(try b.subscription("s1")?.title == "T2")
+        #expect(try b.subscription("s1")?.note == "N")
+        #expect(try b.notes() == ["n1"])
+        a.terminate()
+        b.terminate()
+    }
 }
 

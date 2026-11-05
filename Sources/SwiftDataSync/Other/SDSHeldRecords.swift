@@ -112,6 +112,28 @@ final class SDSHeldRecords {
         try NSKeyedArchiver.archivedData(withRootObject: Array(ids) as NSArray, requiringSecureCoding: true).write(to: deferredDeletionsURL, options: .atomic)
     }
 
+    private var skippedIDsURL: URL {
+        directory.appending(component: "skipped.archive")
+    }
+
+    /// The IDs of records an extension skipped, which the app downloads again, see `CKDownloadHandler.skippedRecordIDs`.
+    func loadSkippedIDs() -> Set<CKRecord.ID> {
+        guard
+            let data = try? Data(contentsOf: skippedIDsURL),
+            let ids = try? NSKeyedUnarchiver.unarchivedArrayOfObjects(ofClass: CKRecord.ID.self, from: data)
+        else { return [] }
+        return Set(ids)
+    }
+
+    func storeSkippedIDs(_ ids: Set<CKRecord.ID>) throws {
+        guard !ids.isEmpty else {
+            try? FileManager.default.removeItem(at: skippedIDsURL)
+            return
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try NSKeyedArchiver.archivedData(withRootObject: Array(ids) as NSArray, requiringSecureCoding: true).write(to: skippedIDsURL, options: .atomic)
+    }
+
     /// Forgets everything, e.g. after switching accounts.
     func removeAll() {
         try? FileManager.default.removeItem(at: directory)
