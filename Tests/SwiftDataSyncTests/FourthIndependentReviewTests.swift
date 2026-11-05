@@ -234,6 +234,60 @@ struct FourthIndependentReviewTests {
         a.terminate()
         b.terminate()
     }
+
+    /// The links of each subscription, as `feedLink: [link names]`, and the links without a subscription under `-`.
+    private func links(_ device: TestDevice) throws -> [String: [String]] {
+        let links = try ModelContext(#require(device.modelContainer)).fetch(FetchDescriptor<ScenarioLink>())
+        return Dictionary(grouping: links) { $0.subscription?.feedLink ?? "-" }.mapValues { $0.map(\.name).sorted() }
+    }
+
+    /// Device B moves a link to another subscription, which device A deletes without knowing about the move, so A doesn't
+    /// delete the link with it, and the link's record references a subscription that's gone. B deletes the link with the
+    /// subscription through its delete rule. A, and a new device C, do the same rather than holding the record forever,
+    /// while A keeps showing the link at its previous subscription.
+    @Test func linkMovedIntoADeletedSubscriptionIsGoneEverywhere() async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try await b.launch()
+        try a.insertSubscriptions(["s1", "s2"])
+        try a.change { context in
+            let link = ScenarioLink(name: "l1")
+            context.insert(link)
+            link.subscription = try context.fetch(FetchDescriptor<ScenarioSubscription>(predicate: #Predicate { $0.feedLink == "s1" })).first
+        }
+        await a.sync()
+        await b.sync()
+
+        b.synchronizer.stop()
+        a.synchronizer.stop()
+        try b.change { context in
+            let link = try #require(try context.fetch(FetchDescriptor<ScenarioLink>()).first)
+            link.subscription = try context.fetch(FetchDescriptor<ScenarioSubscription>(predicate: #Predicate { $0.feedLink == "s2" })).first
+        }
+        try a.deleteSubscription("s2")
+        b.synchronizer.start()
+        await b.settle()
+        a.synchronizer.start()
+        await a.settle()
+        for _ in 0..<2 {
+            await b.sync()
+            await a.sync()
+        }
+
+        #expect(try links(a).isEmpty)
+        #expect(try links(b).isEmpty)
+        let c = TestDevice("C", server: server)
+        try await c.launch()
+        await c.sync()
+        await c.sync()
+        #expect(try links(c).isEmpty)
+        #expect(try c.subscriptions().map(\.feedLink) == ["s1"])
+        a.terminate()
+        b.terminate()
+        c.terminate()
+    }
 }
 
 /// Runs a block on the context's queue without waiting for it.
