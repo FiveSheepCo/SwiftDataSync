@@ -842,17 +842,6 @@ public final class SDSSynchronizer: Sendable {
         temporaryObjectsById[id] = object
     }
 
-    /// Local models that were given random record names, as a download was inserting an object with the same identity, by
-    /// the URIs of the models, with the identities' record names. The download merges them, see
-    /// `CKDownloadHandler.mergeIdentityCollisions()`. Only used on `context`'s queue.
-    nonisolated(unsafe) var identityCollisions: [String: String] = [:]
-
-    /// Has to be called on `context`'s queue.
-    func removeTemporaryObject(for id: String) {
-        guard let object = temporaryObjectsById.removeValue(forKey: id) else { return }
-        temporaryObjectIds[object] = nil
-    }
-
     /// Has to be called on `context`'s queue.
     func removeAllTemporaryObjects() {
         temporaryObjectIds = [:]

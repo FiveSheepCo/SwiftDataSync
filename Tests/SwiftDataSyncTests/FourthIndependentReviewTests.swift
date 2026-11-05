@@ -468,40 +468,6 @@ struct FourthIndependentReviewTests {
         #expect(a.serverNotes() == ["n1 edited", "n2 derived"])
         a.terminate()
     }
-
-    /// Device A creates a subscription. Device B creates the same subscription while its download of A's is about to be
-    /// saved, so B's app couldn't see A's yet. They become one, with one record named after the identity, rather than B's
-    /// getting a record of its own.
-    @Test func modelCreatedWhileADownloadInsertsItBecomesOne() async throws {
-        let server = FakeCloudServer()
-        let a = TestDevice("A", server: server)
-        let b = TestDevice("B", server: server)
-        try await a.launch()
-        try await b.launch()
-        try a.change { $0.insert(ScenarioSubscription(feedLink: "s9", title: "From A")) }
-        await a.sync()
-
-        let isDone = OSAllocatedUnfairLock(initialState: false)
-        let container = try #require(b.modelContainer)
-        b.synchronizer.beforeSavingDownloadedObjects = {
-            guard isDone.withLock({ done in defer { done = true }; return !done }) else { return }
-            let context = ModelContext(container)
-            context.autosaveEnabled = false
-            context.insert(ScenarioSubscription(feedLink: "s9", title: "From B"))
-            try? context.save()
-        }
-        await b.sync()
-        b.synchronizer.beforeSavingDownloadedObjects = nil
-        await b.sync()
-        await a.sync()
-
-        #expect(isDone.withLock { $0 })
-        #expect(server.records(account: "first").filter { $0.recordType == "ScenarioSubscription" }.map(\.recordID.recordName) == [subscriptionRecordName("s9")])
-        #expect(try b.subscriptions().map(\.title) == ["From B"])
-        #expect(try a.subscriptions().map(\.title) == ["From B"])
-        a.terminate()
-        b.terminate()
-    }
 }
 
 /// Runs a block on the context's queue without waiting for it.
