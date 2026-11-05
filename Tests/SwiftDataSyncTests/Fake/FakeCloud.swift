@@ -568,7 +568,18 @@ final class FakeCloudServer: @unchecked Sendable {
         }
 
         let changedKeys = record.changedKeys()
-        let size = changedKeys.reduce(0) { $0 + Self.size(of: record[$1]) }
+        // CloudKit reads the file of every asset it saves
+        if changedKeys.contains(where: { record[$0] is CKAsset && assets[$0] == nil }) {
+            return .failure(CKError(.assetFileNotFound))
+        }
+        // The limit is on the whole record as stored, not only on the keys that change (assets don't count)
+        let existingRecord = account.zones[recordID.zoneID.zoneName]?.records[recordID.recordName]
+        let savedKeys = policy == .allKeys ? record.allKeys() : changedKeys
+        let keptSize = policy == .allKeys ? 0 : (existingRecord?.values ?? [:]).reduce(0) { sum, entry in
+            guard !savedKeys.contains(entry.key), case .value(let value) = entry.value else { return sum }
+            return sum + Self.size(of: value)
+        }
+        let size = savedKeys.reduce(keptSize) { $0 + Self.size(of: record[$1]) }
         guard size <= Self.recordSizeLimit else {
             return .failure(CKError(.limitExceeded, userInfo: [NSLocalizedDescriptionKey: "Record too large"]))
         }
@@ -685,6 +696,11 @@ final class FakeCloudServer: @unchecked Sendable {
             return fail(error)
         }
 
+        // CloudKit removes the files of downloaded assets once the operation is over, so they have to be copied before
+        let assetsDirectory = Self.downloadedAssetsDirectory.appending(component: "fetch-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try! FileManager.default.createDirectory(at: assetsDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: assetsDirectory) }
+
         var zoneErrors: [CKRecordZone.ID: any Error] = [:]
         for zoneID in zoneIDs {
             let configuration = operation.configurationsByRecordZoneID?[zoneID]
@@ -713,7 +729,7 @@ final class FakeCloudServer: @unchecked Sendable {
                 let changes = latest.values.sorted { $0.sequence < $1.sequence }.map { entry -> (Int, Change) in
                     let recordID = CKRecord.ID(recordName: entry.recordName, zoneID: zoneID)
                     if !entry.isDeletion, let stored = zone.records[entry.recordName] {
-                        let record = makeRecord(name: entry.recordName, stored: stored, zoneID: zoneID, desiredKeys: configuration?.desiredKeys)
+                        let record = makeRecord(name: entry.recordName, stored: stored, zoneID: zoneID, desiredKeys: configuration?.desiredKeys, assetsDirectory: assetsDirectory)
                         if let index = brokenAssets.firstIndex(where: { $0.remaining > 0 && $0.matches(recordID) }) {
                             brokenAssets[index].remaining -= 1
                             for key in record.allKeys() where record[key] is CKAsset {
@@ -761,10 +777,14 @@ final class FakeCloudServer: @unchecked Sendable {
                     index += page.count
                     pages += 1
 
-                    let token = FakeChangeToken.make(.init(incarnation: snapshot.incarnation, sequence: page.last!.sequence))
-                    beforePageTokenUpdate?(device, pages)
-                    operation.recordZoneChangeTokensUpdatedBlock?(zoneID, token, nil)
-                    pageDelivered?(device, pages)
+                    // CloudKit only calls the token update block between pages: the last token comes with the zone's result
+                    let isLastPage = index >= snapshot.changes.count
+                    if !isLastPage {
+                        let token = FakeChangeToken.make(.init(incarnation: snapshot.incarnation, sequence: page.last!.sequence))
+                        beforePageTokenUpdate?(device, pages)
+                        operation.recordZoneChangeTokensUpdatedBlock?(zoneID, token, nil)
+                        pageDelivered?(device, pages)
+                    }
 
                     let hangs: Bool = lock.withLock {
                         guard let hangAfter = _hangDownloadAfterPages, pages >= hangAfter else { return false }
@@ -784,7 +804,15 @@ final class FakeCloudServer: @unchecked Sendable {
                 }
                 let endSequence = moreComing ? snapshot.changes[index - 1].sequence : snapshot.end
                 let token = FakeChangeToken.make(.init(incarnation: snapshot.incarnation, sequence: endSequence))
+                // The hooks of the zone's last page run around its result, which brings that page's token
+                let deliversLastPage = !moreComing && pages > 0
+                if deliversLastPage {
+                    beforePageTokenUpdate?(device, pages)
+                }
                 operation.recordZoneFetchResultBlock?(zoneID, .success((serverChangeToken: token, clientChangeTokenData: nil, moreComing: moreComing)))
+                if deliversLastPage {
+                    pageDelivered?(device, pages)
+                }
             }
         }
 
@@ -810,14 +838,14 @@ final class FakeCloudServer: @unchecked Sendable {
     }
 
     /// A record as CloudKit returns it: with a change tag, assets in files, and no changed keys. Has to be called while locked.
-    private func makeRecord(name: String, stored: StoredRecord, zoneID: CKRecordZone.ID, desiredKeys: [CKRecord.FieldKey]?) -> CKRecord {
+    private func makeRecord(name: String, stored: StoredRecord, zoneID: CKRecordZone.ID, desiredKeys: [CKRecord.FieldKey]?, assetsDirectory: URL? = nil) -> CKRecord {
         let record = CKRecord(recordType: stored.recordType, recordID: CKRecord.ID(recordName: name, zoneID: zoneID))
         for (key, value) in stored.values where desiredKeys?.contains(key) ?? true {
             switch value {
             case .value(let value):
                 record[key] = value
             case .asset(let data):
-                let url = Self.downloadedAssetsDirectory.appending(component: UUID().uuidString)
+                let url = (assetsDirectory ?? Self.downloadedAssetsDirectory).appending(component: UUID().uuidString)
                 try! data.write(to: url)
                 record[key] = CKAsset(fileURL: url)
             }
