@@ -316,6 +316,55 @@ struct FourthIndependentReviewTests {
         a.terminate()
         b.terminate()
     }
+
+    /// A subscription's artwork and note are both large, so both are in the record's overflow asset. Editing the note keeps
+    /// the artwork in the asset, also as the upload reads the record from iCloud without its values first.
+    @Test func editingOneLargeValueKeepsTheOthers() async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try await b.launch()
+        let artwork = Data(repeating: 7, count: 300_000)
+        try a.insertSubscriptions(["s1"])
+        try a.editSubscription("s1") {
+            $0.artwork = artwork
+            $0.note = String(repeating: "n", count: 300_000)
+        }
+        await a.sync()
+        let note = String(repeating: "m", count: 300_000)
+        try a.editSubscription("s1") { $0.note = note }
+        await a.sync()
+        await b.sync()
+
+        #expect(try b.subscription("s1")?.note == note)
+        #expect(try b.subscription("s1")?.artwork == artwork)
+        a.terminate()
+        b.terminate()
+    }
+
+    /// A large artwork, which is in the overflow asset, is cleared. Other devices clear it too, rather than reading the asset's
+    /// value, which would stay in iCloud.
+    @Test func clearingALargeValueSticks() async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try await b.launch()
+        try a.insertSubscriptions(["s1"])
+        await a.sync()
+        try a.editSubscription("s1") { $0.artwork = Data(repeating: 7, count: 300_000) }
+        await a.sync()
+        await b.sync()
+        #expect(try b.subscription("s1")?.artwork?.count == 300_000)
+
+        try a.editSubscription("s1") { $0.artwork = nil }
+        await a.sync()
+        await b.sync()
+        #expect(try b.subscription("s1")?.artwork == nil)
+        a.terminate()
+        b.terminate()
+    }
 }
 
 /// Runs a block on the context's queue without waiting for it.

@@ -309,9 +309,9 @@ final class FakeCloudServer: @unchecked Sendable {
         }
     }
 
-    func record(named name: String, account: String, zone: CKRecordZone.ID = .scenario) -> CKRecord? {
+    func record(named name: String, account: String, zone: CKRecordZone.ID = .scenario, desiredKeys: [CKRecord.FieldKey]? = nil) -> CKRecord? {
         lock.withLock {
-            accounts[account]?.zones[zone.zoneName]?.records[name].map { makeRecord(name: name, stored: $0, zoneID: zone, desiredKeys: nil) }
+            accounts[account]?.zones[zone.zoneName]?.records[name].map { makeRecord(name: name, stored: $0, zoneID: zone, desiredKeys: desiredKeys) }
         }
     }
 
@@ -955,7 +955,8 @@ final class FakeCloudDatabase: SDSCloudDatabase, @unchecked Sendable {
         // Like CloudKit, which rejects operations of more than 400 items
         if ids.count > 400 { throw CKError(.limitExceeded) }
         return Dictionary(uniqueKeysWithValues: ids.map { id in
-            let record = isShared ? nil : container.server.record(named: id.recordName, account: accountName, zone: id.zoneID)
+            // Only the keys asked for, like CloudKit: none for only the system fields
+            let record = isShared ? nil : container.server.record(named: id.recordName, account: accountName, zone: id.zoneID, desiredKeys: desiredKeys)
             return (id, record.map { .success($0) } ?? .failure(CKError(.unknownItem)))
         })
     }
