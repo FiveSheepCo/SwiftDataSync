@@ -335,10 +335,13 @@ final class TestDevice: @unchecked Sendable {
         return server.records(account: account).filter { $0.recordType == "ScenarioNote" }.compactMap { $0["text"] as? String }.sorted()
     }
 
-    /// Signs into another account, or out, and tells the synchronizer like iCloud does.
+    /// Signs into another account, or out, and tells the synchronizer like iCloud does. Only this device's: iCloud posts
+    /// `CKAccountChanged` to the whole process, which would make the synchronizers of tests that run meanwhile check their
+    /// accounts again, e.g. so `hasDownloadedOnce` is false until they synchronize again. A device that isn't running checks
+    /// its account when it's launched.
     func switchAccount(to account: FakeCloudContainer.AccountState) {
         cloud.account = account
-        NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
+        synchronizer?.accountChanged(Notification(name: .CKAccountChanged))
     }
 }
 

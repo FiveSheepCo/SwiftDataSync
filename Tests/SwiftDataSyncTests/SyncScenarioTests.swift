@@ -33,7 +33,7 @@ extension SDSSynchronizationViewModel.State {
 /// and download code: turning sync on with a lot of data, merging with data in iCloud, restoring on a new device,
 /// stopping, editing on several devices, switching accounts, losing zones and stores, large values and CloudKit's limits.
 ///
-/// The devices share `CKAccountChanged` and the files of assets with the rest of the process, so the scenarios run one by one.
+/// The devices share the files of assets with the rest of the process, so the scenarios run one by one.
 @Suite(.coreDataReady, .serialized, .timeLimit(.minutes(3)))
 struct SyncScenarioTests {
 
