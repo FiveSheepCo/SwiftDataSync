@@ -27,7 +27,9 @@ Call `setup` once, as early as possible, e.g. when the app launches, so pushes t
 
 Saves of the observed store are recorded as pending changes, and synchronized shortly after: every synchronization
 **downloads first, then uploads**. Local changes are thus uploaded over the newest values: an edit of a model that another
-device deleted is discarded with the deletion, rather than uploaded as a partial record. Local changes that weren't
+device deleted is discarded with the deletion, rather than uploaded as a partial record. Edits are saved over the
+records as they are in iCloud when they're uploaded, and only if they didn't change or disappear meanwhile, so that also
+holds for a model that's deleted after the download. Local changes that weren't
 uploaded yet still win over downloaded values of the same keys. A model created on this device keeps its record, though:
 e.g. after unsubscribing and subscribing again, the earlier deletion doesn't delete the new subscription. If the download
 fails, the changes are uploaded anyway, edits only of records that still exist, except while every record is downloaded
