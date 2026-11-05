@@ -29,7 +29,10 @@ Saves of the observed store are recorded as pending changes, and synchronized sh
 **downloads first, then uploads**. Local changes are thus uploaded over the newest values: an edit of a model that another
 device deleted is discarded with the deletion, rather than uploaded as a partial record. Edits are saved over the
 records as they are in iCloud when they're uploaded, and only if they didn't change or disappear meanwhile, so that also
-holds for a model that's deleted after the download. Local changes that weren't
+holds for a model that's deleted after the download. A model that one device moves into another one, e.g. a link into
+a subscription, while another device deletes that one without knowing about the move, is deleted by the delete rule on
+the device that moved it, while the device that deleted the other one keeps it at its previous place until it changes
+again, and its record stays in iCloud. Local changes that weren't
 uploaded yet still win over downloaded values of the same keys. A model created on this device keeps its record, though:
 e.g. after unsubscribing and subscribing again, the earlier deletion doesn't delete the new subscription. If the download
 fails, the changes are uploaded anyway, edits only of records that still exist, except while every record is downloaded
@@ -121,8 +124,8 @@ To start over instead, `resetSyncData()` forgets everything the synchronizer sto
 have records, the changes that weren't uploaded, change tokens and whether everything was downloaded. iCloud's data stays
 as it is. Synchronizing stops, and the next `start()` downloads everything and uploads the local objects iCloud doesn't
 have, like a new device. Local models without an identity, or without all of its values, are first matched with the
-records that have their values, so they aren't duplicated, and local copies of other users' shares are removed, and
-downloaded again. Changes made in
+records that have their values, so they aren't duplicated, though one whose changes weren't uploaded yet doesn't match
+its record, and becomes another one. Local copies of other users' shares are removed, and downloaded again. Changes made in
 `beforeForgetting`, which runs once no synchronization runs anymore, aren't recorded, so they're never uploaded: an app can
 empty its store there, to look at iCloud's data before deciding what to do with its own. If the data can't be forgotten,
 e.g. as the disk is full, the reset throws, the data stays as it is, apart from local copies of other users' shares that

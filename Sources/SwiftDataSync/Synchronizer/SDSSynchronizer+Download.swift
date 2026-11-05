@@ -52,30 +52,8 @@ extension SDSSynchronizer {
     /// failing, as it mustn't keep the private database from being uploaded. Its own changes aren't uploaded then, as they're
     /// only uploaded after a download.
     /// - Parameter refreshingSharedZones: Whether the shared zones have to be refreshed, which `synchronize()` usually did already.
-    /// How many records are fetched by their IDs at once, see `fetchRecords(_:desiredKeys:from:)`. CloudKit fetches at most 400.
-    static let fetchBatchSize = 200
-
-    /// Fetches records by their IDs, in batches, as CloudKit rejects fetching more than 400 at once. Records of batches
-    /// that failed are left out, and an error is logged. Throws only if synchronizing stopped.
-    func fetchRecords(_ recordIDs: [CKRecord.ID], desiredKeys: [CKRecord.FieldKey]?, from database: any SDSCloudDatabase) async throws -> [CKRecord.ID: Result<CKRecord, any Error>] {
-        var results: [CKRecord.ID: Result<CKRecord, any Error>] = [:]
-        var batchSize = Self.fetchBatchSize
-        var start = 0
-        while start < recordIDs.count {
-            let batch = Array(recordIDs[start ..< min(start + batchSize, recordIDs.count)])
-            do {
-                results.merge(try await database.records(for: batch, desiredKeys: desiredKeys)) { $1 }
-                start += batch.count
-            } catch let error as CKError where error.code == .limitExceeded && batchSize > 1 {
-                batchSize /= 2
-            } catch {
-                logger.error("Failed to fetch \(recordIDs.count - start) records, trying later: \(error.localizedDescription)")
-                try checkNotStopped()
-                break
-            }
-        }
-        return results
-    }
+    /// How many records are downloaded again at once, see `_downloadOnce`. CloudKit fetches at most 400.
+    static let downloadAgainBatchSize = 200
 
     func download(refreshingSharedZones: Bool = true) async throws -> (any Error)? {
         // Downloads skip models and keys this version doesn't synchronize, e.g. ones a newer version added, while their change
@@ -335,24 +313,23 @@ extension SDSSynchronizer {
             // Records of zones that are no longer shared mustn't be stored
             handler.forgetHeldRecords(outside: Set(configurations.keys))
         }
-        // Records that failed to download before are downloaded again, rather than holding back the change token. Ones that
-        // fail are tried again by the next download.
-        let database = (sharedDatabase ? cloudSharedDatabase : cloudPrivateDatabase)!
+        // Records that failed to download before are downloaded again, rather than holding back the change token. In batches,
+        // as CloudKit rejects fetching more than 400 records at once. Ones that fail are tried again by the next download.
         let failedRecordIDs = handler.recordIDsToDownloadAgain
-        if !failedRecordIDs.isEmpty {
-            handler.addDownloadedAgain(try await fetchRecords(failedRecordIDs, desiredKeys: nil, from: database))
-        }
-        // Held records that wait for records that are gone, e.g. a child that one device moved into a parent another device
-        // deleted, are stored like the other device's delete rule would have, see `CKDownloadHandler.resolveReferences(toDeleted:current:)`
-        if case .all = scope, let observedUpdateContext {
-            let targets = observedUpdateContext.performAndWaitUnchecked { handler.missingReferencesOfEarlierHeldRecords() }
-            let deleted = Set(try await fetchRecords(targets, desiredKeys: [], from: database).compactMap { recordID, result in
-                if case .failure(let error as CKError) = result, error.code == .unknownItem { recordID } else { nil }
-            })
-            if !deleted.isEmpty {
-                let referencing = observedUpdateContext.performAndWaitUnchecked { handler.heldRecordIDs(referencingAny: deleted) }
-                let current = try await fetchRecords(referencing, desiredKeys: nil, from: database)
-                observedUpdateContext.performAndWaitUnchecked { handler.resolveReferences(toDeleted: deleted, current: current) }
+        let database = (sharedDatabase ? cloudSharedDatabase : cloudPrivateDatabase)!
+        var batchSize = Self.downloadAgainBatchSize
+        var start = 0
+        while start < failedRecordIDs.count {
+            let batch = Array(failedRecordIDs[start ..< min(start + batchSize, failedRecordIDs.count)])
+            do {
+                handler.addDownloadedAgain(try await database.records(for: batch, desiredKeys: nil))
+                start += batch.count
+            } catch let error as CKError where error.code == .limitExceeded && batchSize > 1 {
+                batchSize /= 2
+            } catch {
+                logger.error("Failed to download \(failedRecordIDs.count - start) records again, trying later: \(error.localizedDescription)")
+                try checkNotStopped()
+                break
             }
         }
         
@@ -1427,97 +1404,7 @@ private final class CKDownloadHandler {
                 missing.insert(reference.recordID)
             }
         }
-        if let parent = record.parent, findObject(for: parent.recordID) == nil {
-            missing.insert(parent.recordID)
-        }
         return missing
-    }
-
-    /// The records that held records of earlier downloads reference, which aren't stored, see `resolveReferences(toDeleted:current:)`.
-    /// Has to be called on `context`'s queue.
-    ///
-    /// Only records this device knows were deleted, as it downloaded their deletions or uploaded them: others might only
-    /// not exist yet, e.g. as CloudKit rejects them for now, and the record that waits for them would be lost meanwhile.
-    func missingReferencesOfEarlierHeldRecords() -> [CKRecord.ID] {
-        guard let heldRecords else { return [] }
-        let held = recordsToAddLater.ids
-        var targets: Set<CKRecord.ID> = []
-        for record in recordsToAddLater where persistedHeld[record.recordID] != nil {
-            targets.formUnion(missingReferences(of: record))
-        }
-        targets = targets.subtracting(held).subtracting(failedRecordIDs).subtracting(skippedRecordIDs)
-        guard !targets.isEmpty else { return [] }
-        let deletedNames = heldRecords.loadDeletedNames()
-        return targets.filter { deletedNames[$0.recordName] != nil }
-    }
-
-    /// The held records that reference any of the records. Has to be called on `context`'s queue.
-    func heldRecordIDs(referencingAny recordIDs: Set<CKRecord.ID>) -> [CKRecord.ID] {
-        recordsToAddLater.filter { !missingReferences(of: $0).isDisjoint(with: recordIDs) }.map(\.recordID)
-    }
-
-    /// Stores held records that wait for records that are gone like the delete rules of the device that deleted them would
-    /// have, e.g. a link that one device moved into a subscription that another device deleted, which didn't know about the
-    /// move. A record whose reference's inverse cascades is gone with it, and so is its object here. A record whose reference's
-    /// inverse nullifies is stored without it. Nothing is uploaded: a later version of the record, e.g. one another device
-    /// moved again, is still downloaded.
-    ///
-    /// Only records that are the same version in iCloud still, as a newer one might not reference the records anymore.
-    /// Records that are gone are deleted like by a download. Has to be called on `context`'s queue.
-    /// - Parameter current: The records that reference them, as they are in iCloud now.
-    func resolveReferences(toDeleted deleted: Set<CKRecord.ID>, current: [CKRecord.ID: Result<CKRecord, any Error>]) {
-        let model = context.persistentStoreCoordinator?.managedObjectModel
-        for (recordID, result) in current {
-            guard let held = recordsToAddLater.first(where: { $0.recordID == recordID }) else { continue }
-            switch result {
-            case .failure(let error as CKError) where error.code == .unknownItem:
-                recordsToAddLater.remove(recordID)
-                _deleted(recordID: recordID, recordType: held.recordType)
-                continue
-            case .success(let record) where Self.version(of: record) != Self.version(of: held):
-                // Tried again like any held record
-                recordsToAddLater.remove(recordID)
-                recordsToAddLater.append(record)
-                continue
-            case .success:
-                break
-            case .failure:
-                continue
-            }
-            guard
-                let entity = model?.entitiesByName[held.recordType],
-                let configuration = synchronizer.configuration?.entities[held.recordType]
-            else { continue }
-
-            var cascades = false
-            let resolved = held.copy() as! CKRecord
-            for key in held.allKeys() where isStored(key, entity: entity, syncedKeys: configuration.syncedProperties) {
-                let relationship = entity.relationshipsByName[findCorrespondingKey(entity: entity, rawKey: key)]
-                if let reference = held[key] as? CKRecord.Reference, deleted.contains(reference.recordID) {
-                    cascades = cascades || relationship?.inverseRelationship?.deleteRule == .cascadeDeleteRule
-                    resolved[key] = nil
-                } else if let references = held[key] as? [CKRecord.Reference], references.contains(where: { deleted.contains($0.recordID) }) {
-                    cascades = cascades || relationship?.inverseRelationship?.deleteRule == .cascadeDeleteRule
-                    let remaining = references.filter { !deleted.contains($0.recordID) }
-                    resolved[key] = remaining.isEmpty ? nil : remaining as CKRecordValue
-                }
-            }
-            if let parent = held.parent, deleted.contains(parent.recordID) {
-                let relationship = configuration.parentKey.flatMap { entity.relationshipsByName[$0] }
-                cascades = cascades || relationship?.inverseRelationship?.deleteRule == .cascadeDeleteRule
-                resolved.parent = nil
-                resolved[SDSSynchronizer.Constants.parentWorkaroundKey] = nil
-            }
-
-            recordsToAddLater.remove(recordID)
-            if cascades {
-                synchronizer.logger.log("Deleting `\(recordID.recordName)`, as the record its delete rule cascades from is gone")
-                _deleted(recordID: recordID, recordType: held.recordType)
-            } else {
-                synchronizer.logger.log("Storing `\(recordID.recordName)` without its references to records that are gone")
-                recordsToAddLater.append(resolved)
-            }
-        }
     }
 
     private func isRecord(_ record: CKRecord, in zoneID: CKRecordZone.ID) -> Bool {
@@ -1817,13 +1704,6 @@ private final class CKDownloadHandler {
         self.tokensToUpdate = [:]
         let deletedRecordIds = Array(self.deletedRecordIds)
         self.deletedRecordIds = []
-        if let heldRecords {
-            do {
-                try heldRecords.noteDeleted(deletedRecordIds)
-            } catch {
-                synchronizer.logger.error("Failed to remember deleted records: \(error.localizedDescription)")
-            }
-        }
         let existingRecords = self.existingRecords
         self.existingRecords = []
 
