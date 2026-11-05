@@ -285,10 +285,11 @@ final class SDSContentIndex {
     /// - Parameter onlyCopiesOfShares: Whether only objects below sharable roots without records are matched, for the records
     ///   of other users' shares: the user's own objects, which aren't below sharable roots, or whose roots got records from
     ///   the private database, never become copies of records in someone else's share.
-    init(synchronizer: SDSSynchronizer, context: NSManagedObjectContext, trackedLocalIds: Set<String>, onlyCopiesOfShares: Bool = false) {
+    /// - Parameter excludedLocalIds: Objects that are matched otherwise, e.g. by the records they had before a reset.
+    init(synchronizer: SDSSynchronizer, context: NSManagedObjectContext, trackedLocalIds: Set<String>, excludedLocalIds: Set<String> = [], onlyCopiesOfShares: Bool = false) {
         self.synchronizer = synchronizer
         self.context = context
-        self.trackedLocalIds = trackedLocalIds
+        self.trackedLocalIds = trackedLocalIds.union(excludedLocalIds)
         self.onlyCopiesOfShares = onlyCopiesOfShares
     }
 

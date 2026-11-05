@@ -254,13 +254,48 @@ extension SDSSynchronizer {
     
     /// Every record was downloaded again after objects vanished, which gave the copies of the vanished objects their
     /// records. The objects without records left are queued with the next synchronization, see `backfill(onlyUntracked:)`.
-    func finishRecoveringVanishedObjects() {
+    ///
+    /// Models that had records before the synchronization data was reset, which weren't downloaded, were deleted elsewhere
+    /// meanwhile, and are deleted here too, rather than uploaded again, see `resetSyncData(beforeForgetting:)`. Unless records
+    /// failed to download.
+    func finishRecoveringVanishedObjects(everyRecordWasDownloaded: Bool) {
+        let hints = heldRecords(sharedDatabase: false)
+        if everyRecordWasDownloaded {
+            deleteModelsWhoseRecordsAreGone(localIds: Array(hints.loadResetHints().values))
+        }
+        hints.removeResetHints()
         updateFileState { state in
             state.isRecoveringVanishedObjects = false
             state.incompleteRecoveries = nil
         }
         mutableStateNeedsBackfill()
         requestSynchronization()
+    }
+
+    /// Deletes the models that still have no records, without uploading their deletions, see `finishRecoveringVanishedObjects`.
+    private func deleteModelsWhoseRecordsAreGone(localIds: [String]) {
+        guard !localIds.isEmpty, let observedUpdateContext, let observedStore else { return }
+        let tracked = context.performAndWait { Set(CloudKitLocalEntity.entries(forLocalIds: localIds, in: context).keys) }
+        let gone = localIds.filter { !tracked.contains($0) }
+        guard !gone.isEmpty else { return }
+        observedUpdateContext.performAndWaitUnchecked {
+            var count = 0
+            for localId in gone {
+                guard
+                    let objectID = URL(string: localId).flatMap(observedStore.managedObjectID(forURIRepresentation:)),
+                    let object = try? observedUpdateContext.existingObject(with: objectID)
+                else { continue }
+                observedUpdateContext.delete(object)
+                count += 1
+            }
+            do {
+                try saveObservedUpdateContext(observedUpdateContext)
+                logger.log("Deleted \(count) models whose records were deleted elsewhere since the synchronization data was reset")
+            } catch {
+                observedUpdateContext.rollback()
+                logger.error("Failed to delete the models whose records are gone: \(error.localizedDescription)")
+            }
+        }
     }
 
     /// How many downloads of every record can have failed records before recovering vanished objects ends anyway, see

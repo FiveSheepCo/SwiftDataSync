@@ -1102,8 +1102,22 @@ public final class SDSSynchronizer: Sendable {
         let wasRecovering = isRecoveringVanishedObjects
         updateFileState { $0.isRecoveringVanishedObjects = true }
         let context = self.context
+        // The records the models had, which recovering gives them again, see `CKDownloadHandler.resetHints`. Only records known
+        // to exist, rather than ones only named here, whose models are uploaded again like new ones.
+        var resetHints: [String: String] = [:]
         do {
             try context.performAndWaitUnchecked {
+                let inserts = NSFetchRequest<NSDictionary>(entityName: "CloudKitUpdate")
+                inserts.resultType = .dictionaryResultType
+                inserts.propertiesToFetch = ["id"]
+                inserts.predicate = NSPredicate(format: "rawChangedKeys BEGINSWITH %@", CloudKitUpdate.insertMarker)
+                let named = Set(((try? context.fetch(inserts)) ?? []).compactMap { $0["id"] as? String })
+                // Models that were deleted, which wasn't uploaded yet, are gone already
+                let removed = Set(((try? context.fetch(CloudKitRemoval.fetchRequest())) ?? []).map(\.id))
+                for entity in (try? context.fetch(CloudKitLocalEntity.fetchRequest())) ?? [] where !named.contains(entity.id) && !removed.contains(entity.id) {
+                    resetHints[entity.id] = entity.localId
+                }
+
                 for entityName in ["CloudKitLocalEntity", "CloudKitUpdate", "CloudKitRemoval", "CloudKitZone", "CloudKitShare", "SDSSynchronizerSavedState"] {
                     ((try? context.fetch(NSFetchRequest<NSManagedObject>(entityName: entityName))) ?? []).forEach(context.delete)
                 }
@@ -1124,6 +1138,12 @@ public final class SDSSynchronizer: Sendable {
 
         heldRecords(sharedDatabase: false).removeAll()
         heldRecords(sharedDatabase: true).removeAll()
+        do {
+            try heldRecords(sharedDatabase: false).storeResetHints(resetHints)
+        } catch {
+            // The models are matched by their values instead
+            logger.error("Failed to keep the records of the models: \(error.localizedDescription)")
+        }
         updateFileState { state in
             state = FileState()
             state.isRecoveringVanishedObjects = true
