@@ -152,6 +152,7 @@ extension SDSSynchronizer {
             for index in round.records.indices {
                 if let serverRecord = serverRecords[round.records[index].recordID] {
                     round.records[index] = SDSIdentity.merging(round.records[index], into: serverRecord)
+                    round.withoutServerValues.insert(serverRecord.recordID.recordName)
                 }
             }
         }
@@ -424,6 +425,9 @@ extension SDSSynchronizer {
         /// Whether records are left for a later round, as the objects they reference only got records while they were
         /// selected, see `synchronizableUpdates(sharedDatabase:maximum:)`.
         var hasDeferredRecords = false
+        /// Records based on the ones in iCloud without their values, only their system fields, see `serverVersions(in:database:)`.
+        /// Their overflow assets and large values aren't known, see `placeLargeValues(in:database:)`.
+        var withoutServerValues: Set<String> = []
     }
 
     /// Up to `maximum` records to upload.
@@ -705,7 +709,8 @@ extension SDSSynchronizer {
             guard !changedKeys.isEmpty else { continue }
 
             let name = record.recordID.recordName
-            let isServerRecord = record.recordChangeTag != nil
+            // A record read without its values doesn't tell whether it has an asset
+            let isServerRecord = record.recordChangeTag != nil && !round.withoutServerValues.contains(name)
             let hasAsset = !overflowKeys(of: name).isEmpty || (isServerRecord && record[SDSOverflow.key] != nil)
             // Values that fit, of a record without an asset, stay in their fields
             guard hasAsset || round.overflowingLocally.contains(name) else { continue }
@@ -722,6 +727,7 @@ extension SDSSynchronizer {
             switch serverRecords[record.recordID] {
             case .success(let serverRecord):
                 record = SDSIdentity.merging(record, into: serverRecord)
+                round.withoutServerValues.remove(record.recordID.recordName)
             case .failure(let error as CKError) where error.code == .unknownItem:
                 // E.g. it was never uploaded, or deleted elsewhere, so it has no asset
                 break
@@ -734,7 +740,7 @@ extension SDSSynchronizer {
                 changedKeys: changedKeys,
                 largeKeys: largeKeys,
                 in: record,
-                hasServerValues: record.recordChangeTag != nil
+                hasServerValues: record.recordChangeTag != nil && !round.withoutServerValues.contains(record.recordID.recordName)
             )
             round.records[index] = record
         }
