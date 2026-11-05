@@ -599,13 +599,12 @@ extension SDSSynchronizer {
         let defaultZoneID = self.defaultZoneID!
         // Quarantined removals are fetched too, so as many more are fetched
         let quarantinedCount = quarantinedRecordCount
-        let model = observedStore?.managedObjectModel
         return context.performAndWait {
             // Updates that aren't uploaded now, e.g. as CloudKit rejected them or iCloud is full, can change what their records
             // reference, which their records in iCloud still reference until they're uploaded: a model's previous parent,
             // which CloudKit deletes them with, or the record a model's identity moved away from, which other devices delete
             // their models with. The removal could be any of them, as removals don't know their entities, so they wait.
-            if Self.hasPendingReferenceChanges(sharedDatabase: sharedDatabase, model: model, in: self.context) {
+            if Self.hasPendingReferenceChanges(sharedDatabase: sharedDatabase, model: self.observedStore?.managedObjectModel, in: self.context) {
                 logger.log("Not uploading removals before changed references, which their records might be referenced by")
                 return ([], 0)
             }

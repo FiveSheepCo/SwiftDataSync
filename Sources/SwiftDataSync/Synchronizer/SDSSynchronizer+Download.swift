@@ -72,7 +72,6 @@ extension SDSSynchronizer {
         }
 
         // Extensions can have little memory and time, so the app catches up
-        let isAppExtension = Bundle.main.bundleURL.pathExtension == "appex"
         if let catchUp, !isAppExtension, catchUp.retryDate.map({ $0 <= .now }) ?? true {
             try checkNotStopped()
             logger.log("More models or keys are synchronized than before, catching up on them")
@@ -459,6 +458,15 @@ private final class CKDownloadHandler {
     private var isAtEndOfZone = false
     /// Records `uniqueMatch(for:...)` held, see `SDSUniqueMatch.keepsItsRecord`.
     private var heldForUniqueValues: Set<CKRecord.ID> = []
+    /// Records and deletions an extension that synchronizes less skipped, as their models or keys are only synchronized by
+    /// the app, see `SDSSynchronizer.keysOnlyOthersSynchronize`. The change token moves past them, so the app downloads them
+    /// again by their IDs, and deletes the objects of the ones that are gone. Kept in a file once a page is saved.
+    private var skippedRecordIDs: Set<CKRecord.ID> = []
+    private var persistedSkippedRecordIDs: Set<CKRecord.ID> = []
+    /// The models and keys this process skips, see `skippedRecordIDs`.
+    private let skippedKeys: Set<String>
+    /// Whether this process downloads the records others skipped again, see `skippedRecordIDs`.
+    private let downloadsSkippedRecords: Bool
     /// Records that failed to download, which later downloads download again.
     private var failedRecordIDs: Set<CKRecord.ID> = []
     private var persistedFailedRecordIDs: Set<CKRecord.ID> = []
@@ -533,6 +541,8 @@ private final class CKDownloadHandler {
         
         self.isForSharedDatabase = forSharedDatabase
         self.scope = scope
+        self.skippedKeys = synchronizer.keysOnlyOthersSynchronize
+        self.downloadsSkippedRecords = !synchronizer.isAppExtension
         
         self.removalCount = synchronizer.removalCount
         self.pendingUpdateIds = Self.ids(of: "CloudKitUpdate", in: synchronizer.context)
@@ -548,6 +558,8 @@ private final class CKDownloadHandler {
             persistedFailedRecordIDs = failedRecordIDs
             deferredDeletions = heldRecords.loadDeferredDeletions()
             persistedDeferredDeletions = deferredDeletions
+            skippedRecordIDs = heldRecords.loadSkippedIDs()
+            persistedSkippedRecordIDs = skippedRecordIDs
             if !forSharedDatabase && synchronizer.isRecoveringVanishedObjects {
                 contentIndex = SDSContentIndex(synchronizer: synchronizer, context: synchronizer.observedUpdateContext!, trackedLocalIds: Self.localIdsOfConfirmedRecords(in: synchronizer.context))
             }
@@ -561,6 +573,7 @@ private final class CKDownloadHandler {
         recordsToAddLater.removeAll { !zoneIDs.contains($0.recordID.zoneID) }
         failedRecordIDs = failedRecordIDs.filter { zoneIDs.contains($0.zoneID) }
         deferredDeletions = deferredDeletions.filter { zoneIDs.contains($0.zoneID) }
+        skippedRecordIDs = skippedRecordIDs.filter { zoneIDs.contains($0.zoneID) }
     }
     
     /// The records that failed to download before, which are downloaded again before the zone's changes.
@@ -570,18 +583,25 @@ private final class CKDownloadHandler {
     }
 
     var recordIDsToDownloadAgain: [CKRecord.ID] {
-        Array(failedRecordIDs)
+        Array(downloadsSkippedRecords ? failedRecordIDs.union(skippedRecordIDs) : failedRecordIDs)
     }
     
     /// Adds records that were downloaded again, see `recordIDsToDownloadAgain`. Records that are gone aren't downloaded again.
+    /// Objects of skipped records that are gone are deleted, as their deletions were skipped too.
     func addDownloadedAgain(_ results: [CKRecord.ID: Result<CKRecord, any Error>]) {
         for (recordID, result) in results {
             switch result {
             case .success(let record):
                 failedRecordIDs.remove(recordID)
+                skippedRecordIDs.remove(recordID)
                 recordsToAddLater.append(record)
             case .failure(let error as CKError) where error.code == .unknownItem:
                 failedRecordIDs.remove(recordID)
+                if skippedRecordIDs.remove(recordID) != nil {
+                    context.performAndWaitUnchecked {
+                        _deleted(recordID: recordID, recordType: "")
+                    }
+                }
             case .failure:
                 break
             }
@@ -695,6 +715,9 @@ private final class CKDownloadHandler {
         // couldn't be found by their records, so every change would insert another object without values.
         guard let entityConfiguration = synchronizer.configuration?.entities[record.recordType] else {
             synchronizer.logger.log("Skipping record of `\(record.recordType, privacy: .public)`, which isn't synchronized")
+            if heldRecords != nil && skippedKeys.contains(record.recordType) {
+                skippedRecordIDs.insert(record.recordID)
+            }
             return
         }
         let recordName = record.recordID.recordName
@@ -724,6 +747,14 @@ private final class CKDownloadHandler {
             synchronizer.logger.error("Failed reading an asset of `\(recordName)`, setting it aside: \(error.localizedDescription)")
             setAside(record)
             return
+        }
+
+        // Keys only other processes synchronize are downloaded again by the app, see `skippedRecordIDs`
+        if heldRecords != nil, !skippedKeys.isEmpty {
+            let keys = Set(record.allKeys()).union(overflowValues.keys).map { findCorrespondingKey(entity: entity, rawKey: $0) }
+            if keys.contains(where: { skippedKeys.contains("\(record.recordType).\($0)") }) {
+                skippedRecordIDs.insert(record.recordID)
+            }
         }
 
         // Make sure dependent objects exist, and prefill all values if they do
@@ -1077,6 +1108,13 @@ private final class CKDownloadHandler {
             return
         }
         
+        // Models only other processes synchronize, whose objects this one can't find, are deleted by the app, which needs
+        // their metadata to find them
+        if heldRecords != nil, skippedKeys.contains(recordType) {
+            skippedRecordIDs.insert(recordID)
+            return
+        }
+
         // Earlier versions that were held are gone too
         recordsToAddLater.remove(recordID)
         setAsideRecords.remove(recordID)
@@ -1522,6 +1560,7 @@ private final class CKDownloadHandler {
             do {
                 try heldRecords.storeFailedIDs(failedRecordIDs)
                 try heldRecords.storeDeferredDeletions(deferredDeletions)
+                try heldRecords.storeSkippedIDs(skippedRecordIDs)
             } catch {
                 synchronizer.logger.error("Failed to keep the records that failed to download: \(error.localizedDescription)")
                 return error
@@ -1533,6 +1572,7 @@ private final class CKDownloadHandler {
             }
             persistedFailedRecordIDs = failedRecordIDs
             persistedDeferredDeletions = deferredDeletions
+            persistedSkippedRecordIDs = skippedRecordIDs
         }
         
         // Written before the token moves past the records it describes
@@ -1662,6 +1702,7 @@ private final class CKDownloadHandler {
         setAsideRecords.removeAll { !persistedHeldIDs.contains($0.recordID) }
         failedRecordIDs = persistedFailedRecordIDs
         deferredDeletions = persistedDeferredDeletions
+        skippedRecordIDs = persistedSkippedRecordIDs
         heldForUniqueValues = []
         identityIndex.discardInsertedObjects()
     }

@@ -100,7 +100,9 @@ rather than becoming duplicates. Only the ones without such a record are uploade
   CloudKit's error, to show or log why. `forceDownload()`, e.g. a "Sync Now" button, tries them again right away.
 - **App groups**, to synchronize from app extensions too: set `SDSSynchronizer.appGroupToStoreSyncData` to an app group in
   the entitlements of the app and its extensions, before `SDSSynchronizer.shared` is used the first time. Synchronization data
-  that an earlier version stored in the app's container is moved there.
+  that an earlier version stored in the app's container is moved there. An extension can synchronize fewer models or keys
+  than the app: the records and deletions it skips are downloaded again by the app. A version of the app that stops
+  synchronizing a model or key catches up on it once a later version synchronizes it again.
 
 ### Turning Synchronizing Off and On
 
