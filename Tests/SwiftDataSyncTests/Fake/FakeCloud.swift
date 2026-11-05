@@ -253,19 +253,6 @@ final class FakeCloudServer: @unchecked Sendable {
         }
     }
 
-    /// Deletes records while every device's change token expires, so no device downloads the deletions: downloads from scratch
-    /// only bring the records that exist.
-    func deleteWhileTokensExpire(_ recordNames: [String], account: String, zone: CKRecordZone.ID = .scenario) {
-        lock.withLock {
-            guard let stored = self.account(account).zones[zone.zoneName] else { return }
-            for name in recordNames {
-                stored.records[name] = nil
-                stored.log.removeAll { $0.recordName == name }
-            }
-            stored.incarnation = UUID()
-        }
-    }
-
     /// Fails downloading the matching records, like a record whose asset couldn't be downloaded, `count` times in all.
     func failDownloading(where matches: @escaping @Sendable (CKRecord.ID) -> Bool, with error: CKError, count: Int = .max) {
         lock.withLock { downloadFailures.append(RecordFailure(matches: matches, error: error, remaining: count)) }

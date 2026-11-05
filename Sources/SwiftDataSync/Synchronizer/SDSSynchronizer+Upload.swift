@@ -25,9 +25,6 @@ extension SDSSynchronizer {
         var summary = UploadSummary()
         let context = self.context
         lastRecordFailure = nil
-        // Edits of records that are gone are left out of this upload once they're found, see `_upload`, and looked at again
-        // by the next one
-        editsOfRecordsGone = []
         do {
             for sharedDatabase in includingSharedDatabase ? [false, true] : [false] {
                 do {
@@ -137,6 +134,7 @@ extension SDSSynchronizer {
         // deleted elsewhere meanwhile, e.g. since the download, would otherwise be created again with only the edited
         // values, and without its identity's. Saving over it fails then, see `classify(_:of:lastChangeDates:into:)`, like
         // saving over one that changed meanwhile, which is saved over again.
+        var skipsEditsDeletedElsewhere = false
         if !round.insertsBackfilledValues {
             let (serverRecords, deleted): ([CKRecord.ID: CKRecord], Set<CKRecord.ID>)
             do {
@@ -149,13 +147,7 @@ extension SDSSynchronizer {
                 logger.log("Not uploading edits of \(deleted.count) records that were deleted elsewhere")
                 CKAsset.removeTemporaryFiles(of: round.records.filter { deleted.contains($0.recordID) })
                 round.records.removeAll { deleted.contains($0.recordID) }
-                // Left out of the rest of this upload, so they don't keep the updates after them from being selected, e.g. as
-                // the download that deletes their models never comes after the change token expired
-                editsOfRecordsGone.formUnion(deleted.map(\.recordName))
-                // The next updates are selected, before removals, which only go once every update did
-                if round.records.isEmpty {
-                    return try await _upload(sharedDatabase: sharedDatabase, maximumRecords: maximumRecords, roundsOfChangedRecords: roundsOfChangedRecords, didRetryConflicts: didRetryConflicts, deferredSelections: deferredSelections)
-                }
+                skipsEditsDeletedElsewhere = true
             }
             for index in round.records.indices {
                 if let serverRecord = serverRecords[round.records[index].recordID] {
@@ -175,6 +167,10 @@ extension SDSSynchronizer {
             ? synchronizableDeletes(sharedDatabase: sharedDatabase, maximum: maximumRecords)
             : ([], 0)
         round.quarantinedCount += quarantinedDeleteCount
+        // Their updates would be selected again and again, so the remaining edits wait for a download
+        if skipsEditsDeletedElsewhere && round.records.isEmpty && deletes.isEmpty {
+            return round.quarantinedCount
+        }
         let records = round.records
         let lastChangeDates = round.lastChangeDates
         // Removals CloudKit rejects are set aside like records, see `SDSRecordQuarantine.removalChangeDate`
@@ -268,7 +264,6 @@ extension SDSSynchronizer {
                     progress.rejectedCount = self.quarantineRejectedRecords(outcome.rejected)
                     progress.deletedElsewhereCount = outcome.deletedElsewhere.count
                     if !outcome.deletedElsewhere.isEmpty {
-                        self.editsOfRecordsGone.formUnion(outcome.deletedElsewhere)
                         self.logger.log("Not uploading edits of \(outcome.deletedElsewhere.count) records that were deleted elsewhere meanwhile")
                         self.requestSynchronization()
                     }
@@ -445,9 +440,7 @@ extension SDSSynchronizer {
     private func synchronizableUpdates(sharedDatabase: Bool, maximum: Int) throws -> UploadRound {
         guard maximum > 0 else { return UploadRound() }
         let referenceDepths = (configuration?.entities ?? [:]).mapValues(\.referenceDepth)
-        // Updates of records that are gone are fetched again too, see `_upload`
-        let goneNames = editsOfRecordsGone
-        let quarantinedCount = quarantinedRecordCount + goneNames.count
+        let quarantinedCount = quarantinedRecordCount
 
         // By reference depth, lowest first. Updates of other entities, which can't be uploaded, are discarded with the first.
         let typesByDepth = Dictionary(grouping: referenceDepths.keys, by: { referenceDepths[$0] ?? 0 })
@@ -504,7 +497,6 @@ extension SDSSynchronizer {
                                     discardedCount += 1
                                     continue
                                 }
-                                guard !goneNames.contains(update.id) else { continue }
                                 let lastChangeDate = update.lastChangeDate
                                 guard !isQuarantined(update.id, lastChangeDate: lastChangeDate) else {
                                     quarantined += 1
