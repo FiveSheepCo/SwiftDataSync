@@ -619,11 +619,7 @@ public final class SDSSynchronizer: Sendable {
     }
 
     func quarantine(_ rejections: [String: SDSRecordQuarantine.Rejection]) {
-        mutableState.withLock { state in
-            for (recordName, rejection) in rejections {
-                state.quarantine.add(recordName, lastChangeDate: rejection.lastChangeDate, error: rejection.error)
-            }
-        }
+        mutableState.withLock { $0.quarantine.add(rejections) }
     }
 
     /// How many records CloudKit rejected, see `SDSRecordQuarantine.count(now:)`.

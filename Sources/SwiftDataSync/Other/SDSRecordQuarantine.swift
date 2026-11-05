@@ -47,10 +47,19 @@ struct SDSRecordQuarantine: Sendable {
         entries.values.filter { $0.error != nil && now < $0.endDate }.max { $0.endDate < $1.endDate }?.error
     }
 
-    /// Records whose time is up are forgotten, as they're uploaded again anyway.
-    mutating func add(_ recordName: String, lastChangeDate: Date, error: (any Error)? = nil, now: Date = .now) {
+    /// Adds the records CloudKit rejected in one upload. Records whose time is up are forgotten, as they're uploaded again
+    /// anyway, once for all of them, as an upload can reject thousands, e.g. a backfill the production schema lacks a field of.
+    mutating func add(_ rejections: [String: Rejection], now: Date = .now) {
+        guard !rejections.isEmpty else { return }
         entries = entries.filter { now < $0.value.endDate }
-        entries[recordName] = Entry(lastChangeDate: lastChangeDate, endDate: now.addingTimeInterval(Self.duration), error: error)
+        let endDate = now.addingTimeInterval(Self.duration)
+        for (recordName, rejection) in rejections {
+            entries[recordName] = Entry(lastChangeDate: rejection.lastChangeDate, endDate: endDate, error: rejection.error)
+        }
+    }
+
+    mutating func add(_ recordName: String, lastChangeDate: Date, error: (any Error)? = nil, now: Date = .now) {
+        add([recordName: Rejection(lastChangeDate: lastChangeDate, error: error)], now: now)
     }
 
     /// Whether CloudKit rejected a record for a reason that retrying it unchanged doesn't fix.
