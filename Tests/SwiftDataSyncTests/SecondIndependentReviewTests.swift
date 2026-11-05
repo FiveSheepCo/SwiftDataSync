@@ -87,6 +87,43 @@ struct SecondIndependentReviewTests {
         b.terminate()
     }
 
+    /// Device A changes a subscription's identity, which moves it to another record, and its links to it. Uploading the links
+    /// fails for now. Device B downloads in between. The subscription's previous record isn't deleted before the links
+    /// reference the new one, so B doesn't delete the links with it through the delete rule.
+    @Test func identityMoveDeletesThePreviousRecordAfterItsReferences() async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try await b.launch()
+        try a.change { context in
+            let subscription = ScenarioSubscription(feedLink: "old", title: "T")
+            context.insert(subscription)
+            for index in 0..<3 {
+                let link = ScenarioLink(name: "l\(index)")
+                context.insert(link)
+                link.subscription = subscription
+            }
+        }
+        await a.sync()
+        await b.sync()
+        #expect(try b.count(ScenarioLink.self) == 3)
+
+        server.failSaving(where: { $0.recordName != subscriptionRecordName("new") }, with: CKError(.networkFailure), count: 3)
+        try a.editSubscription("old") { $0.feedLink = "new" }
+        await a.settle()
+        await b.sync()
+        #expect(try b.count(ScenarioLink.self) == 3)
+
+        await a.sync()
+        await b.sync()
+        #expect(try b.count(ScenarioLink.self) == 3)
+        #expect(try b.subscriptions().map(\.feedLink) == ["new"])
+        #expect(b.serverSubscriptions().map(\.feedLink) == ["new"])
+        a.terminate()
+        b.terminate()
+    }
+
     /// Documents below sharable workspaces, without an identity, which can't be below a sharable entity.
     private static let sharableConfiguration = SDSConfiguration(swiftDataEntities: [
         .init(entity: ScenarioSubscription.self, description: .sync(.without([]), identity: ["feedLink"])),

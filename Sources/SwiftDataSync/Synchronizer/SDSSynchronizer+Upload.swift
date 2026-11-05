@@ -113,22 +113,30 @@ extension SDSSynchronizer {
         await updateUpdatesToSend()
         let database = (sharedDatabase ? cloudSharedDatabase : cloudPrivateDatabase)!
 
-        // Deletes are retrieved first. The maximum applies to saved and deleted records combined.
-        // While iCloud is full, only removals are uploaded, which free up storage.
-        let (deletes, quarantinedDeleteCount) = synchronizableDeletes(sharedDatabase: sharedDatabase, maximum: maximumRecords)
-        var round = try synchronizableUpdates(sharedDatabase: sharedDatabase, maximum: quotaPauseEnd(sharedDatabase: sharedDatabase) == nil ? maximumRecords - deletes.count : 0)
-        round.quarantinedCount += quarantinedDeleteCount
+        // Removals are uploaded once every update is, in rounds of their own: e.g. the record a model's identity moved away from
+        // is only deleted once the records that referenced it reference the model's new record, see `storeUpdates`. A device
+        // that downloads in between would otherwise delete the model, and what its delete rules cascade to. CloudKit also
+        // rejects saving and deleting a record in one operation. While iCloud is full, only removals are uploaded, which free
+        // up storage.
+        let isQuotaPaused = quotaPauseEnd(sharedDatabase: sharedDatabase) != nil
+        var round = try synchronizableUpdates(sharedDatabase: sharedDatabase, maximum: isQuotaPaused ? 0 : maximumRecords)
+        var skipsEditsDeletedElsewhere = false
         if checkingRecordsExist && !round.insertsBackfilledValues {
             let deleted = try await recordsDeletedElsewhere(in: round, database: database)
             if !deleted.isEmpty {
                 logger.log("Not uploading edits of \(deleted.count) records that were deleted elsewhere")
                 CKAsset.removeTemporaryFiles(of: round.records.filter { deleted.contains($0.recordID) })
                 round.records.removeAll { deleted.contains($0.recordID) }
-                // Their updates would be selected again and again, so the remaining edits wait for a download
-                if round.records.isEmpty && deletes.isEmpty {
-                    return round.quarantinedCount
-                }
+                skipsEditsDeletedElsewhere = true
             }
+        }
+        let (deletes, quarantinedDeleteCount) = round.records.isEmpty && !round.hasDeferredRecords
+            ? synchronizableDeletes(sharedDatabase: sharedDatabase, maximum: maximumRecords)
+            : ([], 0)
+        round.quarantinedCount += quarantinedDeleteCount
+        // Their updates would be selected again and again, so the remaining edits wait for a download
+        if skipsEditsDeletedElsewhere && round.records.isEmpty && deletes.isEmpty {
+            return round.quarantinedCount
         }
         let records = round.records
         let lastChangeDates = round.lastChangeDates
