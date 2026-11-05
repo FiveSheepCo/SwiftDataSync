@@ -36,17 +36,20 @@ struct SDSRecordQuarantine: Sendable {
         return entry.lastChangeDate == lastChangeDate && now < entry.endDate
     }
 
-    /// How many records were rejected, also ones whose time is up.
-    var count: Int {
-        entries.count
+    /// How many records were rejected and aren't uploaded until their time is up, unless they change. Uploads fetch as many
+    /// more updates, as they're left out, so ones whose time is up don't count.
+    func count(now: Date = .now) -> Int {
+        entries.values.count { now < $0.endDate }
     }
 
     /// Why CloudKit rejected the record it rejected last, which later uploads that leave the records out still report.
-    var latestError: (any Error)? {
-        entries.values.filter { $0.error != nil }.max { $0.endDate < $1.endDate }?.error
+    func latestError(now: Date = .now) -> (any Error)? {
+        entries.values.filter { $0.error != nil && now < $0.endDate }.max { $0.endDate < $1.endDate }?.error
     }
 
+    /// Records whose time is up are forgotten, as they're uploaded again anyway.
     mutating func add(_ recordName: String, lastChangeDate: Date, error: (any Error)? = nil, now: Date = .now) {
+        entries = entries.filter { now < $0.value.endDate }
         entries[recordName] = Entry(lastChangeDate: lastChangeDate, endDate: now.addingTimeInterval(Self.duration), error: error)
     }
 

@@ -613,14 +613,14 @@ public final class SDSSynchronizer: Sendable {
         }
     }
 
-    /// How many records CloudKit rejected, see `SDSRecordQuarantine.count`.
+    /// How many records CloudKit rejected, see `SDSRecordQuarantine.count(now:)`.
     var quarantinedRecordCount: Int {
-        mutableState.withLock { $0.quarantine.count }
+        mutableState.withLock { $0.quarantine.count() }
     }
 
-    /// Why CloudKit rejected the record it rejected last, see `SDSRecordQuarantine.latestError`.
+    /// Why CloudKit rejected the record it rejected last, see `SDSRecordQuarantine.latestError(now:)`.
     var latestRejectionError: (any Error)? {
-        mutableState.withLock { $0.quarantine.latestError }
+        mutableState.withLock { $0.quarantine.latestError() }
     }
 
     func resetQuarantine() {
