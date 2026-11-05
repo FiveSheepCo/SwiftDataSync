@@ -428,6 +428,46 @@ struct FourthIndependentReviewTests {
         #expect(server.records(account: "first").filter { $0.recordType == "ScenarioSubscription" }.count == 1)
         a.terminate()
     }
+
+    /// The app observes saves from before the synchronizer is set up, so its observer runs first, and saves the context again
+    /// from there, e.g. to derive a value. Both saves' edits are uploaded, as the second one is done before the first.
+    @Test func saveFromAnObserverOfTheAppKeepsTheFirstSavesEdits() async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        let appContext = OSAllocatedUnfairLock<NSManagedObjectContext?>(uncheckedState: nil)
+        let savesAgain = OSAllocatedUnfairLock(initialState: false)
+        let observer = NotificationCenter.default.addObserver(forName: .NSManagedObjectContextDidSave, object: nil, queue: nil) { notification in
+            guard
+                let context = notification.object as? NSManagedObjectContext,
+                appContext.withLockUnchecked({ $0 === context }),
+                savesAgain.withLock({ isSaving in defer { isSaving = false }; return isSaving })
+            else { return }
+            let notes = try? context.fetch(NSFetchRequest<NSManagedObject>(entityName: "ScenarioNote"))
+            notes?.first { ($0.value(forKey: "text") as? String) == "n2" }?.setValue("n2 derived", forKey: "text")
+            try? context.save()
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        try await a.launch()
+        try a.change { context in
+            for index in 1...2 { context.insert(ScenarioNote(text: "n\(index)")) }
+        }
+        await a.sync()
+
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = try #require(a.synchronizer.observedStore)
+        appContext.withLockUnchecked { $0 = context }
+        try context.performAndWait {
+            let notes = try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "ScenarioNote"))
+            notes.first { ($0.value(forKey: "text") as? String) == "n1" }?.setValue("n1 edited", forKey: "text")
+            savesAgain.withLock { $0 = true }
+            try context.save()
+        }
+        await a.sync()
+        await a.sync()
+
+        #expect(a.serverNotes() == ["n1 edited", "n2 derived"])
+        a.terminate()
+    }
 }
 
 /// Runs a block on the context's queue without waiting for it.

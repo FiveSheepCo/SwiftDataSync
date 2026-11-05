@@ -174,7 +174,7 @@ struct SeventhReviewScenarioTests {
             return (model.objectID, SDSObjectDeletion(localId: model.objectID.uriRepresentation().absoluteString, sharableRootLocalId: nil, isSharable: false))
         }
         let failedContext = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
-        synchronizer.rememberDeletionsBeingSaved([deletion.0: deletion.1], by: failedContext)
+        synchronizer.rememberDeletionsBeingSaved([deletion.0: deletion.1], token: 0, by: failedContext)
 
         server.seed([subscriptionRecord("s1", title: "Edited elsewhere")], account: "first")
         await device.sync()

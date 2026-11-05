@@ -105,7 +105,9 @@ public final class SDSSynchronizer: Sendable {
         
         /// The synchronized keys a context is saving to the store, by context. Read when the save starts, and taken when it's
         /// done, or dropped if it failed, see `KeysBeingSaved`.
-        var keysBeingSaved: [ObjectIdentifier: KeysBeingSaved] = [:]
+        /// A stack for each context, as a save can start while another is being done, e.g. from an observer of its
+        /// `NSManagedObjectContextDidSave` that runs before the synchronizer's: saves nest, so the newest is done first.
+        var keysBeingSaved: [ObjectIdentifier: [KeysBeingSaved]] = [:]
         /// The keys of saves that are done, until they're stored, by the saves' tokens, see `KeysBeingSaved`.
         var keysSavedNotStored: [Int: [NSManagedObjectID: Set<String>]] = [:]
         var lastSaveToken = 0
@@ -133,7 +135,8 @@ public final class SDSSynchronizer: Sendable {
         var queuedReferencedObjectCount = 0
         /// The deletions a context is saving to the store, by object. Read when the save starts, and taken when it's done,
         /// like `keysBeingSaved`.
-        var deletionsBeingSaved: [ObjectIdentifier: DeletionsBeingSaved] = [:]
+        /// A stack for each context, like `keysBeingSaved`.
+        var deletionsBeingSaved: [ObjectIdentifier: [DeletionsBeingSaved]] = [:]
         /// The URIs of objects whose deletions were saved, until their removals are stored, see `contextSaved`.
         var removalsBeingStored: [String: Int] = [:]
         /// Records a catch-up couldn't store, and whether it's tried again for them, see `download(refreshingSharedZones:)`.
@@ -350,15 +353,20 @@ public final class SDSSynchronizer: Sendable {
     }
 
     /// Remembers the deletions a context is about to save to the store, see `contextWillSave`.
-    func rememberDeletionsBeingSaved(_ deletions: [NSManagedObjectID: SDSObjectDeletion], by context: NSManagedObjectContext) {
-        mutableState.withLock { $0.deletionsBeingSaved[ObjectIdentifier(context)] = deletions.isEmpty ? nil : .init(date: .now, deletions: deletions) }
+    /// - Parameter token: The save's, see `KeysBeingSaved`.
+    func rememberDeletionsBeingSaved(_ deletions: [NSManagedObjectID: SDSObjectDeletion], token: Int, by context: NSManagedObjectContext) {
+        mutableState.withLock { $0.deletionsBeingSaved[ObjectIdentifier(context), default: []].append(.init(token: token, date: .now, deletions: deletions)) }
     }
 
     /// Returns the deletions a context saved to the store. Downloads keep leaving their records alone until
     /// `finishStoringRemovals(of:)`.
     func takeDeletionsBeingSaved(by context: NSManagedObjectContext) -> [NSManagedObjectID: SDSObjectDeletion] {
         mutableState.withLock { state in
-            let deletions = state.deletionsBeingSaved.removeValue(forKey: ObjectIdentifier(context))?.deletions ?? [:]
+            let id = ObjectIdentifier(context)
+            let deletions = state.deletionsBeingSaved[id]?.popLast()?.deletions ?? [:]
+            if state.deletionsBeingSaved[id]?.isEmpty == true {
+                state.deletionsBeingSaved[id] = nil
+            }
             for deletion in deletions.values {
                 state.removalsBeingStored[deletion.localId, default: 0] += 1
             }
@@ -384,7 +392,7 @@ public final class SDSSynchronizer: Sendable {
     /// `DeletionsBeingSaved`.
     func isDeletionPending(localId: String) -> Bool {
         mutableState.withLock { state in
-            state.removalsBeingStored[localId] != nil || state.deletionsBeingSaved.values.contains { saving in
+            state.removalsBeingStored[localId] != nil || state.deletionsBeingSaved.values.joined().contains { saving in
                 saving.isCurrent && saving.localIds.contains(localId)
             }
         }
@@ -392,17 +400,20 @@ public final class SDSSynchronizer: Sendable {
 
     /// Whether `isDeletionPending(localId:)` can be true for any object.
     var hasPendingDeletions: Bool {
-        mutableState.withLock { !$0.removalsBeingStored.isEmpty || $0.deletionsBeingSaved.values.contains(where: \.isCurrent) }
+        mutableState.withLock { !$0.removalsBeingStored.isEmpty || $0.deletionsBeingSaved.values.joined().contains { $0.isCurrent && !$0.deletions.isEmpty } }
     }
 
     /// The deletions a context is saving, see `MutableState.deletionsBeingSaved`.
     struct DeletionsBeingSaved {
+        /// The save's, see `KeysBeingSaved`.
+        let token: Int
         let date: Date
         let deletions: [NSManagedObjectID: SDSObjectDeletion]
         /// The URIs of the deleted objects, so `isDeletionPending(localId:)` doesn't go through every deletion for each object.
         let localIds: Set<String>
 
-        init(date: Date, deletions: [NSManagedObjectID: SDSObjectDeletion]) {
+        init(token: Int, date: Date, deletions: [NSManagedObjectID: SDSObjectDeletion]) {
+            self.token = token
             self.date = date
             self.deletions = deletions
             self.localIds = Set(deletions.values.map(\.localId))
@@ -649,7 +660,7 @@ public final class SDSSynchronizer: Sendable {
     func rememberKeysBeingSaved(_ keys: [NSManagedObjectID: Set<String>], previousReferences: [NSManagedObjectID: Set<String>], by context: NSManagedObjectContext) -> Int {
         mutableState.withLock { state in
             state.lastSaveToken += 1
-            state.keysBeingSaved[ObjectIdentifier(context)] = KeysBeingSaved(token: state.lastSaveToken, date: .now, keys: keys, previousReferences: previousReferences)
+            state.keysBeingSaved[ObjectIdentifier(context), default: []].append(KeysBeingSaved(token: state.lastSaveToken, date: .now, keys: keys, previousReferences: previousReferences))
             return state.lastSaveToken
         }
     }
@@ -657,21 +668,28 @@ public final class SDSSynchronizer: Sendable {
     /// Drops the keys of a save that's over without having posted `NSManagedObjectContextDidSave`, as it failed.
     func dropKeysOfFailedSave(_ token: Int, by contextId: ObjectIdentifier) {
         mutableState.withLock { state in
-            guard state.keysBeingSaved[contextId]?.token == token else { return }
-            state.keysBeingSaved[contextId] = nil
+            state.keysBeingSaved[contextId]?.removeAll { $0.token == token }
+            if state.keysBeingSaved[contextId]?.isEmpty == true {
+                state.keysBeingSaved[contextId] = nil
+            }
+            state.deletionsBeingSaved[contextId]?.removeAll { $0.token == token }
+            if state.deletionsBeingSaved[contextId]?.isEmpty == true {
+                state.deletionsBeingSaved[contextId] = nil
+            }
         }
     }
 
     /// Whether a context is saving to the store, between `contextWillSave` and `contextSaved`.
     func isSavingKeys(by context: NSManagedObjectContext) -> Bool {
-        mutableState.withLock { $0.keysBeingSaved[ObjectIdentifier(context)]?.isCurrent == true }
+        mutableState.withLock { $0.keysBeingSaved[ObjectIdentifier(context)]?.last?.isCurrent == true }
     }
 
     /// Adds keys that changed while a context saves, see `contextChangedWhileSaving`.
     func addKeysBeingSaved(_ keys: [NSManagedObjectID: Set<String>], by context: NSManagedObjectContext) {
         guard !keys.isEmpty else { return }
         mutableState.withLock { state in
-            state.keysBeingSaved[ObjectIdentifier(context)]?.keys.merge(keys) { $0.union($1) }
+            guard let index = state.keysBeingSaved[ObjectIdentifier(context)]?.indices.last else { return }
+            state.keysBeingSaved[ObjectIdentifier(context)]?[index].keys.merge(keys) { $0.union($1) }
         }
     }
 
@@ -679,7 +697,11 @@ public final class SDSSynchronizer: Sendable {
     /// see `forgetSavedKeys(_:)`. Returns the keys and the token.
     func takeKeysBeingSaved(by context: NSManagedObjectContext) -> KeysBeingSaved? {
         mutableState.withLock { state in
-            guard let save = state.keysBeingSaved.removeValue(forKey: ObjectIdentifier(context)) else { return nil }
+            let id = ObjectIdentifier(context)
+            guard let save = state.keysBeingSaved[id]?.popLast() else { return nil }
+            if state.keysBeingSaved[id]?.isEmpty == true {
+                state.keysBeingSaved[id] = nil
+            }
             state.keysSavedNotStored[save.token] = save.keys
             return save
         }
@@ -693,7 +715,7 @@ public final class SDSSynchronizer: Sendable {
     /// The keys that contexts are saving, or saved and aren't stored yet, of every context, by object.
     func keysBeingSavedByAnyContext() -> [NSManagedObjectID: Set<String>] {
         mutableState.withLock { state in
-            let saving = state.keysBeingSaved.values.filter(\.isCurrent).map(\.keys)
+            let saving = state.keysBeingSaved.values.joined().filter(\.isCurrent).map(\.keys)
             return (saving + state.keysSavedNotStored.values).reduce(into: [:]) { keys, saveKeys in
                 keys.merge(saveKeys) { $0.union($1) }
             }
