@@ -349,6 +349,7 @@ extension SDSSynchronizer {
         
         // The record ID depends on the object's parents, which have to be read on its context's queue
         let id = sharable.object.managedObjectContext?.performAndWaitUnchecked { sharable.recordId } ?? sharable.recordId
+        try await confirmBackfilledValues(ofRootRecord: id)
         let record = CKRecord(recordType: sharable.object.entity.name!, recordID: id)
         let shareId = CKRecord.ID(recordName: "\(id.recordName)\(staticShareExtension)", zoneID: defaultZoneID)
         let share = CKShare(rootRecord: record, shareID: shareId)
@@ -406,6 +407,44 @@ extension SDSSynchronizer {
         }
     }
     
+    /// Settles the backfilled values of a root record before it's shared, see `CloudKitUpdate.backfilledKeys`.
+    ///
+    /// Saving the share saves the root record too, without values, which creates it if it doesn't exist. Backfilled values
+    /// are only uploaded to records that don't exist, so they'd be dropped as the record would exist then, and the record
+    /// would stay without values on every device. If the record doesn't exist, the local values are the only ones, and are
+    /// uploaded as changes. If it does, its values win, as for any backfilled values.
+    private func confirmBackfilledValues(ofRootRecord id: CKRecord.ID) async throws {
+        let context = self.context
+        let hasBackfilledValues = await context.perform {
+            CloudKitUpdate.find(for: id.recordName).map { !$0.backfilledKeys.isEmpty } ?? false
+        }
+        guard hasBackfilledValues else { return }
+
+        let exists: Bool
+        switch try await cloudPrivateDatabase.records(for: [id], desiredKeys: [])[id] {
+        case .success:
+            exists = true
+        case .failure(let error as CKError) where error.code == .unknownItem:
+            exists = false
+        case .failure(let error):
+            throw error
+        case nil:
+            throw SDSSyncError(title: "share.error.notSaved")
+        }
+        try await context.perform {
+            guard let update = CloudKitUpdate.find(for: id.recordName) else { return }
+            if exists {
+                update.recordExists()
+            } else {
+                update.addChangedKeys(update.backfilledKeys)
+            }
+            if update.keysToUpload.isEmpty {
+                context.delete(update)
+            }
+            try context.save()
+        }
+    }
+
     public func acceptShare(with metadata: CKShare.Metadata) async throws {
         guard metadata.share.recordID.zoneID.zoneName == defaultZoneID.zoneName else {
             // E.g. a share from an app that uses another default zone in the same container, which can't be synchronized
