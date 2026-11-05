@@ -126,7 +126,7 @@ extension SDSSynchronizer {
             )
         }
         // Downloads leave their records alone until the removals are stored, see `isDeletionPending(localId:)`
-        rememberDeletionsBeingSaved(deletions, by: context)
+        rememberDeletionsBeingSaved(deletions, token: token, by: context)
     }
     
     /// Values can still change once a save started, e.g. in `NSManagedObject.willSave()`, which Core Data calls after
@@ -162,7 +162,9 @@ extension SDSSynchronizer {
             savingContext.persistentStoreCoordinator == observedStore,
             savingContext != observedUpdateContext
         else { return }
+        // Taken together, as the save's entries are the newest of the context's, see `MutableState.keysBeingSaved`
         let saved = takeKeysBeingSaved(by: savingContext)
+        let readDeletions = takeDeletionsBeingSaved(by: savingContext)
         // Forgotten only once they're stored, as blocks on `context`'s queue run in order, so a download that looks for local
         // changes finds them in one place or the other, see `CKDownloadHandler.keepLocalChanges(in:)`
         defer {
@@ -170,7 +172,10 @@ extension SDSSynchronizer {
                 context.perform { self.forgetSavedKeys(token) }
             }
         }
-        guard let userInfo = userInfo(from: notification) else { return }
+        guard let userInfo = userInfo(from: notification) else {
+            finishStoringRemovals(of: Array(readDeletions.values))
+            return
+        }
         let savedChanges = saved?.keys ?? [:]
         let previousReferences = saved?.previousReferences ?? [:]
         // Deletions are stored once they're saved, rather than when they're made, so ones that are discarded aren't uploaded
@@ -178,7 +183,6 @@ extension SDSSynchronizer {
         let deletedObjectIDs = (userInfo[NSDeletedObjectsKey] as? NSSet ?? []).compactMap { ($0 as? NSManagedObject)?.objectID }.filter { objectID in
             configuration?.entities[objectID.entity.name ?? ""] != nil && !objectID.isTemporaryID
         }
-        let readDeletions = takeDeletionsBeingSaved(by: savingContext)
         // See `resetSyncData(beforeForgetting:)`
         guard !isForgetting else {
             finishStoringRemovals(of: Array(readDeletions.values))
