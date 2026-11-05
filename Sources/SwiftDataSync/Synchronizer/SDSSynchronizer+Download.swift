@@ -1245,17 +1245,27 @@ private final class CKDownloadHandler {
         
         var fixCount = 0
         while true {
-            // Objects that were changed locally while downloading keep their changes, which would otherwise be overwritten with
-            // the downloaded values. They're uploaded next, and the next download brings the record's other values again.
+            // Keys that were changed locally while downloading keep their changes, which would otherwise be overwritten with
+            // the downloaded values. They're uploaded next. The object's other keys keep the downloaded values, like local
+            // changes win key by key over records that are downloaded, see `_changed(record:)`.
             // A catch-up downloads every record, which can take long, and it's done again later, after they're uploaded.
             let hasLocalChanges = observedContext.performAndWaitUnchecked {
+                let updatedObjects = observedContext.updatedObjects.filter { !$0.objectID.isTemporaryID }
+                guard !updatedObjects.isEmpty else { return false }
+                let localIds = Dictionary(updatedObjects.map { ($0, $0.objectID.uriRepresentation().absoluteString) }, uniquingKeysWith: { $1 })
+                // One lookup for the page, rather than several for each object
+                let pendingKeys = synchronizer.pendingLocalKeys(ofLocalIds: Array(localIds.values))
                 var hasLocalChanges = false
-                for object in observedContext.updatedObjects {
-                    guard let id = synchronizer.existingRecordId(of: object) else { continue }
-                    if !synchronizer.pendingLocalChange(of: id).keys.isDisjoint(with: object.changedValues().keys) {
-                        observedContext.refresh(object, mergeChanges: false)
-                        hasLocalChanges = true
+                for object in updatedObjects {
+                    guard let keys = localIds[object].flatMap({ pendingKeys[$0] }) else { continue }
+                    let downloaded = object.changedValues()
+                    guard !keys.isDisjoint(with: downloaded.keys) else { continue }
+                    // The object reads its saved values again, with the local changes, and gets the other downloaded values back
+                    observedContext.refresh(object, mergeChanges: false)
+                    for (key, value) in downloaded where !keys.contains(key) {
+                        object.setValue(value is NSNull ? nil : value, forKey: key)
                     }
+                    hasLocalChanges = true
                 }
                 return hasLocalChanges
             }
