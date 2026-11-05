@@ -88,6 +88,7 @@ extension SDSSynchronizer {
             }
             do {
                 _ = takeRecordsSkippedWhileCatchingUp()
+                _ = takeCaughtUpKeysOfRecords()
                 // The change tokens are kept, as downloading every record doesn't include deletions, which would then be missed
                 try await _download(scope: .catchingUp(on: catchUp.newKeys))
                 try await _download(sharedDatabase: true, scope: .catchingUp(on: catchUp.newKeys))
@@ -96,12 +97,14 @@ extension SDSSynchronizer {
                 // a record leaving out a key clears it (see `SDSValueCoding.clearedValues`), so they're uploaded first.
                 // Until then, downloads leave them alone, as they're local changes. The upload follows this download.
                 // Records that couldn't be stored might have the keys already, which the local values mustn't overwrite.
+                // Keys that records had were downloaded, and aren't uploaded again.
                 let skipped = takeRecordsSkippedWhileCatchingUp()
+                let downloadedKeys = takeCaughtUpKeysOfRecords()
                 if let recordsLeft = catchUp.recordsLeft {
                     // The other objects' values were uploaded by an earlier try
-                    try uploadLocalObjects(keysByEntity: keysByEntity(catchUp.newKeys), onlyRecordNames: recordsLeft.subtracting(skipped.keys))
+                    try uploadLocalObjects(keysByEntity: keysByEntity(catchUp.newKeys), onlyRecordNames: recordsLeft.subtracting(skipped.keys), downloadedKeys: downloadedKeys)
                 } else {
-                    try uploadLocalObjects(keysByEntity: keysByEntity(catchUp.newKeys), skippingRecordNames: Set(skipped.keys))
+                    try uploadLocalObjects(keysByEntity: keysByEntity(catchUp.newKeys), skippingRecordNames: Set(skipped.keys), downloadedKeys: downloadedKeys)
                 }
                 if skipped.values.contains(true) && countIncompleteCatchUp(catchUp) < Self.maximumCatchUpAttempts {
                     // Their records might lack the keys, which would clear the local values once caught up. Downloads leave
@@ -756,6 +759,9 @@ private final class CKDownloadHandler {
 
         let insertsObject = scope.insertsObjects(of: record.recordType)
         if scope.isCatchingUp {
+            let caughtUpKeys = Set(record.allKeys().map { findCorrespondingKey(entity: entity, rawKey: $0) } + overflowValues.keys.map { findCorrespondingKey(entity: entity, rawKey: $0) })
+                .filter { scope.includes(entity: record.recordType, key: $0) }
+            synchronizer.noteCaughtUpKeys(caughtUpKeys, of: recordName)
             guard !kVPs.isEmpty || insertsObject else { return }
         }
 
