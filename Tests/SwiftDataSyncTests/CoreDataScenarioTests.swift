@@ -223,7 +223,7 @@ private final class CoreDataDevice: @unchecked Sendable {
     private func settle() async {
         var idleChecks = 0
         for _ in 0..<1000 {
-            var isBusy = synchronizer.hasPendingSaveSync
+            var isBusy = synchronizer.hasPendingSaveSync || synchronizer.hasPendingSyncStart || synchronizer.isSynchronizing
             if !isBusy {
                 switch await synchronizer.viewModel.state {
                 case .bootstrapping, .uploading, .downloading, .processingSaveEvent, .waitingForSetup, .waitingForContainerDetection: isBusy = true
