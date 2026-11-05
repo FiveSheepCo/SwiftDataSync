@@ -9,10 +9,11 @@ import CloudKit
 /// property list of record key → value, and the record leaves out their keys. Downloads read the asset's values like the
 /// record's own, so its keys aren't taken for cleared ones.
 ///
-/// Which values overflow only depends on the model's current values, so every upload that includes a key that can be large
-/// makes the same split again. Compared with the keys the record's asset has (see `SDSSynchronizer.overflowKeys(of:)`), it
-/// only sends the keys that move into or out of the asset, and the asset if its keys or values changed, or clears it once
-/// the values fit. Production schemas reject fields they don't have, so only records that need the field or had it get it.
+/// Uploads only send the values that changed, which they place on top of the record in iCloud, see `place(changedKeys:…)`:
+/// the asset of a record is made from the server's, so another device's values in it are kept, rather than overwritten with
+/// this device's, which can be older. Values that didn't change stay where they are. Changed values go into the asset if
+/// they're large, or don't fit next to the values that stay in the record. Production schemas reject fields they don't
+/// have, so only records that need the field or had it get it.
 enum SDSOverflow {
     static let key = "SDSOverflow"
 
@@ -66,6 +67,38 @@ enum SDSOverflow {
         try CKAsset(data: PropertyListSerialization.data(fromPropertyList: values as NSDictionary, format: .binary, options: 0))
     }
 
+    /// Places the changed values that can be large, which are in their fields, into the record's fields or its asset, and
+    /// returns the record keys in the asset. Values that didn't change stay where they are: in the asset if it has them, and
+    /// in their fields otherwise. Changed values go into the asset if they're large on their own, or, largest first, until
+    /// the values in the fields fit. Throws if the record's asset can't be read, or the new one can't be written.
+    /// - Parameters:
+    ///   - largeKeys: The record keys of the entity whose values can be large, see `keys(of:description:)`.
+    ///   - hasServerValues: Whether the record is the one in iCloud, with its values and asset, and this device's changes.
+    ///     Otherwise it only has the changes, e.g. as it doesn't exist yet.
+    static func place(changedKeys: Set<String>, largeKeys: Set<String>, in record: CKRecord, hasServerValues: Bool) throws -> Set<String> {
+        let previous = hasServerValues ? (try values(in: record) ?? [:]).compactMapValues { $0 as? CKRecordValue } : [:]
+        var assetValues = previous.filter { !changedKeys.contains($0.key) }
+
+        let sizes = Dictionary(changedKeys.map { ($0, size(of: record[$0])) }, uniquingKeysWith: { $1 })
+        var overflowing = Set(sizes.filter { $0.value >= largeValueSize }.keys)
+        // What stays in the fields: the values that didn't change and aren't in the asset, and the changed ones that fit
+        var remaining = largeKeys.subtracting(changedKeys).filter { assetValues[$0] == nil }.reduce(0) { $0 + size(of: record[$1]) }
+            + sizes.filter { !overflowing.contains($0.key) }.reduce(0) { $0 + $1.value }
+        for (key, size) in sizes.sorted(by: { ($0.value, $1.key) > ($1.value, $0.key) }) where remaining > recordBudget && !overflowing.contains(key) {
+            overflowing.insert(key)
+            remaining -= size
+        }
+        for key in overflowing {
+            assetValues[key] = record[key]
+            record[key] = nil
+        }
+
+        if Set(assetValues.keys) != Set(previous.keys) || !overflowing.isEmpty || !changedKeys.isDisjoint(with: previous.keys) {
+            record[Self.key] = assetValues.isEmpty ? nil : try asset(for: assetValues)
+        }
+        return Set(assetValues.keys)
+    }
+
     /// The values of a record's asset, by record key, or `nil` if it has none. Throws if the asset can't be read.
     static func values(in record: CKRecord) throws -> [String: Any]? {
         guard let asset = record[key] as? CKAsset else { return nil }
@@ -77,34 +110,5 @@ enum SDSOverflow {
             throw CocoaError(.propertyListReadCorrupt)
         }
         return values
-    }
-}
-
-extension SDSSynchronizableContainer {
-
-    /// Which of the keys that can be large stay in the record, and which go into the overflow asset, see `SDSOverflow`.
-    struct OverflowSplit {
-        /// The record's values of every key that can be large, by record key: `nil` for the ones in the asset.
-        var fields: [String: CKRecordValue?]
-        /// The values that go into the asset, by record key, `nil` if the record needs no asset.
-        var overflow: [String: CKRecordValue]?
-    }
-
-    /// The split of the object's current values, which only depends on them. Throws like `changeDictionary(for:)`.
-    func overflowSplit(keys: [String]) throws -> OverflowSplit {
-        let values = try changeDictionary(for: keys)
-        let overflowing = SDSOverflow.overflowingKeys(sizes: values.mapValues { SDSOverflow.size(of: $0) })
-        var fields: [String: CKRecordValue?] = [:]
-        var overflow: [String: CKRecordValue] = [:]
-        for (key, value) in values {
-            // `updateValue`, as assigning `nil` through the subscript would remove the key instead of clearing it
-            if overflowing.contains(key), let value {
-                overflow[key] = value
-                fields.updateValue(nil, forKey: key)
-            } else {
-                fields.updateValue(value, forKey: key)
-            }
-        }
-        return OverflowSplit(fields: fields, overflow: overflow.isEmpty ? nil : overflow)
     }
 }
