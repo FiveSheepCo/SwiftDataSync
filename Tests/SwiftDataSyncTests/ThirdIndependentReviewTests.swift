@@ -172,5 +172,41 @@ struct ThirdIndependentReviewTests {
         }
         Issue.record("Y's record never got the name that's kept")
     }
+
+    /// Subscriptions before the app gave them an identity, and afterwards.
+    private static let withoutIdentity = SDSConfiguration(swiftDataEntities: [
+        .init(entity: ScenarioSubscription.self, description: .sync(.without([])))
+    ])
+    private static let withIdentity = SDSConfiguration(swiftDataEntities: [
+        .init(entity: ScenarioSubscription.self, description: .sync(.without([]), identity: ["feedLink"]))
+    ])
+
+    /// Device A uploaded a subscription before subscriptions had an identity, so its record isn't named after it. Device C,
+    /// with the version that has identities, has the same subscription from before it synchronized for the first time. C's
+    /// values, which are of unknown age, don't become a record of their own, which A would take over its edit.
+    @Test func recordFromBeforeIdentitiesWinsOverBackfilledValues() async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        try await a.launch(configuration: Self.withoutIdentity)
+        try a.insertSubscriptions(["s1"], title: { _ in "Edited on A" })
+        await a.sync()
+        a.terminate()
+        try await a.launch(configuration: Self.withIdentity)
+        await a.sync()
+
+        let c = TestDevice("C", server: server)
+        try c.change { $0.insert(ScenarioSubscription(feedLink: "s1", title: "Old on C")) }
+        try await c.launch(configuration: Self.withIdentity)
+        for _ in 0..<3 {
+            await c.sync()
+            await a.sync()
+        }
+
+        #expect(server.records(account: "first").filter { $0.recordType == "ScenarioSubscription" }.map { $0["title"] as? String } == ["Edited on A"])
+        #expect(try c.subscriptions().map(\.title) == ["Edited on A"])
+        #expect(try a.subscriptions().map(\.title) == ["Edited on A"])
+        a.terminate()
+        c.terminate()
+    }
 }
 

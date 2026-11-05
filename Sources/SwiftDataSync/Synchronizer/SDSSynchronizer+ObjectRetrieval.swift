@@ -218,8 +218,10 @@ extension SDSSynchronizer {
         let isNamedAfterIdentity = recordName == identityRecordName
         let (adopted, movedKeys, replacedRecord) = self.context.performAndWaitUnchecked {
             // An object matched by its values whose record was only named here, and that was saved before, e.g. as it
-            // changed while every record is downloaded again, is a copy of this record's object too, see `SDSContentIndex`
-            let hasUnconfirmedRecord = identityRecordName == nil && CloudKitLocalEntity.entry(forLocalId: localId, in: self.context).flatMap { entry in
+            // changed while every record is downloaded again, is a copy of this record's object too, see `SDSContentIndex`.
+            // So is one matched by its identity, e.g. on a new device, whose record was uploaded before the entity had one,
+            // so it isn't named after the identity: its values are of unknown age, and mustn't become a record of their own.
+            let hasUnconfirmedRecord = CloudKitLocalEntity.entry(forLocalId: localId, in: self.context).flatMap { entry in
                 CloudKitUpdate.find(for: entry.id).map { $0.isLocalInsert && !$0.backfilledKeys.isEmpty }
             } == true
             let (adopted, previousId) = CloudKitLocalEntity.adopt(recordName: recordName, forLocalId: localId, replacingOwnRecord: replacingOwnRecord || isNamedAfterIdentity || hasUnconfirmedRecord, in: self.context)
