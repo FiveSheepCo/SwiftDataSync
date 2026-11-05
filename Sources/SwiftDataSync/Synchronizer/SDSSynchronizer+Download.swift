@@ -57,6 +57,7 @@ extension SDSSynchronizer {
         // tokens move on. Once more is synchronized, they are caught up on by downloading every record once more.
         let catchUp = pendingCatchUp
         let scope = DownloadScope.all(catchUpIsPending: catchUp != nil)
+        _ = takeRecoveryMissedRecords()
         
         try await _download(scope: scope)
         try checkNotStopped()
@@ -68,7 +69,19 @@ extension SDSSynchronizer {
             try await self._download(sharedDatabase: true, scope: scope)
         } catch let error where !Self.endsSynchronization(error) {
             logger.error("Failed to download the shared database: \(error.localizedDescription)")
+            // Unless it keeps failing, which would keep anything from being uploaded, see `synchronize()`
+            if isRecoveringVanishedObjects && countIncompleteRecovery() >= Self.maximumIncompleteRecoveries {
+                finishRecoveringVanishedObjects()
+            }
             return error
+        }
+
+        // Every record was downloaded again, also the shared database's, whose objects are copies of records in other users'
+        // zones. Not while records failed, which local objects without records can be copies of: they'd be uploaded as new
+        // records, and the records downloaded as duplicates. Unless they keep failing, which would keep anything from being
+        // uploaded, see `synchronize()`.
+        if isRecoveringVanishedObjects && (!takeRecoveryMissedRecords() || countIncompleteRecovery() >= Self.maximumIncompleteRecoveries) {
+            finishRecoveringVanishedObjects()
         }
 
         // Extensions can have little memory and time, so the app catches up
@@ -319,12 +332,10 @@ extension SDSSynchronizer {
                 // Also if records were held back, e.g. as their references are missing. They might never be resolved.
                 if !sharedDatabase, case .all = scope {
                     self.markDownloadedOnce()
-                    // Not while records failed, which local objects without records can be copies of: they'd be uploaded as
-                    // new records, and the records downloaded as duplicates. Unless they keep failing, which would keep
-                    // anything from being uploaded, see `synchronize()`.
-                    if self.isRecoveringVanishedObjects && (!handler.hasFailedRecords || self.countIncompleteRecovery() >= Self.maximumIncompleteRecoveries) {
-                        self.finishRecoveringVanishedObjects()
-                    }
+                }
+                // Recovering ends once both databases were downloaded, see `download(refreshingSharedZones:)`
+                if case .all = scope, handler.hasFailedRecords {
+                    self.noteRecoveryMissedRecords()
                 }
                 
                 continuation.resume()
@@ -571,7 +582,9 @@ private final class CKDownloadHandler {
             persistedDeferredDeletions = deferredDeletions
             skippedRecordIDs = heldRecords.loadSkippedIDs()
             persistedSkippedRecordIDs = skippedRecordIDs
-            if !forSharedDatabase && synchronizer.isRecoveringVanishedObjects {
+            // Also the shared database's, whose local objects are copies of records in other users' zones. It's downloaded
+            // after the private one, so the objects that got their records there aren't matched again.
+            if synchronizer.isRecoveringVanishedObjects {
                 contentIndex = SDSContentIndex(synchronizer: synchronizer, context: synchronizer.observedUpdateContext!, trackedLocalIds: Self.localIdsOfConfirmedRecords(in: synchronizer.context))
             }
         } else {
