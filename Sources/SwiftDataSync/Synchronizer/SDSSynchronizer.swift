@@ -103,8 +103,12 @@ public final class SDSSynchronizer: Sendable {
         /// Models and keys that still have to be caught up on.
         var catchUp: CatchUp?
         
-        /// The synchronized keys a context is saving to the store, by object. Read when the save starts, and taken when it's done.
-        var keysBeingSaved: [ObjectIdentifier: [NSManagedObjectID: Set<String>]] = [:]
+        /// The synchronized keys a context is saving to the store, by context. Read when the save starts, and taken when it's
+        /// done, or dropped if it failed, see `KeysBeingSaved`.
+        var keysBeingSaved: [ObjectIdentifier: KeysBeingSaved] = [:]
+        /// The keys of saves that are done, until they're stored, by the saves' tokens, see `KeysBeingSaved`.
+        var keysSavedNotStored: [Int: [NSManagedObjectID: Set<String>]] = [:]
+        var lastSaveToken = 0
         
         /// Records that existed already when they were saved, e.g. because another device saved the same identity first, by
         /// name. Their next upload saves the changed keys over them, see `takeServerRecordOfConflict(named:)`.
@@ -615,40 +619,72 @@ public final class SDSSynchronizer: Sendable {
         }
     }
     
-    /// Remembers the synchronized keys a context is about to save to the store, see `contextWillSave`.
-    func rememberKeysBeingSaved(_ keys: [NSManagedObjectID: Set<String>], by context: NSManagedObjectContext) {
-        mutableState.withLock { $0.keysBeingSaved[ObjectIdentifier(context)] = keys }
+    /// The synchronized keys of a save, by object, see `contextWillSave`.
+    ///
+    /// Each save has a token of its own, so what's done for one save, e.g. forgetting its keys once they're stored, never
+    /// changes another's of the same context, or of another context that got the same address. A save that fails never
+    /// posts `NSManagedObjectContextDidSave`, so its keys are dropped once it's over, see `dropKeysOfFailedSave(_:by:)`, or
+    /// once they're old, for contexts whose queues can't be used for that.
+    struct KeysBeingSaved {
+        let token: Int
+        let date: Date
+        var keys: [NSManagedObjectID: Set<String>]
+
+        /// Saves are short. An older one failed.
+        var isCurrent: Bool { Date.now.timeIntervalSince(date) < 60 }
     }
-    
+
+    /// Remembers the synchronized keys a context is about to save to the store, see `contextWillSave`. Returns the save's token.
+    func rememberKeysBeingSaved(_ keys: [NSManagedObjectID: Set<String>], by context: NSManagedObjectContext) -> Int {
+        mutableState.withLock { state in
+            state.lastSaveToken += 1
+            state.keysBeingSaved[ObjectIdentifier(context)] = KeysBeingSaved(token: state.lastSaveToken, date: .now, keys: keys)
+            return state.lastSaveToken
+        }
+    }
+
+    /// Drops the keys of a save that's over without having posted `NSManagedObjectContextDidSave`, as it failed.
+    func dropKeysOfFailedSave(_ token: Int, by contextId: ObjectIdentifier) {
+        mutableState.withLock { state in
+            guard state.keysBeingSaved[contextId]?.token == token else { return }
+            state.keysBeingSaved[contextId] = nil
+        }
+    }
+
     /// Whether a context is saving to the store, between `contextWillSave` and `contextSaved`.
     func isSavingKeys(by context: NSManagedObjectContext) -> Bool {
-        mutableState.withLock { $0.keysBeingSaved[ObjectIdentifier(context)] != nil }
+        mutableState.withLock { $0.keysBeingSaved[ObjectIdentifier(context)]?.isCurrent == true }
     }
 
     /// Adds keys that changed while a context saves, see `contextChangedWhileSaving`.
     func addKeysBeingSaved(_ keys: [NSManagedObjectID: Set<String>], by context: NSManagedObjectContext) {
         guard !keys.isEmpty else { return }
         mutableState.withLock { state in
-            guard state.keysBeingSaved[ObjectIdentifier(context)] != nil else { return }
-            state.keysBeingSaved[ObjectIdentifier(context)]?.merge(keys) { $0.union($1) }
+            state.keysBeingSaved[ObjectIdentifier(context)]?.keys.merge(keys) { $0.union($1) }
         }
     }
 
-    /// The synchronized keys a context saved to the store.
-    func keysBeingSaved(by context: NSManagedObjectContext) -> [NSManagedObjectID: Set<String>] {
-        mutableState.withLock { $0.keysBeingSaved[ObjectIdentifier(context)] ?? [:] }
+    /// Takes the synchronized keys a context saved to the store, which are kept by the save's token until they're stored,
+    /// see `forgetSavedKeys(_:)`. Returns the keys and the token.
+    func takeKeysBeingSaved(by context: NSManagedObjectContext) -> (keys: [NSManagedObjectID: Set<String>], token: Int)? {
+        mutableState.withLock { state in
+            guard let save = state.keysBeingSaved.removeValue(forKey: ObjectIdentifier(context)) else { return nil }
+            state.keysSavedNotStored[save.token] = save.keys
+            return (save.keys, save.token)
+        }
     }
 
-    /// Forgets the keys a context saved, once they're stored.
-    func forgetKeysBeingSaved(by contextId: ObjectIdentifier) {
-        mutableState.withLock { _ = $0.keysBeingSaved.removeValue(forKey: contextId) }
+    /// Forgets the keys of a save once they're stored.
+    func forgetSavedKeys(_ token: Int) {
+        mutableState.withLock { _ = $0.keysSavedNotStored.removeValue(forKey: token) }
     }
 
     /// The keys that contexts are saving, or saved and aren't stored yet, of every context, by object.
     func keysBeingSavedByAnyContext() -> [NSManagedObjectID: Set<String>] {
         mutableState.withLock { state in
-            state.keysBeingSaved.values.reduce(into: [:]) { keys, contextKeys in
-                keys.merge(contextKeys) { $0.union($1) }
+            let saving = state.keysBeingSaved.values.filter(\.isCurrent).map(\.keys)
+            return (saving + state.keysSavedNotStored.values).reduce(into: [:]) { keys, saveKeys in
+                keys.merge(saveKeys) { $0.union($1) }
             }
         }
     }

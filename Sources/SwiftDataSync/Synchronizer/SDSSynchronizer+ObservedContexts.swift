@@ -86,7 +86,16 @@ extension SDSSynchronizer {
                 keys[object.objectID] = savedKeys
             }
         }
-        rememberKeysBeingSaved(keys, by: context)
+        let token = rememberKeysBeingSaved(keys, by: context)
+        // Runs once the save is over, as blocks on the context's queue run one after another. A save that failed didn't post
+        // `NSManagedObjectContextDidSave`, so its keys are still there, and would keep downloaded values from being stored.
+        // Contexts confined to a thread don't have a queue, and their keys expire instead.
+        if context.concurrencyType.rawValue != 0 {
+            let contextId = ObjectIdentifier(context)
+            context.perform { [weak self] in
+                self?.dropKeysOfFailedSave(token, by: contextId)
+            }
+        }
 
         // Deletions are read now, as their objects can't be read anymore once they're saved, see `contextSaved`. Only the
         // ones being saved, rather than all that are made, which can still be discarded, e.g. by a rollback.
@@ -130,19 +139,22 @@ extension SDSSynchronizer {
 
     @objc func contextSaved(_ notification:Notification) {
         guard
-            let userInfo = userInfo(from: notification),
             let savingContext = notification.object as? NSManagedObjectContext,
             // A child context only saves to its parent, whose save is handled. Its inserted objects don't have permanent IDs yet.
-            savingContext.parent == nil
+            savingContext.parent == nil,
+            savingContext.persistentStoreCoordinator == observedStore,
+            savingContext != observedUpdateContext
         else { return }
-        let savedChanges = keysBeingSaved(by: savingContext)
+        let saved = takeKeysBeingSaved(by: savingContext)
         // Forgotten only once they're stored, as blocks on `context`'s queue run in order, so a download that looks for local
         // changes finds them in one place or the other, see `CKDownloadHandler.keepLocalChanges(in:)`
         defer {
-            let context = self.context
-            let contextId = ObjectIdentifier(savingContext)
-            context.perform { self.forgetKeysBeingSaved(by: contextId) }
+            if let token = saved?.token {
+                context.perform { self.forgetSavedKeys(token) }
+            }
         }
+        guard let userInfo = userInfo(from: notification) else { return }
+        let savedChanges = saved?.keys ?? [:]
         // Deletions are stored once they're saved, rather than when they're made, so ones that are discarded aren't uploaded
         let configuration = self.configuration
         let deletedObjectIDs = (userInfo[NSDeletedObjectsKey] as? NSSet ?? []).compactMap { ($0 as? NSManagedObject)?.objectID }.filter { objectID in
