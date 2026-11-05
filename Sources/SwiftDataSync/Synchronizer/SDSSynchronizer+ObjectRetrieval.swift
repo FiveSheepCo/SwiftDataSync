@@ -9,8 +9,10 @@ enum SDSUniqueMatch {
     case saved(NSManagedObject, replacingOwnRecord: Bool)
     /// An object this download inserted for another record, which gets this one instead.
     case inserted(NSManagedObject)
-    /// The local object keeps its record, and the downloaded record is left alone. The device that has it as its own record
-    /// gives its object the local object's record once it downloads that.
+    /// The downloaded record isn't stored now, and is held, see `CKDownloadHandler.recordsToAddLater`: until the end of the
+    /// zone's download, as the local object's own record can change later in it, e.g. to other unique values, and afterwards
+    /// as the local object keeps its record. The device that has it as its own record gives its object the local object's
+    /// record once it downloads that, and deletes it.
     case keepsItsRecord
 }
 
@@ -173,7 +175,7 @@ extension SDSSynchronizer {
                 preliminaryUpdateHandler(match, [])
                 return match
             case .keepsItsRecord:
-                logger.log("[Download] Leaving `\(id)` alone, as a local object of the same unique values keeps its own record")
+                logger.log("[Download] Holding `\(id)`, as a local object of the same unique values has its own record")
                 preliminaryUpdateHandler(nil, [])
                 return nil
             }
