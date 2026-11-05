@@ -208,5 +208,44 @@ struct ThirdIndependentReviewTests {
         a.terminate()
         c.terminate()
     }
+
+    /// Workspaces are sharable, documents are below them.
+    private static let sharableConfiguration = SDSConfiguration(swiftDataEntities: [
+        .init(entity: ScenarioSubscription.self, description: .sync(.without([]), identity: ["feedLink"])),
+        .init(entity: ScenarioWorkspace.self, description: .sync(.without([]), isSharable: true)),
+        .init(entity: ScenarioDocument.self, description: .sync(.without([]), parentKey: "workspace"))
+    ])
+
+    /// A workspace saved before synchronizing started, whose backfilled values weren't uploaded yet, is shared. Saving the
+    /// share creates its record without values, and the backfilled values are still uploaded to it, rather than dropped as
+    /// the record exists. The fake server can't save shares, so sharing fails after the root record was saved.
+    @Test func sharingAModelWithBackfilledValuesKeepsThem() async throws {
+        let server = FakeCloudServer()
+        let device = TestDevice("A", server: server)
+        try await device.launch(configuration: Self.sharableConfiguration)
+        await device.sync()
+        device.terminate()
+        try device.changeInAnotherProcess { $0.insert(ScenarioWorkspace(title: "Groceries")) }
+        server.failNextModify(with: CKError(.networkFailure))
+        try await device.launch(configuration: Self.sharableConfiguration)
+        await device.settle()
+
+        let synchronizer = try #require(device.synchronizer)
+        let observed = try #require(synchronizer.observedUpdateContext)
+        let workspace = try observed.performAndWait {
+            try #require(try observed.fetch(NSFetchRequest<NSManagedObject>(entityName: "ScenarioWorkspace")).first)
+        }
+        _ = try? await synchronizer.share(title: "Groceries", imageData: nil, object: workspace)
+        await device.sync()
+        await device.sync()
+
+        let b = TestDevice("B", server: server)
+        try await b.launch(configuration: Self.sharableConfiguration)
+        await b.sync()
+        #expect(server.records(account: "first").filter { $0.recordType == "ScenarioWorkspace" }.map { $0["title"] as? String } == ["Groceries"])
+        #expect(try ModelContext(#require(b.modelContainer)).fetch(FetchDescriptor<ScenarioWorkspace>()).map(\.title) == ["Groceries"])
+        device.terminate()
+        b.terminate()
+    }
 }
 
