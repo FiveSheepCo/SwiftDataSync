@@ -232,6 +232,11 @@ extension SDSSynchronizer {
                 // The record was named here, and isn't known to exist, see `CloudKitUpdate.isLocalInsert`
                 if backfilled || previousId != nil || !hadRecord.contains(change.localId) {
                     update.markAsLocalInsert()
+                    // The record the model moved away from is only deleted once the model's new record is uploaded, rather
+                    // than while it waits, e.g. as iCloud is full, which would delete the model on other devices meanwhile
+                    if let previousId {
+                        update.addPreviousReferences([previousId])
+                    }
                 } else {
                     update.addPreviousReferences(change.previousReferenceLocalIds.compactMap { previousReferenceIds[$0] })
                 }

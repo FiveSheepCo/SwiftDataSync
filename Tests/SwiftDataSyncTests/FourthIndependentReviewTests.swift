@@ -365,6 +365,44 @@ struct FourthIndependentReviewTests {
         a.terminate()
         b.terminate()
     }
+
+    /// Device A changes a subscription's identity, so it moves to another record, while iCloud is full, or while CloudKit
+    /// rejects the new record. The previous record isn't deleted before the new one is uploaded, which would delete the
+    /// subscription on device B meanwhile. Once the new record can be uploaded, the previous one is deleted.
+    @Test(arguments: [false, true]) func identityMoveKeepsThePreviousRecordUntilTheNewOneIsUploaded(rejected: Bool) async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try await b.launch()
+        try a.insertSubscriptions(["s1", "s2"])
+        await a.sync()
+        await b.sync()
+
+        let isFailing = OSAllocatedUnfairLock(initialState: true)
+        let newRecord = subscriptionRecordName("s1x")
+        if rejected {
+            server.failSaving(where: { $0.recordName == newRecord && isFailing.withLock { $0 } }, with: CKError(.serverRejectedRequest))
+        } else {
+            server.failSaving(where: { _ in isFailing.withLock { $0 } }, with: CKError(.quotaExceeded))
+        }
+        try a.editSubscription("s1") { $0.feedLink = "s1x" }
+        await a.sync()
+        await a.sync()
+        await b.sync()
+        #expect(try b.subscriptions().map(\.feedLink) == ["s1", "s2"])
+
+        isFailing.withLock { $0 = false }
+        a.synchronizer.resetQuarantine()
+        a.synchronizer.resumeUploads()
+        await a.sync()
+        await a.sync()
+        await b.sync()
+        #expect(a.serverSubscriptions().map(\.feedLink) == ["s1x", "s2"])
+        #expect(try b.subscriptions().map(\.feedLink) == ["s1x", "s2"])
+        a.terminate()
+        b.terminate()
+    }
 }
 
 /// Runs a block on the context's queue without waiting for it.
