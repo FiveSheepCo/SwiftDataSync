@@ -143,9 +143,9 @@ public final class SDSSynchronizer: Sendable {
         var removalsBeingStored: [String: Int] = [:]
         /// Records a catch-up couldn't store, and whether it's tried again for them, see `download(refreshingSharedZones:)`.
         var recordsSkippedWhileCatchingUp: [String: Bool] = [:]
-        /// Models and keys that other processes synchronize, but this one doesn't, e.g. an extension that synchronizes less.
-        /// See `CKDownloadHandler.skippedRecordIDs`.
-        var keysOnlyOthersSynchronize: Set<String> = []
+        /// What an extension synchronizes, which can be less than the app does, see `keysOnlyOthersSynchronize`. `nil` in the
+        /// app.
+        var keysOfExtension: Set<String>?
         /// Whether a download of every record missed records while recovering vanished objects, see `download(refreshingSharedZones:)`.
         var recoveryMissedRecords = false
         /// The keys being caught up on that downloaded records had, by record name, see `noteCaughtUpKeys(_:of:)`.
@@ -822,9 +822,12 @@ public final class SDSSynchronizer: Sendable {
     /// Whether this process is an app extension, e.g. a widget's, which can have little memory and time. Tests set it.
     nonisolated(unsafe) var isAppExtension = Bundle.main.bundleURL.pathExtension == "appex"
 
-    /// Models and keys that other processes synchronize, but this one doesn't, see `CKDownloadHandler.skippedRecordIDs`.
+    /// Models and keys that other processes synchronize, but this one doesn't, e.g. an extension that synchronizes less than
+    /// the app, see `CKDownloadHandler.skippedRecordIDs`. Read for each download, as the app can catch up on more while an
+    /// extension runs, and an extension that skipped those keys' changes without keeping them for the app would lose them.
     var keysOnlyOthersSynchronize: Set<String> {
-        mutableState.withLock { $0.keysOnlyOthersSynchronize }
+        guard let keysOfExtension = mutableState.withLock({ $0.keysOfExtension }) else { return [] }
+        return (storedSynchronizedKeys ?? []).subtracting(keysOfExtension)
     }
 
     /// Called by downloads right before the downloaded objects are saved, once local changes were looked for. Tests use it to
@@ -1417,9 +1420,10 @@ public final class SDSSynchronizer: Sendable {
         let keys = Set(configuration.entities.flatMap { name, entity in
             [name] + entity.syncedProperties.map { "\(name).\($0)" }
         })
-        let previousKeys = synchronizedKeysURL
-            .flatMap { try? Data(contentsOf: $0) }
-            .flatMap { try? JSONDecoder().decode(Set<String>.self, from: $0) }
+        if isAppExtension {
+            mutableState.withLock { $0.keysOfExtension = keys }
+        }
+        let previousKeys = storedSynchronizedKeys
         
         // Without stored keys, e.g. on the first launch of a version that stores them, what was skipped before is unknown.
         // Catching up on every key would overwrite local changes with older values, so only later additions are caught up on.
@@ -1429,9 +1433,8 @@ public final class SDSSynchronizer: Sendable {
         }
         if isAppExtension {
             // An extension can synchronize less than the app, which uses the same synchronization data. It doesn't reduce the
-            // stored keys, which would make the app catch up again every time, but keeps the records it skips for the app.
-            let skippedKeys = previousKeys.subtracting(keys)
-            mutableState.withLock { $0.keysOnlyOthersSynchronize = skippedKeys }
+            // stored keys, which would make the app catch up again every time, but keeps the records it skips for the app,
+            // see `keysOnlyOthersSynchronize`.
             guard !keys.isSubset(of: previousKeys) else { return }
             mutableState.withLock { $0.catchUp = CatchUp(keys: keys.union(previousKeys), newKeys: keys.subtracting(previousKeys)) }
         } else {
@@ -1446,6 +1449,13 @@ public final class SDSSynchronizer: Sendable {
         }
     }
     
+    /// What was synchronized when everything was caught up on last, see `checkForNewlySynchronizedKeys(_:)`.
+    private var storedSynchronizedKeys: Set<String>? {
+        synchronizedKeysURL
+            .flatMap { try? Data(contentsOf: $0) }
+            .flatMap { try? JSONDecoder().decode(Set<String>.self, from: $0) }
+    }
+
     private var synchronizedKeysURL: URL? {
         container.persistentStoreDescriptions.first?.url?.deletingLastPathComponent().appendingPathComponent("CloudKitSync.keys.json")
     }

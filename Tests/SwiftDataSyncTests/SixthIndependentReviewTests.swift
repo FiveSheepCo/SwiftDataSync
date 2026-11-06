@@ -373,4 +373,122 @@ struct SixthIndependentReviewTests {
         #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).count == 3)
         #expect(held.loadFailedIDs() == [records[0].recordID])
     }
+
+    // MARK: Extensions
+
+    /// Version 1 of the app doesn't synchronize subscriptions' notes.
+    private static let withoutNotes = SDSConfiguration(swiftDataEntities: [
+        .init(entity: ScenarioSubscription.self, description: .sync(.without(["note"]), identity: ["feedLink"])),
+        .init(entity: ScenarioEpisode.self, description: .sync(.without([]), identity: ["feedLink", "guid"])),
+        .init(entity: ScenarioNote.self, description: .sync(.without([]))),
+        .init(entity: ScenarioLink.self, description: .sync(.without([]))),
+        .init(entity: ScenarioTag.self, description: .sync(.without([]))),
+        .init(entity: ScenarioWorkspace.self, description: .sync(.without([]))),
+        .init(entity: ScenarioDocument.self, description: .sync(.without([]), parentKey: "workspace", identity: ["title"]))
+    ])
+
+    /// Device B's app is updated to a version that synchronizes subscriptions' notes, while its extension doesn't. The
+    /// extension was set up before the app caught up on notes, and keeps running. Notes another device changes afterwards,
+    /// which the extension downloads, reach B's app, as the extension keeps those records for it.
+    @Test(arguments: [false, true]) func extensionSetUpBeforeTheAppCaughtUpKeepsWhatItSkipsForTheApp(relaunchingExtension: Bool) async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try a.insertSubscriptions(["s1"])
+        try a.editSubscription("s1") { $0.note = "N1" }
+        await a.sync()
+        // B's version 1 doesn't synchronize notes
+        try await b.launch(configuration: Self.withoutNotes)
+        await b.sync()
+        b.terminate()
+
+        // The update: the extension, which still doesn't synchronize notes, launches first
+        var ext = try await ExtensionProcess(of: b, configuration: Self.withoutNotes)
+        await ext.sync()
+        // The app catches up on notes
+        try await b.launch()
+        await b.sync()
+        #expect(try b.subscription("s1")?.note == "N1")
+        b.terminate()
+        if relaunchingExtension {
+            ext.terminate()
+            ext = try await ExtensionProcess(of: b, configuration: Self.withoutNotes)
+        }
+
+        // Another device changes the note, which the extension downloads while the app isn't running
+        try a.editSubscription("s1") { $0.note = "N2" }
+        await a.sync()
+        await ext.sync()
+        ext.terminate()
+
+        try await b.launch()
+        await b.sync()
+        #expect(try b.subscription("s1")?.note == "N2")
+        a.terminate()
+        b.terminate()
+    }
+}
+
+/// An extension of a test device, on its synchronization data and store, which runs while the device's app is terminated and
+/// launched again.
+private final class ExtensionProcess: @unchecked Sendable {
+    let synchronizer: SDSSynchronizer
+    let modelContainer: ModelContainer
+
+    init(of device: TestDevice, configuration: SDSConfiguration) async throws {
+        let cloud = FakeCloudContainer(server: device.server, device: "\(device.name)-extension", account: .signedIn("first"))
+        synchronizer = SDSSynchronizer(
+            syncDataDirectory: device.directory.appending(path: "Sync"),
+            viewModel: SDSSynchronizationViewModel(),
+            makeCloudContainer: { _ in cloud },
+            monitorsNetwork: false,
+            timing: device.timing
+        )
+        synchronizer.isAppExtension = true
+        var created: ModelContainer?
+        let storeURL = device.storeURL
+        synchronizer.setup(
+            containerName: "iCloud.test",
+            configuration: configuration,
+            modelContainer: {
+                created = try? ModelContainer(
+                    for: Schema([ScenarioTag.self, ScenarioLink.self, ScenarioSubscription.self, ScenarioEpisode.self, ScenarioNote.self, ScenarioWorkspace.self, ScenarioDocument.self]),
+                    configurations: ModelConfiguration(url: storeURL, cloudKitDatabase: .none)
+                )
+                return created
+            }()
+        )
+        modelContainer = try #require(created)
+        for _ in 0..<500 where !synchronizer.isObservingStore {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await settle()
+    }
+
+    func settle() async {
+        var idleChecks = 0
+        for _ in 0..<6000 {
+            var isBusy = synchronizer.hasPendingSaveSync || synchronizer.hasPendingSyncStart || synchronizer.isSynchronizing
+            if !isBusy {
+                switch await synchronizer.viewModel.state {
+                case .bootstrapping, .uploading, .downloading, .processingSaveEvent, .waitingForSetup, .waitingForContainerDetection: isBusy = true
+                default: break
+                }
+            }
+            idleChecks = isBusy ? 0 : idleChecks + 1
+            if idleChecks >= 3 { return }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    func sync() async {
+        await settle()
+        await synchronizer.synchronize()
+        await settle()
+    }
+
+    func terminate() {
+        synchronizer.invalidate()
+    }
 }
