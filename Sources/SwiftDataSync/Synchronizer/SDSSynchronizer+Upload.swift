@@ -674,8 +674,9 @@ extension SDSSynchronizer {
             guard hasAsset || round.overflowingLocally.contains(name) else { continue }
             placements.append((index, changedKeys, largeKeys))
             // A local insert's record isn't known to exist, unless it's known to have an asset, e.g. as a model created again
-            // with a deleted one's identity took its record, whose asset still has the deleted model's values
-            if !isServerRecord && (!round.localInserts.contains(name) || knowsAsset) {
+            // with a deleted one's identity took its record, whose asset still has the deleted model's values. Not for backfilled
+            // values, which are saved only if the record doesn't exist, and otherwise conflict, see `_upload`.
+            if !isServerRecord && (!round.localInserts.contains(name) || (knowsAsset && !round.insertsBackfilledValues)) {
                 recordIDsToFetch.append(record.recordID)
             }
         }
