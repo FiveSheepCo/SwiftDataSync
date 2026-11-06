@@ -107,6 +107,136 @@ nonisolated(unsafe) private let episodeInfoModel: NSManagedObjectModel = {
     return model
 }()
 
+/// Synchronized folders, items that can't exist without their folder, parts that can't exist without their item, and notes
+/// that an item's delete rule deletes with it, and favorites and lists that reference items. The relationships to the folder and the item are required, while their delete
+/// rules only nullify them. It isn't changed after it's made.
+nonisolated(unsafe) private let requiredFolderModel: NSManagedObjectModel = {
+    let folder = NSEntityDescription()
+    folder.name = "RFolder"
+    let item = NSEntityDescription()
+    item.name = "RItem"
+
+    let folderName = NSAttributeDescription()
+    folderName.name = "name"
+    folderName.type = .string
+    folderName.isOptional = true
+    let itemName = NSAttributeDescription()
+    itemName.name = "name"
+    itemName.type = .string
+    itemName.isOptional = true
+    let items = NSRelationshipDescription()
+    items.name = "items"
+    items.destinationEntity = item
+    items.maxCount = 0
+    items.isOptional = true
+    items.deleteRule = .nullifyDeleteRule
+    let toFolder = NSRelationshipDescription()
+    toFolder.name = "folder"
+    toFolder.destinationEntity = folder
+    toFolder.maxCount = 1
+    toFolder.minCount = 1
+    toFolder.isOptional = false
+    toFolder.deleteRule = .nullifyDeleteRule
+    items.inverseRelationship = toFolder
+    toFolder.inverseRelationship = items
+
+    let part = NSEntityDescription()
+    part.name = "RPart"
+    let partName = NSAttributeDescription()
+    partName.name = "name"
+    partName.type = .string
+    partName.isOptional = true
+    let parts = NSRelationshipDescription()
+    parts.name = "parts"
+    parts.destinationEntity = part
+    parts.maxCount = 0
+    parts.isOptional = true
+    parts.deleteRule = .nullifyDeleteRule
+    let toItem = NSRelationshipDescription()
+    toItem.name = "item"
+    toItem.destinationEntity = item
+    toItem.maxCount = 1
+    toItem.minCount = 1
+    toItem.isOptional = false
+    toItem.deleteRule = .nullifyDeleteRule
+    parts.inverseRelationship = toItem
+    toItem.inverseRelationship = parts
+    part.properties = [partName, toItem]
+
+    let note = NSEntityDescription()
+    note.name = "RNote"
+    let noteName = NSAttributeDescription()
+    noteName.name = "name"
+    noteName.type = .string
+    noteName.isOptional = true
+    let notes = NSRelationshipDescription()
+    notes.name = "notes"
+    notes.destinationEntity = note
+    notes.maxCount = 0
+    notes.isOptional = true
+    notes.deleteRule = .cascadeDeleteRule
+    let noteItem = NSRelationshipDescription()
+    noteItem.name = "item"
+    noteItem.destinationEntity = item
+    noteItem.maxCount = 1
+    noteItem.isOptional = true
+    noteItem.deleteRule = .nullifyDeleteRule
+    notes.inverseRelationship = noteItem
+    noteItem.inverseRelationship = notes
+    note.properties = [noteName, noteItem]
+
+    let favorite = NSEntityDescription()
+    favorite.name = "RFavorite"
+    let favoriteItem = NSRelationshipDescription()
+    favoriteItem.name = "item"
+    favoriteItem.destinationEntity = item
+    favoriteItem.maxCount = 1
+    favoriteItem.isOptional = true
+    favoriteItem.deleteRule = .nullifyDeleteRule
+    let favorites = NSRelationshipDescription()
+    favorites.name = "favorites"
+    favorites.destinationEntity = favorite
+    favorites.maxCount = 0
+    favorites.isOptional = true
+    favorites.deleteRule = .nullifyDeleteRule
+    favoriteItem.inverseRelationship = favorites
+    favorites.inverseRelationship = favoriteItem
+    let favoriteName = NSAttributeDescription()
+    favoriteName.name = "name"
+    favoriteName.type = .string
+    favoriteName.isOptional = true
+    favorite.properties = [favoriteName, favoriteItem]
+
+    let list = NSEntityDescription()
+    list.name = "RList"
+    let entries = NSRelationshipDescription()
+    entries.name = "entries"
+    entries.destinationEntity = item
+    entries.maxCount = 0
+    entries.isOrdered = true
+    entries.isOptional = true
+    entries.deleteRule = .nullifyDeleteRule
+    let lists = NSRelationshipDescription()
+    lists.name = "lists"
+    lists.destinationEntity = list
+    lists.maxCount = 0
+    lists.isOptional = true
+    lists.deleteRule = .nullifyDeleteRule
+    entries.inverseRelationship = lists
+    lists.inverseRelationship = entries
+    let listName = NSAttributeDescription()
+    listName.name = "name"
+    listName.type = .string
+    listName.isOptional = true
+    list.properties = [listName, entries]
+
+    folder.properties = [folderName, items]
+    item.properties = [itemName, toFolder, parts, notes, favorites, lists]
+    let model = NSManagedObjectModel()
+    model.entities = [folder, item, part, note, favorite, list]
+    return model
+}()
+
 /// Notes that count their revisions in `willSave()`, like models that stamp when they changed.
 @objc(RevisedNote)
 final class RevisedNote: NSManagedObject {
@@ -390,6 +520,120 @@ struct CoreDataScenarioTests {
         await first.sync()
         await second.sync()
         #expect(titles(second) == ["Second"])
+        first.synchronizer.invalidate()
+        second.synchronizer.invalidate()
+    }
+
+    /// A folder is deleted elsewhere while this device puts a synchronized item, which requires a folder, into it, without
+    /// uploading that yet. The item goes with the folder everywhere, like a child moved into a parent whose delete rule
+    /// cascades, and so does what requires it, or what its delete rule deletes. What refers to it doesn't anymore, also with
+    /// this device's other edits. Nothing stays pointing at the deleted folder.
+    @Test(arguments: [true, false]) func downloadedDeletionTakesSynchronizedObjectsWithUnuploadedRelationships(isCreated: Bool) async throws {
+        let server = FakeCloudServer()
+        let first = try await CoreDataDevice("A", server: server, model: requiredFolderModel)
+        let second = try await CoreDataDevice("B", server: server, model: requiredFolderModel)
+        let names = { (device: CoreDataDevice, entityName: String) in
+            let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+            context.persistentStoreCoordinator = device.coordinator
+            return context.performAndWait {
+                ((try? context.fetch(NSFetchRequest<NSManagedObject>(entityName: entityName))) ?? []).compactMap { $0.value(forKey: "name") as? String }.sorted()
+            }
+        }
+        let folderOfItems = { (device: CoreDataDevice) in
+            let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+            context.persistentStoreCoordinator = device.coordinator
+            return context.performAndWait {
+                ((try? context.fetch(NSFetchRequest<NSManagedObject>(entityName: "RItem"))) ?? []).map {
+                    ($0.value(forKey: "folder") as? NSManagedObject)?.value(forKey: "name") as? String
+                }
+            }
+        }
+
+        try first.change { context in
+            let kept = NSEntityDescription.insertNewObject(forEntityName: "RFolder", into: context)
+            kept.setValue("Kept", forKey: "name")
+            NSEntityDescription.insertNewObject(forEntityName: "RFolder", into: context).setValue("Deleted", forKey: "name")
+            if !isCreated {
+                let item = NSEntityDescription.insertNewObject(forEntityName: "RItem", into: context)
+                item.setValue("Item", forKey: "name")
+                item.setValue(kept, forKey: "folder")
+                // A part of the item, which requires it
+                let part = NSEntityDescription.insertNewObject(forEntityName: "RPart", into: context)
+                part.setValue("Part", forKey: "name")
+                part.setValue(item, forKey: "item")
+                // A note, which the item's delete rule would delete with it
+                let note = NSEntityDescription.insertNewObject(forEntityName: "RNote", into: context)
+                note.setValue("Note", forKey: "name")
+                note.setValue(item, forKey: "item")
+                // A favorite and a list that reference the item
+                let favorite = NSEntityDescription.insertNewObject(forEntityName: "RFavorite", into: context)
+                favorite.setValue("Favorite", forKey: "name")
+                favorite.setValue(item, forKey: "item")
+                let list = NSEntityDescription.insertNewObject(forEntityName: "RList", into: context)
+                list.setValue("List", forKey: "name")
+                list.setValue(NSOrderedSet(array: [item]), forKey: "entries")
+            }
+        }
+        await first.sync()
+        await second.sync()
+
+        // A deletes the folder, while B puts the item in it without uploading it yet: B downloads the deletion first
+        try first.change { context in
+            let folders = try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "RFolder"))
+            context.delete(try #require(folders.first { $0.value(forKey: "name") as? String == "Deleted" }))
+        }
+        await first.sync()
+        try second.change { context in
+            let folders = try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "RFolder"))
+            let deleted = try #require(folders.first { $0.value(forKey: "name") as? String == "Deleted" })
+            if isCreated {
+                let item = NSEntityDescription.insertNewObject(forEntityName: "RItem", into: context)
+                item.setValue("Item", forKey: "name")
+                item.setValue(deleted, forKey: "folder")
+            } else {
+                // With other edits of the item, its note, and the list, in the same save
+                let item = try #require(try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "RItem")).first)
+                item.setValue(deleted, forKey: "folder")
+                item.setValue("Renamed", forKey: "name")
+                try #require(try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "RNote")).first).setValue("Edited note", forKey: "name")
+                let other = NSEntityDescription.insertNewObject(forEntityName: "RItem", into: context)
+                other.setValue("Other", forKey: "name")
+                other.setValue(folders.first { $0.value(forKey: "name") as? String == "Kept" }, forKey: "folder")
+                let list = try #require(try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "RList")).first)
+                list.setValue(NSOrderedSet(array: [item, other]), forKey: "entries")
+            }
+        }
+        await second.sync()
+        await first.sync()
+        await second.sync()
+        await first.sync()
+
+        #expect(names(second, "RFolder") == ["Kept"])
+        #expect(names(first, "RFolder") == ["Kept"])
+        #expect(folderOfItems(second).allSatisfy { $0 == "Kept" })
+        #expect(folderOfItems(first).allSatisfy { $0 == "Kept" })
+        #expect(names(second, "RItem") == names(first, "RItem"))
+        #expect(names(first, "RItem") == (isCreated ? [] : ["Other"]))
+        #expect(names(second, "RPart") == names(first, "RPart"))
+        #expect(names(first, "RPart") == [])
+        #expect(names(second, "RNote") == names(first, "RNote"))
+        #expect(names(first, "RNote") == [])
+        let references = { (device: CoreDataDevice) in
+            let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+            context.persistentStoreCoordinator = device.coordinator
+            return context.performAndWait {
+                let favorites = ((try? context.fetch(NSFetchRequest<NSManagedObject>(entityName: "RFavorite"))) ?? []).map {
+                    ($0.value(forKey: "item") as? NSManagedObject)?.value(forKey: "name") as? String ?? "none"
+                }
+                let entries = ((try? context.fetch(NSFetchRequest<NSManagedObject>(entityName: "RList"))) ?? []).flatMap {
+                    (($0.value(forKey: "entries") as? NSOrderedSet)?.array ?? []).map { ($0 as? NSManagedObject)?.value(forKey: "name") as? String ?? "none" }
+                }
+                return favorites + entries
+            }
+        }
+        #expect(references(second) == references(first))
+        #expect(references(first) == (isCreated ? [] : ["none", "Other"]))
+        #expect(server.records(account: "first").filter { $0.recordType == "RItem" }.count == (isCreated ? 0 : 1))
         first.synchronizer.invalidate()
         second.synchronizer.invalidate()
     }
