@@ -103,7 +103,8 @@ extension SDSSynchronizer {
                 }
             }
         }
-        let token = rememberKeysBeingSaved(keys, previousReferences: previousReferences, by: context)
+        let objects = Set(context.insertedObjects.union(context.updatedObjects).union(context.deletedObjects).map(ObjectIdentifier.init))
+        let token = rememberKeysBeingSaved(keys, previousReferences: previousReferences, objects: objects, by: context)
         // Runs once the save is over, as blocks on the context's queue run one after another. A save that failed didn't post
         // `NSManagedObjectContextDidSave`, so its keys are still there, and would keep downloaded values from being stored.
         // Contexts confined to a thread don't have a queue, and their keys expire instead.
@@ -162,9 +163,15 @@ extension SDSSynchronizer {
             savingContext.persistentStoreCoordinator == observedStore,
             savingContext != observedUpdateContext
         else { return }
-        // Taken together, as the save's entries are the newest of the context's, see `MutableState.keysBeingSaved`
-        let saved = takeKeysBeingSaved(by: savingContext)
-        let readDeletions = takeDeletionsBeingSaved(by: savingContext)
+        // The save's keys and deletions, found by the objects it saved, see `takeKeysBeingSaved(by:savedObjects:)`
+        let savedObjects = [NSInsertedObjectsKey, NSUpdatedObjectsKey, NSDeletedObjectsKey].reduce(into: Set<ObjectIdentifier>()) { objects, key in
+            for case let object as NSManagedObject in notification.userInfo?[key] as? NSSet ?? [] {
+                objects.insert(ObjectIdentifier(object))
+            }
+        }
+        let taken = takeKeysBeingSaved(by: savingContext, savedObjects: savedObjects)
+        let saved = taken?.save
+        let readDeletions = takeDeletionsBeingSaved(by: savingContext, tokens: taken?.tokens ?? [])
         // Forgotten only once they're stored, as blocks on `context`'s queue run in order, so a download that looks for local
         // changes finds them in one place or the other, see `CKDownloadHandler.keepLocalChanges(in:)`
         defer {

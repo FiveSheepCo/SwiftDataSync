@@ -91,4 +91,133 @@ struct SixthIndependentReviewTests {
         #expect(device.serverNotes() == ["offline", "synced"])
         device.terminate()
     }
+
+    // MARK: Saves
+
+    /// An observer of the app that runs before the synchronizer's saves the context again from the first save's DidSave, and
+    /// that nested save fails (here a unique constraint conflict), so it posts no DidSave. The first save's DidSave still
+    /// stores the first save's keys, rather than the failed save's, which are on top of them.
+    @Test func failedNestedSaveFromAnObserverOfTheAppKeepsTheFirstSavesEdits() async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        let appContext = OSAllocatedUnfairLock<NSManagedObjectContext?>(uncheckedState: nil)
+        let savesAgain = OSAllocatedUnfairLock(initialState: false)
+        let nestedFailed = OSAllocatedUnfairLock(initialState: false)
+        let observer = NotificationCenter.default.addObserver(forName: .NSManagedObjectContextDidSave, object: nil, queue: nil) { notification in
+            guard
+                let context = notification.object as? NSManagedObjectContext,
+                appContext.withLockUnchecked({ $0 === context }),
+                savesAgain.withLock({ isSaving in defer { isSaving = false }; return isSaving })
+            else { return }
+            let notes = try? context.fetch(NSFetchRequest<NSManagedObject>(entityName: "ScenarioNote"))
+            notes?.first { ($0.value(forKey: "text") as? String) == "n2" }?.setValue("n2 never saved", forKey: "text")
+            let tag = NSEntityDescription.insertNewObject(forEntityName: "ScenarioTag", into: context)
+            tag.setValue("t", forKey: "name")
+            do {
+                try context.save()
+            } catch {
+                nestedFailed.withLock { $0 = true }
+                context.rollback()
+            }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        try await a.launch()
+        try a.change { context in
+            for index in 1...2 { context.insert(ScenarioNote(text: "n\(index)")) }
+            context.insert(ScenarioTag(name: "t"))
+        }
+        await a.sync()
+
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = try #require(a.synchronizer.observedStore)
+        appContext.withLockUnchecked { $0 = context }
+        try context.performAndWait {
+            let notes = try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "ScenarioNote"))
+            notes.first { ($0.value(forKey: "text") as? String) == "n1" }?.setValue("n1 edited", forKey: "text")
+            savesAgain.withLock { $0 = true }
+            try context.save()
+        }
+        await a.sync()
+        await a.sync()
+
+        #expect(nestedFailed.withLock { $0 })
+        #expect(a.serverNotes() == ["n1 edited", "n2"])
+        a.terminate()
+    }
+
+    /// A save fails, and the app saves other changes right after, before the failed save's keys are dropped. The second
+    /// save's edit is uploaded, and the failed one's isn't.
+    @Test func saveRightAfterAFailedOneKeepsItsEdits() async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        try await a.launch()
+        try a.change { context in
+            for index in 1...2 { context.insert(ScenarioNote(text: "n\(index)")) }
+            context.insert(ScenarioTag(name: "t"))
+        }
+        await a.sync()
+
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = try #require(a.synchronizer.observedStore)
+        let failed: Bool = try context.performAndWait {
+            let notes = try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "ScenarioNote"))
+            notes.first { ($0.value(forKey: "text") as? String) == "n1" }?.setValue("n1 never saved", forKey: "text")
+            NSEntityDescription.insertNewObject(forEntityName: "ScenarioTag", into: context).setValue("t", forKey: "name")
+            var failed = false
+            do { try context.save() } catch { failed = true }
+            context.rollback()
+            notes.first { ($0.value(forKey: "text") as? String) == "n2" }?.setValue("n2 edited", forKey: "text")
+            try context.save()
+            return failed
+        }
+        await a.sync()
+        await a.sync()
+
+        #expect(failed)
+        #expect(a.serverNotes() == ["n1", "n2 edited"])
+        a.terminate()
+    }
+
+    /// The saves a DidSave is matched with, by the objects they started with. Several that match are taken together, and
+    /// none that matches takes the newest, as before.
+    @Test func savesAreMatchedByTheirObjects() async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        try await a.launch()
+        try a.change { $0.insert(ScenarioNote(text: "n")) }
+        let synchronizer = try #require(a.synchronizer)
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = try #require(synchronizer.observedStore)
+        let (one, two, three) = (NSObject(), NSObject(), NSObject())
+        let objectID = try #require(context.performAndWait {
+            try? context.fetch(NSFetchRequest<NSManagedObject>(entityName: "ScenarioNote")).first?.objectID
+        })
+        func remember(_ key: String, _ objects: [NSObject]) -> Int {
+            synchronizer.rememberKeysBeingSaved([objectID: [key]], previousReferences: [:], objects: Set(objects.map(ObjectIdentifier.init)), by: context)
+        }
+
+        // The outer save's DidSave, below a failed save of other objects
+        let outer = remember("outer", [one, two])
+        _ = remember("failed", [three])
+        let first = try #require(synchronizer.takeKeysBeingSaved(by: context, savedObjects: Set([one, two].map(ObjectIdentifier.init))))
+        #expect(first.tokens == [outer])
+        #expect(first.save.keys[objectID] == ["outer"])
+
+        // A failed save of objects that are saved too is taken with the save
+        _ = remember("failed of the same", [one])
+        let next = remember("next", [one, two])
+        let both = try #require(synchronizer.takeKeysBeingSaved(by: context, savedObjects: Set([one, two].map(ObjectIdentifier.init))))
+        #expect(both.save.token == next)
+        #expect(both.tokens.count == 2)
+        #expect(both.save.keys[objectID] == ["failed of the same", "next"])
+
+        // Without a match, the newest, which leaves the failed save of other objects from the start
+        let newest = remember("unmatched", [one])
+        let fallback = try #require(synchronizer.takeKeysBeingSaved(by: context, savedObjects: []))
+        #expect(fallback.tokens == [newest])
+        let left = try #require(synchronizer.takeKeysBeingSaved(by: context, savedObjects: [ObjectIdentifier(three)]))
+        #expect(left.save.keys[objectID] == ["failed"])
+        #expect(synchronizer.takeKeysBeingSaved(by: context, savedObjects: []) == nil ? true : false)
+        a.terminate()
+    }
 }
