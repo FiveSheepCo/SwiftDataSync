@@ -46,15 +46,15 @@ private enum DownloadScope {
 
 extension SDSSynchronizer {
     
+    /// How many records are downloaded again at once, see `_downloadOnce`. CloudKit fetches at most 400.
+    static let downloadAgainBatchSize = 200
+
     /// Downloads the private database, then the shared one.
     ///
     /// Returns the error of the shared database's download instead of throwing it, e.g. for a zone of another user that keeps
     /// failing, as it mustn't keep the private database from being uploaded. Its own changes aren't uploaded then, as they're
     /// only uploaded after a download.
     /// - Parameter refreshingSharedZones: Whether the shared zones have to be refreshed, which `synchronize()` usually did already.
-    /// How many records are downloaded again at once, see `_downloadOnce`. CloudKit fetches at most 400.
-    static let downloadAgainBatchSize = 200
-
     func download(refreshingSharedZones: Bool = true) async throws -> (any Error)? {
         // Downloads skip models and keys this version doesn't synchronize, e.g. ones a newer version added, while their change
         // tokens move on. Once more is synchronized, they are caught up on by downloading every record once more.
