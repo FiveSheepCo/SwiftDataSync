@@ -27,11 +27,9 @@ Call `setup` once, as early as possible, e.g. when the app launches, so pushes t
 
 Saves of the observed store are recorded as pending changes, and synchronized shortly after: every synchronization
 **downloads first, then uploads**. Local changes are thus uploaded over the newest values: an edit of a model that another
-device deleted is discarded with the deletion, rather than uploaded as a partial record. A model that one device moves into another one, e.g. a link into
-a subscription, while another device deletes that one without knowing about the move, is deleted by the delete rule on
-the device that moved it, while the device that deleted the other one keeps it at its previous place until it changes
-again, and its record stays in iCloud. Local changes that weren't
-uploaded yet still win over downloaded values of the same keys. A model created on this device keeps its record, though:
+device deleted is discarded with the deletion, rather than uploaded as a partial record (see the known limitations for a
+deletion that reaches iCloud after the download). Local changes that weren't uploaded yet still win over downloaded values
+of the same keys. A model created on this device keeps its record, though:
 e.g. after unsubscribing and subscribing again, the earlier deletion doesn't delete the new subscription. If the download
 fails, the changes are uploaded anyway, edits only of records that still exist, except while every record is downloaded
 again, e.g. after `resetSyncData()`: local models can be copies of records that weren't downloaded yet. Then nothing is
@@ -171,6 +169,22 @@ it's large, or doesn't fit next to the others, and out of it once it fits. Two d
 asset within the same moment are the exception: the last upload of the asset wins. Only records that need the field or had
 it get it, so a production schema without it keeps working until a value grows that large:
 `initializeSchema()` creates it for every entity with texts or data. Identity values are never moved into the asset.
+
+### Known Limitations
+
+These are races between devices, or between the app and a running download, that synchronizing doesn't resolve:
+
+- An edit of a model that another device deleted after this device's last download, but before its upload, creates the
+  record again with only the edited values. Other devices then download a model with only those values.
+- A model the app creates with the identity of a record that a running download inserts at the same moment can end up as
+  two models of the same identity on that device.
+- A model that one device moves into another one, e.g. a link into a subscription, while another device deletes that one
+  without knowing about the move, is deleted by the delete rule on the device that moved it, while the device that
+  deleted the other one keeps it at its previous place until it changes again, and its record stays in iCloud.
+- When a change token expires, e.g. after a device was offline for a long time, models that other devices deleted
+  meanwhile stay on that device, as their deletions aren't downloaded again.
+- The removal of a record that a waiting update still references, e.g. a document's previous workspace, or the record a
+  model moved away from, waits for that update. If CloudKit keeps rejecting the update, the removal waits too.
 
 ## Installation
 
