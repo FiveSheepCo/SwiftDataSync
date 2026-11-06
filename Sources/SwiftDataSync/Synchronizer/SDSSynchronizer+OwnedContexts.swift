@@ -243,7 +243,12 @@ extension SDSSynchronizer {
                 // were replaced. A model that moves away from its record also holds back that record's removal, rather than it
                 // being deleted while the new record waits, e.g. as iCloud is full, which would delete the model on other devices
                 // meanwhile, and what that record's update held back, e.g. the record of a move before, or a previous parent.
-                var references = change.previousReferenceLocalIds.compactMap { previousReferenceIds[$0] } + change.previousReferenceRecordIds
+                // Only of records that can be in iCloud: a model that got its record here, which isn't uploaded yet, references
+                // nothing there.
+                var references: [String] = []
+                if hadRecord.contains(change.localId) {
+                    references += change.previousReferenceLocalIds.compactMap { previousReferenceIds[$0] } + change.previousReferenceRecordIds
+                }
                 if let previousId {
                     references += [previousId] + (heldBackByMoving[change.localId] ?? [])
                 }
