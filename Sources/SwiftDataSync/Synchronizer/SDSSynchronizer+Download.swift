@@ -1687,8 +1687,9 @@ private final class CKDownloadHandler {
                 return error
             }
             let heldIDs = recordsToAddLater.ids.union(setAsideRecords.ids)
-            for recordID in persistedHeldIDs.subtracting(heldIDs) {
-                heldRecords.release(recordID)
+            let released = persistedHeldIDs.subtracting(heldIDs)
+            heldRecords.release(released)
+            for recordID in released {
                 persistedHeld[recordID] = nil
             }
             persistedFailedRecordIDs = failedRecordIDs
