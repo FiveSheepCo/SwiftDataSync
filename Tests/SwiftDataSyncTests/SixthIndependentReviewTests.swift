@@ -266,6 +266,15 @@ struct SixthIndependentReviewTests {
         #expect(both.tokens.count == 2)
         #expect(both.save.keys[objectID] == ["failed of the same", "next"])
 
+        // A save that only inserted, below the save whose notification this is, e.g. one whose notification's observer saves
+        // again, isn't taken by it, but by its own notification later
+        let inserting = remember("inserting", [])
+        let fromObserver = remember("from observer", [two])
+        let observers = try #require(synchronizer.takeKeysBeingSaved(by: context, savedObjects: [ObjectIdentifier(two)]))
+        #expect(observers.tokens == [fromObserver])
+        let inserts = try #require(synchronizer.takeKeysBeingSaved(by: context, savedObjects: []))
+        #expect(inserts.tokens == [inserting])
+
         // Without a match, the newest, which leaves the failed save of other objects from the start
         let newest = remember("unmatched", [one])
         let fallback = try #require(synchronizer.takeKeysBeingSaved(by: context, savedObjects: []))
