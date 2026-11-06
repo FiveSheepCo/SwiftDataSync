@@ -351,16 +351,25 @@ public final class SDSSynchronizer: Sendable {
         mutableState.withLock { $0.deletionsBeingSaved[ObjectIdentifier(context), default: []].append(.init(token: token, date: .now, deletions: deletions)) }
     }
 
-    /// Returns the deletions a context saved to the store, of the saves `takeKeysBeingSaved(by:savedObjects:)` found. Downloads
-    /// keep leaving their records alone until `finishStoringRemovals(of:)`.
-    func takeDeletionsBeingSaved(by context: NSManagedObjectContext, tokens: Set<Int>) -> [NSManagedObjectID: SDSObjectDeletion] {
+    /// Returns the deletions a context saved to the store, read when the saves that deleted the objects started. They're found
+    /// by the objects `NSManagedObjectContextDidSave` lists as deleted, rather than by save like the keys, as a failed save's
+    /// deletion mustn't be uploaded, see `takeKeysBeingSaved(by:)`. Downloads keep leaving their records alone until
+    /// `finishStoringRemovals(of:)`.
+    func takeDeletionsBeingSaved(by context: NSManagedObjectContext, deleted objectIDs: [NSManagedObjectID]) -> [NSManagedObjectID: SDSObjectDeletion] {
         mutableState.withLock { state in
             let id = ObjectIdentifier(context)
-            let saves = state.deletionsBeingSaved[id] ?? []
-            let deletions = saves.filter { tokens.contains($0.token) }.reduce(into: [NSManagedObjectID: SDSObjectDeletion]()) { deletions, save in
-                deletions.merge(save.deletions) { current, _ in current }
+            var deletions: [NSManagedObjectID: SDSObjectDeletion] = [:]
+            var left: [DeletionsBeingSaved] = []
+            for save in state.deletionsBeingSaved[id] ?? [] {
+                var remaining = save.deletions
+                for objectID in objectIDs {
+                    guard let deletion = remaining.removeValue(forKey: objectID) else { continue }
+                    deletions[objectID] = deletions[objectID] ?? deletion
+                }
+                if !remaining.isEmpty {
+                    left.append(remaining.count == save.deletions.count ? save : DeletionsBeingSaved(token: save.token, date: save.date, deletions: remaining))
+                }
             }
-            let left = saves.filter { !tokens.contains($0.token) }
             state.deletionsBeingSaved[id] = left.isEmpty ? nil : left
             for deletion in deletions.values {
                 state.removalsBeingStored[deletion.localId, default: 0] += 1
@@ -656,19 +665,16 @@ public final class SDSSynchronizer: Sendable {
         var keys: [NSManagedObjectID: Set<String>]
         /// The URIs of the objects that changed relationships referenced before, by object, see `SDSObjectChange.previousReferenceLocalIds`.
         var previousReferences: [NSManagedObjectID: Set<String>] = [:]
-        /// The objects the save started with that were updated or deleted. `NSManagedObjectContextDidSave` lists the same
-        /// instances, which tells which save it belongs to, see `takeKeysBeingSaved(by:savedObjects:)`.
-        var objects: Set<ObjectIdentifier> = []
 
         /// Saves are short. An older one failed.
         var isCurrent: Bool { Date.now.timeIntervalSince(date) < 60 }
     }
 
     /// Remembers the synchronized keys a context is about to save to the store, see `contextWillSave`. Returns the save's token.
-    func rememberKeysBeingSaved(_ keys: [NSManagedObjectID: Set<String>], previousReferences: [NSManagedObjectID: Set<String>], objects: Set<ObjectIdentifier>, by context: NSManagedObjectContext) -> Int {
+    func rememberKeysBeingSaved(_ keys: [NSManagedObjectID: Set<String>], previousReferences: [NSManagedObjectID: Set<String>], by context: NSManagedObjectContext) -> Int {
         mutableState.withLock { state in
             state.lastSaveToken += 1
-            state.keysBeingSaved[ObjectIdentifier(context), default: []].append(KeysBeingSaved(token: state.lastSaveToken, date: .now, keys: keys, previousReferences: previousReferences, objects: objects))
+            state.keysBeingSaved[ObjectIdentifier(context), default: []].append(KeysBeingSaved(token: state.lastSaveToken, date: .now, keys: keys, previousReferences: previousReferences))
             return state.lastSaveToken
         }
     }
@@ -701,38 +707,24 @@ public final class SDSSynchronizer: Sendable {
         }
     }
 
-    /// Takes the synchronized keys a context saved to the store, which are kept by the save's token until they're stored,
-    /// see `forgetSavedKeys(_:)`, and the deletions it saved, see `takeDeletionsBeingSaved(by:tokens:)`.
+    /// Takes the synchronized keys of every save of a context that started, which are kept by the newest one's token until
+    /// they're stored, see `forgetSavedKeys(_:)`.
     ///
-    /// A save is found by its objects, which are among the ones `NSManagedObjectContextDidSave` lists, rather than by being
-    /// the newest of the context's: a save that an app's observer of `NSManagedObjectContextDidSave` makes, which runs before
-    /// this synchronizer's, can fail, and leave its keys on top of the ones of the save whose notification this is.
-    /// - If several saves are found, e.g. a failed one whose objects are among the saved ones too, their keys are taken
-    ///   together: uploading a key that didn't change costs little, while a save's keys that are dropped are never uploaded.
-    /// - If none is, the newest is taken, as before.
-    /// - Parameter savedObjects: The objects the notification lists as inserted, updated or deleted.
-    /// - Returns: The keys of the saves, under the newest one's token, and the tokens of the saves.
-    func takeKeysBeingSaved(by context: NSManagedObjectContext, savedObjects: Set<ObjectIdentifier>) -> (save: KeysBeingSaved, tokens: Set<Int>)? {
+    /// Saves of a context run one after another on its queue, and an app's observer of `NSManagedObjectContextDidSave` that
+    /// runs before this synchronizer's can save it again from there, so saves nest, and `NSManagedObjectContextDidSave` doesn't
+    /// tell which save's keys are its own. When it arrives, the keys of other saves of the context are of saves it's nested in,
+    /// which are in the store already, as their notifications are being posted, or of saves that failed, as one that didn't
+    /// was taken by its own notification. So every save's keys are taken: a failed save's keys are uploaded with the store's
+    /// values, which costs little, while a save's keys that are dropped are never uploaded.
+    func takeKeysBeingSaved(by context: NSManagedObjectContext) -> KeysBeingSaved? {
         mutableState.withLock { state in
-            let id = ObjectIdentifier(context)
-            guard let saves = state.keysBeingSaved[id], !saves.isEmpty else { return nil }
-            // A save that only inserts has no objects here, and would match every save, e.g. a save of an app's observer of
-            // its `NSManagedObjectContextDidSave`, which would take its keys. It's only the newest's: one below that is
-            // done once a later save's notification arrives, or failed.
-            let matching = saves.indices.filter { index in
-                saves[index].objects.isEmpty ? index == saves.count - 1 : saves[index].objects.isSubset(of: savedObjects)
-            }.map { saves[$0] }
-            let taken = matching.isEmpty ? [saves[saves.count - 1]] : matching
-            let tokens = Set(taken.map(\.token))
-            var save = taken[taken.count - 1]
-            for other in taken.dropLast() {
+            guard let saves = state.keysBeingSaved.removeValue(forKey: ObjectIdentifier(context)), var save = saves.last else { return nil }
+            for other in saves.dropLast() {
                 save.keys.merge(other.keys) { $0.union($1) }
                 save.previousReferences.merge(other.previousReferences) { $0.union($1) }
             }
-            let left = saves.filter { !tokens.contains($0.token) }
-            state.keysBeingSaved[id] = left.isEmpty ? nil : left
             state.keysSavedNotStored[save.token] = save.keys
-            return (save, tokens)
+            return save
         }
     }
 

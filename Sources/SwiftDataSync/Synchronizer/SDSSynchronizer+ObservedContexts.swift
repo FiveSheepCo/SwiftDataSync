@@ -106,10 +106,7 @@ extension SDSSynchronizer {
                 }
             }
         }
-        // Not the inserted ones, which have no keys or deletions here, and which `NSManagedObjectContextDidSave` leaves out if a
-        // merge policy folds them into existing ones of the same unique values, e.g. SwiftData's `@Attribute(.unique)`
-        let objects = Set(context.updatedObjects.union(context.deletedObjects).map(ObjectIdentifier.init))
-        let token = rememberKeysBeingSaved(keys, previousReferences: previousReferences, objects: objects, by: context)
+        let token = rememberKeysBeingSaved(keys, previousReferences: previousReferences, by: context)
         // Runs once the save is over, as blocks on the context's queue run one after another. A save that failed didn't post
         // `NSManagedObjectContextDidSave`, so its keys are still there, and would keep downloaded values from being stored.
         // Contexts confined to a thread don't have a queue, and their keys expire instead.
@@ -168,15 +165,11 @@ extension SDSSynchronizer {
             savingContext.persistentStoreCoordinator == observedStore,
             savingContext != observedUpdateContext
         else { return }
-        // The save's keys and deletions, found by the objects it saved, see `takeKeysBeingSaved(by:savedObjects:)`
-        let savedObjects = [NSInsertedObjectsKey, NSUpdatedObjectsKey, NSDeletedObjectsKey].reduce(into: Set<ObjectIdentifier>()) { objects, key in
-            for case let object as NSManagedObject in notification.userInfo?[key] as? NSSet ?? [] {
-                objects.insert(ObjectIdentifier(object))
-            }
-        }
-        let taken = takeKeysBeingSaved(by: savingContext, savedObjects: savedObjects)
-        let saved = taken?.save
-        let readDeletions = takeDeletionsBeingSaved(by: savingContext, tokens: taken?.tokens ?? [])
+        // The keys of every save of the context that started, as saves nest, and the deletions of the objects this one deleted,
+        // see `takeKeysBeingSaved(by:)`
+        let saved = takeKeysBeingSaved(by: savingContext)
+        let deletedByThisSave = (notification.userInfo?[NSDeletedObjectsKey] as? NSSet ?? []).compactMap { ($0 as? NSManagedObject)?.objectID }
+        let readDeletions = takeDeletionsBeingSaved(by: savingContext, deleted: deletedByThisSave)
         // Forgotten only once they're stored, as blocks on `context`'s queue run in order, so a download that looks for local
         // changes finds them in one place or the other, see `CKDownloadHandler.keepLocalChanges(in:)`
         defer {
@@ -217,10 +210,17 @@ extension SDSSynchronizer {
         // Before the changes, so a model saved with the identity of a deleted one gets its record, see `storeUpdates`
         storeRemovals(deletions, finishing: Array(readDeletions.values))
         
-        // Changes that were saved are stored again, so their saved values are uploaded too, see `contextWillSave`
-        let updatedObjects = (userInfo[NSUpdatedObjectsKey] as? NSSet ?? []).compactMap { $0 as? NSManagedObject }
+        // Changes that were saved are stored again, so their saved values are uploaded too, see `contextWillSave`. Also of
+        // objects this notification doesn't list, as the keys can be of a save this one is nested in, see `takeKeysBeingSaved(by:)`.
+        let listedObjects = (userInfo[NSUpdatedObjectsKey] as? NSSet ?? []).compactMap { $0 as? NSManagedObject }
+        let listedIDs = Set(listedObjects.map(\.objectID))
+        let otherObjects = savedChanges.keys.filter { !listedIDs.contains($0) }.compactMap { objectID -> NSManagedObject? in
+            // Read on the queue of the context, which is posting the notification
+            guard let object = savingContext.registeredObject(for: objectID) ?? (try? savingContext.existingObject(with: objectID)) else { return nil }
+            return object.isDeleted ? nil : object
+        }
         var updatedChanges: [SDSObjectChange] = []
-        for object in updatedObjects {
+        for object in listedObjects + otherObjects {
             guard let keys = savedChanges[object.objectID], let container = container(for: object) else { continue }
             var change = identifying(SDSObjectChange(
                 localId: object.objectID.uriRepresentation().absoluteString,
