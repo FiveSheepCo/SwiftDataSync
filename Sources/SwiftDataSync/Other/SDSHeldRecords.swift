@@ -62,11 +62,15 @@ final class SDSHeldRecords {
         try data.write(to: directory.appending(component: "\(name).record"), options: .atomic)
     }
 
-    /// Forgets a record, e.g. once it's stored, or a newer version of it arrived.
-    func release(_ recordID: CKRecord.ID) {
-        let name = fileName(of: recordID)
+    /// Forgets records, e.g. once they're stored, or newer versions of them arrived. The directory is listed once for all of
+    /// them, as a new device can release thousands at once.
+    func release(_ recordIDs: some Collection<CKRecord.ID>) {
+        guard !recordIDs.isEmpty else { return }
+        let names = Set(recordIDs.map(fileName(of:)))
         guard let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return }
-        for file in files where file.lastPathComponent.hasPrefix(name + ".") {
+        // A record's file, and the files of its assets, start with its name and a dot, see `hold(_:)`
+        for file in files {
+            guard let name = file.lastPathComponent.split(separator: ".", maxSplits: 1).first, names.contains(String(name)) else { continue }
             try? FileManager.default.removeItem(at: file)
         }
     }

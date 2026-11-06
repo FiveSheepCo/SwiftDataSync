@@ -321,4 +321,56 @@ struct SixthIndependentReviewTests {
         a.terminate()
         b.terminate()
     }
+
+    // MARK: Held records
+
+    /// A new device downloads many links before the subscription they reference, which was changed after them, so the links
+    /// are held until it arrives. Releasing them lists the directory of held records once, rather than once for each.
+    @Test func manyHeldRecordsAreReleasedQuickly() async throws {
+        let count = 2000
+        let server = FakeCloudServer()
+        let subscription = subscriptionRecord("s1", title: "Title")
+        let links = (0..<count).map { index in
+            let link = CKRecord(recordType: "ScenarioLink", recordID: CKRecord.ID(recordName: UUID().uuidString, zoneID: .scenario))
+            link["name"] = "Link \(index)"
+            link["subscription"] = CKRecord.Reference(recordID: subscription.recordID, action: .none)
+            return link
+        }
+        server.seed(links, account: "first")
+        server.seed([subscription], account: "first")
+        let b = TestDevice("B", server: server)
+        let start = ContinuousClock.now
+        try await b.launch()
+        await b.sync()
+        let duration = ContinuousClock.now - start
+        #expect(try b.count(ScenarioLink.self) == count)
+        #expect(duration < .seconds(5), "Took \(duration)")
+        b.terminate()
+    }
+
+    /// Releasing held records removes their files and their assets' files, and leaves the others.
+    @Test func releasingHeldRecordsRemovesOnlyTheirFiles() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "SwiftDataSync Tests/\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let held = SDSHeldRecords(directory: directory)
+        let assetFile = FileManager.default.temporaryDirectory.appending(component: UUID().uuidString)
+        try Data("asset".utf8).write(to: assetFile)
+        defer { try? FileManager.default.removeItem(at: assetFile) }
+        let records = (0..<3).map { index in
+            let record = CKRecord(recordType: "ScenarioNote", recordID: CKRecord.ID(recordName: "n\(index)", zoneID: .scenario))
+            record["text"] = "n\(index)"
+            record["artwork"] = CKAsset(fileURL: assetFile)
+            return record
+        }
+        for record in records {
+            try held.hold(record)
+        }
+        try held.storeFailedIDs([records[0].recordID])
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).count == 7)
+
+        held.release([records[0].recordID, records[2].recordID])
+        #expect(held.load().map(\.recordID.recordName) == ["n1"])
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).count == 3)
+        #expect(held.loadFailedIDs() == [records[0].recordID])
+    }
 }
