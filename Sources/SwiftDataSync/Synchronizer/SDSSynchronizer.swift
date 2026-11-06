@@ -656,9 +656,8 @@ public final class SDSSynchronizer: Sendable {
         var keys: [NSManagedObjectID: Set<String>]
         /// The URIs of the objects that changed relationships referenced before, by object, see `SDSObjectChange.previousReferenceLocalIds`.
         var previousReferences: [NSManagedObjectID: Set<String>] = [:]
-        /// The objects the save started with: inserted, updated and deleted ones. `NSManagedObjectContextDidSave` lists the
-        /// same instances, also of inserted objects whose IDs became permanent, which tells which save it belongs to, see
-        /// `takeKeysBeingSaved(by:savedObjects:)`.
+        /// The objects the save started with that were updated or deleted. `NSManagedObjectContextDidSave` lists the same
+        /// instances, which tells which save it belongs to, see `takeKeysBeingSaved(by:savedObjects:)`.
         var objects: Set<ObjectIdentifier> = []
 
         /// Saves are short. An older one failed.
@@ -1310,7 +1309,7 @@ public final class SDSSynchronizer: Sendable {
         removeSavedPlaceholders()
         checkForNewlySynchronizedKeys(configuration)
         // Files of assets that earlier uploads couldn't remove, e.g. because the app was terminated while uploading
-        CKAsset.removeAllTemporaryFiles()
+        CKAsset.removeLeftoverTemporaryFiles()
         
         // Adopted models are saved before observing the store, so they aren't uploaded as new records
         if let adoption {

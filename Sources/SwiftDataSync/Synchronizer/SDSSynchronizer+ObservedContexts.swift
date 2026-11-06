@@ -106,7 +106,9 @@ extension SDSSynchronizer {
                 }
             }
         }
-        let objects = Set(context.insertedObjects.union(context.updatedObjects).union(context.deletedObjects).map(ObjectIdentifier.init))
+        // Not the inserted ones, which have no keys or deletions here, and which `NSManagedObjectContextDidSave` leaves out if a
+        // merge policy folds them into existing ones of the same unique values, e.g. SwiftData's `@Attribute(.unique)`
+        let objects = Set(context.updatedObjects.union(context.deletedObjects).map(ObjectIdentifier.init))
         let token = rememberKeysBeingSaved(keys, previousReferences: previousReferences, objects: objects, by: context)
         // Runs once the save is over, as blocks on the context's queue run one after another. A save that failed didn't post
         // `NSManagedObjectContextDidSave`, so its keys are still there, and would keep downloaded values from being stored.

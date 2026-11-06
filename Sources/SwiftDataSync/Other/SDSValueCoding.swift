@@ -168,8 +168,19 @@ extension CKAsset {
         }
     }
 
+    /// How old the files of earlier uploads are once `removeLeftoverTemporaryFiles()` removes them. Every synchronizer of the
+    /// process shares the directory, so files of uploads that are running, of another synchronizer, are left alone.
+    static let leftoverTemporaryFileAge: TimeInterval = 24 * 60 * 60
+
     /// Removes the files of earlier uploads that weren't removed, e.g. because the app was terminated while uploading.
-    static func removeAllTemporaryFiles() {
-        try? FileManager.default.removeItem(at: temporaryFilesDirectory)
+    static func removeLeftoverTemporaryFiles(now: Date = .now) {
+        let fileManager = FileManager.default
+        guard let files = try? fileManager.contentsOfDirectory(at: temporaryFilesDirectory, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
+        for file in files {
+            let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            if now.timeIntervalSince(modified) > leftoverTemporaryFileAge {
+                try? fileManager.removeItem(at: file)
+            }
+        }
     }
 }
