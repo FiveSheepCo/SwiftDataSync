@@ -795,13 +795,10 @@ private final class CKDownloadHandler {
             return
         }
 
-        // Keys only other processes synchronize are downloaded again by the app, see `skippedRecordIDs`
-        if heldRecords != nil, !skippedKeys.isEmpty {
-            // Not keys that aren't properties, e.g. `parentWorkaround` or the overflow asset's
-            let keys = Set(record.allKeys()).union(overflowValues.keys).compactMap { propertyName(entity: entity, rawKey: $0) }
-            if keys.contains(where: { skippedKeys.contains("\(record.recordType).\($0)") }) {
-                skippedRecordIDs.insert(record.recordID)
-            }
+        // Keys only other processes synchronize are downloaded again by the app, see `skippedRecordIDs`. Also when the record
+        // doesn't have them: records leave out cleared values, so one cleared elsewhere would be missed.
+        if heldRecords != nil, skippedKeys.contains(where: { $0.hasPrefix("\(record.recordType).") }) {
+            skippedRecordIDs.insert(record.recordID)
         }
 
         // Make sure dependent objects exist, and prefill all values if they do
