@@ -179,8 +179,9 @@ These are races between devices, or between the app and a running download, that
 - A model the app creates with the identity of a record that a running download inserts at the same moment can end up as
   two models of the same identity on that device.
 - A model that one device moves into another one, e.g. a link into a subscription, while another device deletes that one
-  without knowing about the move, is deleted by the delete rule on the device that moved it, while the device that
-  deleted the other one keeps it at its previous place until it changes again, and its record stays in iCloud.
+  without knowing about the move, is deleted everywhere if the move wasn't uploaded yet, like a delete rule that
+  cascades. If it was, the device that moved it deletes it only there, while the device that deleted the other one keeps
+  it at its previous place until it changes again, and its record stays in iCloud.
 - When a change token expires, e.g. after a device was offline for a long time, models that other devices deleted
   meanwhile stay on that device, as their deletions aren't downloaded again.
 - The removal of a record that a waiting update still references, e.g. a document's previous workspace, or the record a
