@@ -797,7 +797,8 @@ private final class CKDownloadHandler {
 
         // Keys only other processes synchronize are downloaded again by the app, see `skippedRecordIDs`
         if heldRecords != nil, !skippedKeys.isEmpty {
-            let keys = Set(record.allKeys()).union(overflowValues.keys).map { findCorrespondingKey(entity: entity, rawKey: $0) }
+            // Not keys that aren't properties, e.g. `parentWorkaround` or the overflow asset's
+            let keys = Set(record.allKeys()).union(overflowValues.keys).compactMap { propertyName(entity: entity, rawKey: $0) }
             if keys.contains(where: { skippedKeys.contains("\(record.recordType).\($0)") }) {
                 skippedRecordIDs.insert(record.recordID)
             }
@@ -836,7 +837,8 @@ private final class CKDownloadHandler {
 
         let insertsObject = scope.insertsObjects(of: record.recordType)
         if scope.isCatchingUp {
-            let caughtUpKeys = Set(record.allKeys().map { findCorrespondingKey(entity: entity, rawKey: $0) } + overflowValues.keys.map { findCorrespondingKey(entity: entity, rawKey: $0) })
+            // Not keys that aren't properties, e.g. `parentWorkaround` or the overflow asset's
+            let caughtUpKeys = Set(Set(record.allKeys()).union(overflowValues.keys).compactMap { propertyName(entity: entity, rawKey: $0) })
                 .filter { scope.includes(entity: record.recordType, key: $0) }
             synchronizer.noteCaughtUpKeys(caughtUpKeys, of: recordName)
             guard !kVPs.isEmpty || insertsObject else { return }
