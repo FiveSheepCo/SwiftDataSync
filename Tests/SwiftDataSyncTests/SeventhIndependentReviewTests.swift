@@ -92,4 +92,44 @@ struct SeventhIndependentReviewTests {
         a.terminate()
         b.terminate()
     }
+
+    /// Another device clears a subscription's note while B's extension, which doesn't synchronize notes, downloads. The record
+    /// leaves the cleared note out, and B's app downloads it again, so it clears the note too.
+    @Test(arguments: [false, true]) func appGetsAClearOfAKeyTheExtensionSkipped(alsoEditsTitle: Bool) async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try a.insertSubscriptions(["s1"])
+        try a.editSubscription("s1") { $0.note = "Old note" }
+        await a.sync()
+        try await b.launch()
+        await b.sync()
+        #expect(try b.subscription("s1")?.note == "Old note")
+        b.terminate()
+
+        try a.editSubscription("s1") { subscription in
+            subscription.note = nil
+            if alsoEditsTitle {
+                subscription.title = "New title"
+            }
+        }
+        await a.sync()
+
+        b.beforeSetup = { $0.isAppExtension = true }
+        try await b.launch(configuration: Self.extensionConfiguration)
+        await b.sync()
+        b.terminate()
+        b.beforeSetup = nil
+        try await b.launch()
+        await b.sync()
+        await b.sync()
+
+        #expect(try b.subscription("s1")?.note == nil)
+        if alsoEditsTitle {
+            #expect(try b.subscription("s1")?.title == "New title")
+        }
+        a.terminate()
+        b.terminate()
+    }
 }
