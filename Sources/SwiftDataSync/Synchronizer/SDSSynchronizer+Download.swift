@@ -1953,9 +1953,10 @@ private final class CKDownloadHandler {
         // it's in the deleted object.
         if let key = nsError.userInfo[NSValidationKeyErrorKey] as? String, lostRequiredRelationship(key, of: object) {
             let recordName = synchronizer.existingRecordId(of: object)
-            let isMovedHere = recordName.map { pendingLocalChange(of: $0).keys.contains(key) } ?? false
+            // Read from what's stored now, rather than when the download started: the app can move it meanwhile
+            let isMovedHere = recordName.map { synchronizer.pendingLocalChange(of: $0).keys.contains(key) } ?? false
                 || isChangeOnOtherSide(of: key, of: object, pendingKeys: { related in
-                    synchronizer.existingRecordId(of: related).map { Array(pendingLocalChange(of: $0).keys) } ?? []
+                    synchronizer.existingRecordId(of: related).map { Array(synchronizer.pendingLocalChange(of: $0).keys) } ?? []
                 })
             context.delete(object)
             if let recordName, !isMovedHere {

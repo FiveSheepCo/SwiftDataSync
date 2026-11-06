@@ -2,6 +2,7 @@ import Foundation
 import CoreData
 import CloudKit
 import Testing
+import os
 @testable import SwiftDataSync
 
 /// A Core Data model with what SwiftData can't express: a playlist with an ordered list of items.
@@ -649,6 +650,55 @@ struct CoreDataScenarioTests {
         #expect(server.records(account: "first").filter { $0.recordType == "RItem" }.count == (isCreated ? 0 : 1))
         first.synchronizer.invalidate()
         second.synchronizer.invalidate()
+    }
+
+    /// The same, when this device moves the item while a download runs, which deletes the folder on a later page.
+    @Test func itemMovedDuringADownloadIntoAFolderDeletedElsewhereIsGoneEverywhere() async throws {
+        let server = FakeCloudServer()
+        let first = try await CoreDataDevice("A", server: server, model: requiredFolderModel)
+        let second = try await CoreDataDevice("B", server: server, model: requiredFolderModel)
+        try first.change { context in
+            let kept = NSEntityDescription.insertNewObject(forEntityName: "RFolder", into: context)
+            kept.setValue("Kept", forKey: "name")
+            NSEntityDescription.insertNewObject(forEntityName: "RFolder", into: context).setValue("Deleted", forKey: "name")
+            NSEntityDescription.insertNewObject(forEntityName: "RFolder", into: context).setValue("Other", forKey: "name")
+            let item = NSEntityDescription.insertNewObject(forEntityName: "RItem", into: context)
+            item.setValue("Item", forKey: "name")
+            item.setValue(kept, forKey: "folder")
+        }
+        await first.sync()
+        await second.sync()
+
+        // A renames a folder, then deletes another, which B downloads on two pages
+        try first.change { try Self.folder("Other", $0).setValue("Renamed", forKey: "name") }
+        await first.sync()
+        try first.change { $0.delete(try Self.folder("Deleted", $0)) }
+        await first.sync()
+        server.pageSize = 1
+        let hasMoved = OSAllocatedUnfairLock(initialState: false)
+        second.synchronizer.afterSavingDownloadedObjects = { [second] in
+            guard hasMoved.withLock({ hasMoved in defer { hasMoved = true }; return !hasMoved }) else { return }
+            try? second.change { context in
+                let item = try #require(try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "RItem")).first)
+                item.setValue(try Self.folder("Deleted", context), forKey: "folder")
+            }
+            // Until the move is stored
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        await second.sync()
+        second.synchronizer.afterSavingDownloadedObjects = nil
+        await first.sync()
+        await second.sync()
+
+        #expect(second.count("RItem") == 0)
+        #expect(first.count("RItem") == 0)
+        #expect(server.records(account: "first").filter { $0.recordType == "RItem" }.isEmpty)
+        first.synchronizer.invalidate()
+        second.synchronizer.invalidate()
+    }
+
+    private static func folder(_ name: String, _ context: NSManagedObjectContext) throws -> NSManagedObject {
+        try #require(try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "RFolder")).first { $0.value(forKey: "name") as? String == name })
     }
 
     /// The same, when the relationship is synchronized on the parent's side, as an ordered list of its children: this device
