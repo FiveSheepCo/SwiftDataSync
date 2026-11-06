@@ -220,4 +220,105 @@ struct SixthIndependentReviewTests {
         #expect(synchronizer.takeKeysBeingSaved(by: context, savedObjects: []) == nil ? true : false)
         a.terminate()
     }
+
+    // MARK: Removals held back for records that are replaced
+
+    /// A model whose identity changes twice before its new record is uploaded, as iCloud is full. The second move deletes the
+    /// update of the first move's record, which held back the original record's removal: the new record's update holds it
+    /// back instead, so device B keeps the model meanwhile.
+    @Test func modelMovingTwiceKeepsItsOriginalRecordUntilTheNewOneIsUploaded() async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try await b.launch()
+        try a.insertSubscriptions(["s1", "s2"])
+        await a.sync()
+        await b.sync()
+
+        let isFailing = OSAllocatedUnfairLock(initialState: true)
+        server.failSaving(where: { _ in isFailing.withLock { $0 } }, with: CKError(.quotaExceeded))
+        try a.editSubscription("s1") { $0.feedLink = "s1x" }
+        try a.editSubscription("s1x") { $0.feedLink = "s1y" }
+        await a.sync()
+        await a.sync()
+        await b.sync()
+        #expect(server.records(account: "first").contains { $0.recordID.recordName == subscriptionRecordName("s1") })
+        #expect(try b.subscriptions().map(\.feedLink) == ["s1", "s2"])
+
+        isFailing.withLock { $0 = false }
+        a.synchronizer.resumeUploads()
+        await a.sync()
+        await a.sync()
+        await b.sync()
+        #expect(a.serverSubscriptions().map(\.feedLink) == ["s1y", "s2"])
+        #expect(try b.subscriptions().map(\.feedLink) == ["s1y", "s2"])
+        a.terminate()
+        b.terminate()
+    }
+
+    /// A document moves to another workspace and changes its identity, in one save or two, while iCloud is full or CloudKit
+    /// rejects its new record, and its previous workspace is deleted. The document's previous record still has that workspace
+    /// as its parent, so the workspace's removal waits for the new record, rather than CloudKit deleting the document's
+    /// previous record with it, and device B the document.
+    @Test(arguments: [false, true], [true, false]) func moveWithIdentityChangeKeepsThePreviousParent(rejected: Bool, inOneSave: Bool) async throws {
+        let server = FakeCloudServer()
+        server.cascadesDeleteSelf = true
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try await b.launch()
+        try a.change { context in
+            let w1 = ScenarioWorkspace(title: "W1")
+            let w2 = ScenarioWorkspace(title: "W2")
+            context.insert(w1)
+            context.insert(w2)
+            let document = ScenarioDocument(title: "d1")
+            context.insert(document)
+            document.workspace = w1
+        }
+        await a.sync()
+        await b.sync()
+        #expect(try b.count(ScenarioDocument.self) == 1)
+
+        let isFailing = OSAllocatedUnfairLock(initialState: true)
+        if rejected {
+            server.failSaving(where: { $0.recordName == documentRecordName("d2") && isFailing.withLock { $0 } }, with: CKError(.serverRejectedRequest))
+        } else {
+            server.failSaving(where: { _ in isFailing.withLock { $0 } }, with: CKError(.quotaExceeded))
+        }
+        try a.change { context in
+            let document = try #require(try context.fetch(FetchDescriptor<ScenarioDocument>()).first)
+            let w2 = try #require(try context.fetch(FetchDescriptor<ScenarioWorkspace>(predicate: #Predicate { $0.title == "W2" })).first)
+            document.workspace = w2
+            if inOneSave { document.title = "d2" }
+        }
+        if !inOneSave {
+            try a.change { context in
+                let document = try #require(try context.fetch(FetchDescriptor<ScenarioDocument>()).first)
+                document.title = "d2"
+            }
+        }
+        try a.change { context in
+            for workspace in try context.fetch(FetchDescriptor<ScenarioWorkspace>(predicate: #Predicate { $0.title == "W1" })) {
+                context.delete(workspace)
+            }
+        }
+        await a.sync()
+        await a.sync()
+        await b.sync()
+        #expect(server.record(named: documentRecordName("d1"), account: "first") != nil, "The previous record is gone before the new one was uploaded")
+        #expect(try b.count(ScenarioDocument.self) == 1)
+
+        isFailing.withLock { $0 = false }
+        a.synchronizer.resetQuarantine()
+        a.synchronizer.resumeUploads()
+        await a.sync()
+        await a.sync()
+        await b.sync()
+        #expect(server.records(account: "first").filter { $0.recordType == "ScenarioDocument" }.map(\.recordID.recordName) == [documentRecordName("d2")])
+        #expect(try b.count(ScenarioDocument.self) == 1)
+        a.terminate()
+        b.terminate()
+    }
 }

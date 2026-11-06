@@ -185,6 +185,42 @@ nonisolated(unsafe) private let currentEpisodeModel: NSManagedObjectModel = {
     return model
 }()
 
+/// Workspaces whose names are unique, with documents below them. It isn't changed after it's made.
+nonisolated(unsafe) private let uniqueWorkspaceModel: NSManagedObjectModel = {
+    let workspace = NSEntityDescription()
+    workspace.name = "UWorkspace"
+    let document = NSEntityDescription()
+    document.name = "UDocument"
+    let name = NSAttributeDescription()
+    name.name = "name"
+    name.type = .string
+    name.isOptional = true
+    let title = NSAttributeDescription()
+    title.name = "title"
+    title.type = .string
+    title.isOptional = true
+    let documents = NSRelationshipDescription()
+    documents.name = "documents"
+    documents.destinationEntity = document
+    documents.maxCount = 0
+    documents.isOptional = true
+    documents.deleteRule = .cascadeDeleteRule
+    let toWorkspace = NSRelationshipDescription()
+    toWorkspace.name = "workspace"
+    toWorkspace.destinationEntity = workspace
+    toWorkspace.maxCount = 1
+    toWorkspace.isOptional = true
+    toWorkspace.deleteRule = .nullifyDeleteRule
+    documents.inverseRelationship = toWorkspace
+    toWorkspace.inverseRelationship = documents
+    workspace.properties = [name, documents]
+    workspace.uniquenessConstraints = [["name"]]
+    document.properties = [title, toWorkspace]
+    let model = NSManagedObjectModel()
+    model.entities = [workspace, document]
+    return model
+}()
+
 /// A device whose store is a Core Data store, set up with its coordinator.
 private final class CoreDataDevice: @unchecked Sendable {
     let synchronizer: SDSSynchronizer
@@ -243,6 +279,12 @@ private final class CoreDataDevice: @unchecked Sendable {
             try body(context)
             try context.save()
         }
+    }
+
+    func count(_ entityName: String) -> Int {
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = coordinator
+        return context.performAndWait { (try? context.count(for: NSFetchRequest<NSManagedObject>(entityName: entityName))) ?? -1 }
     }
 
     /// The names of the items of every playlist, by title.
@@ -414,5 +456,46 @@ struct CoreDataScenarioTests {
         first.synchronizer.invalidate()
         second.synchronizer.invalidate()
     }
-}
 
+    /// Device B has a workspace with a document. Another device uploaded a workspace of the same unique name, whose record
+    /// wins. B moves its workspace to that record, re-points its document, and deletes its own workspace record. If iCloud is
+    /// full, or CloudKit rejects the document, only the removal could be uploaded: it waits for the document's update, as the
+    /// document's record still has B's previous workspace record as its parent, which CloudKit deletes it with.
+    @Test(arguments: [0, 1, 2]) func replacedRecordsRemovalWaitsForTheRecordsThatReferenceIt(failure: Int) async throws {
+        let configuration = SDSConfiguration(rawEntities: [
+            "UWorkspace": .sync(.all),
+            "UDocument": .sync(.all, parentKey: "workspace")
+        ])
+        let server = FakeCloudServer()
+        server.freshRecordsConflict = false
+        server.cascadesDeleteSelf = true
+        let b = try await CoreDataDevice("B", server: server, model: uniqueWorkspaceModel, configuration: configuration)
+        try b.change { context in
+            let workspace = NSEntityDescription.insertNewObject(forEntityName: "UWorkspace", into: context)
+            workspace.setValue("W", forKey: "name")
+            let document = NSEntityDescription.insertNewObject(forEntityName: "UDocument", into: context)
+            document.setValue("D", forKey: "title")
+            document.setValue(workspace, forKey: "workspace")
+        }
+        await b.sync()
+        let documentName = try #require(server.records(account: "first").first { $0.recordType == "UDocument" }?.recordID.recordName)
+
+        // Another device's workspace of the same name, whose record name sorts first, so it's kept
+        let other = CKRecord(recordType: "UWorkspace", recordID: CKRecord.ID(recordName: "00000000-0000-0000-0000-000000000000", zoneID: .scenario))
+        other["name"] = "W"
+        server.seed([other], account: "first")
+        // 0: nothing fails, 1: iCloud is full, 2: CloudKit rejects the document
+        if failure == 1 {
+            server.failSaving(where: { _ in true }, with: CKError(.quotaExceeded))
+        } else if failure == 2 {
+            server.failSaving(where: { $0.recordName == documentName }, with: CKError(.serverRejectedRequest))
+        }
+        await b.sync()
+        await b.sync()
+        await b.sync()
+        #expect(server.records(account: "first").filter { $0.recordType == "UDocument" }.count == 1)
+        #expect(b.count("UDocument") == 1)
+        #expect(b.count("UWorkspace") == 1)
+        b.synchronizer.invalidate()
+    }
+}

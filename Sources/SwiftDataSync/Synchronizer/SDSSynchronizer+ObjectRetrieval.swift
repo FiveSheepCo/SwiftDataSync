@@ -229,19 +229,29 @@ extension SDSSynchronizer {
             if let previousId {
                 // The object's own record is a duplicate of this one. Its pending changes would be deleted with it.
                 logger.log("[Download] Replacing record `\(previousId)` with `\(recordName)` of the same object")
-                movedKeys = CloudKitUpdate.find(for: previousId)?.changedKeys ?? []
+                let previous = CloudKitUpdate.find(for: previousId)
+                movedKeys = previous?.changedKeys ?? []
+                // What it held back waits for the update that takes its changes, as the replaced record in iCloud still
+                // references it until it's deleted, and so does the replaced record itself, see `CloudKitUpdate.previousReferences`
+                let heldBack = [previousId] + (previous?.previousReferences ?? [])
                 setRemoval(id: previousId, zoneId: nil)
                 if !movedKeys.isEmpty {
                     setUpdate(id: recordName, zoneId: nil, entityName: entityName, changedKeys: movedKeys)
+                    CloudKitUpdate.find(for: recordName)?.addPreviousReferences(heldBack.filter { $0 != recordName })
                 }
             }
-            return (adopted, Set(movedKeys), previousId != nil)
+            return (adopted, Set(movedKeys), previousId)
         }
         guard adopted else { return nil }
 
-        if replacedRecord {
-            // Records that reference the deleted record reference this one from now on
-            let changes = referencingChanges(to: object)
+        if let replacedRecord {
+            // Records that reference the deleted record reference this one from now on. Their records in iCloud reference the
+            // deleted one until they're uploaded, so its removal waits for them.
+            let changes = referencingChanges(to: object).map { change in
+                var change = change
+                change.previousReferenceRecordIds = [replacedRecord]
+                return change
+            }
             if !changes.isEmpty {
                 self.context.performAndWaitUnchecked {
                     self.storeUpdates(changes)

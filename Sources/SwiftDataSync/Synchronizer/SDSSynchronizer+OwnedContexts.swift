@@ -52,6 +52,10 @@ extension SDSSynchronizer {
         // The keys of moving models whose values are of unknown age, read before another model takes their records, which
         // gets updates of its own there, see below
         var backfilledKeysOfMoving: [String: Set<String>] = [:]
+        // What the updates of the records moving models move away from hold back, which their new records' updates hold back
+        // instead, as the records in iCloud still reference them until those are uploaded, see `CloudKitUpdate.previousReferences`.
+        // Read before the updates are deleted with the records' removals, or as other models take the records.
+        var heldBackByMoving: [String: [String]] = [:]
         let moving = changes.filter(\.identityChanged)
         if !moving.isEmpty {
             let current = CloudKitLocalEntity.entries(forLocalIds: moving.map(\.localId), in: context)
@@ -59,6 +63,7 @@ extension SDSSynchronizer {
             for change in moving {
                 guard let id = current[change.localId]?.id else { continue }
                 backfilledKeysOfMoving[change.localId] = Set(pending[id]?.backfilledKeys ?? [])
+                heldBackByMoving[change.localId] = pending[id]?.previousReferences ?? []
                 guard id != change.identityRecordName, UUID(uuidString: id) == nil else { continue }
                 vacating.insert(id)
             }
@@ -232,14 +237,17 @@ extension SDSSynchronizer {
                 // The record was named here, and isn't known to exist, see `CloudKitUpdate.isLocalInsert`
                 if backfilled || previousId != nil || !hadRecord.contains(change.localId) {
                     update.markAsLocalInsert()
-                    // The record the model moved away from is only deleted once the model's new record is uploaded, rather
-                    // than while it waits, e.g. as iCloud is full, which would delete the model on other devices meanwhile
-                    if let previousId {
-                        update.addPreviousReferences([previousId])
-                    }
-                } else {
-                    update.addPreviousReferences(change.previousReferenceLocalIds.compactMap { previousReferenceIds[$0] })
                 }
+                // The records that the model's record in iCloud references, whose removals wait for this update, see
+                // `CloudKitUpdate.previousReferences`: what its relationships referenced before they changed, and records that
+                // were replaced. A model that moves away from its record also holds back that record's removal, rather than it
+                // being deleted while the new record waits, e.g. as iCloud is full, which would delete the model on other devices
+                // meanwhile, and what that record's update held back, e.g. the record of a move before, or a previous parent.
+                var references = change.previousReferenceLocalIds.compactMap { previousReferenceIds[$0] } + change.previousReferenceRecordIds
+                if let previousId {
+                    references += [previousId] + (heldBackByMoving[change.localId] ?? [])
+                }
+                update.addPreviousReferences(references.filter { $0 != id })
                 if let zoneId {
                     update.sharedZone = CloudKitZone.getZone(with: zoneId, context: context)
                 }
