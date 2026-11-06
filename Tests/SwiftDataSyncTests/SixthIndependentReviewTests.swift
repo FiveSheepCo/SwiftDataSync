@@ -386,6 +386,44 @@ struct SixthIndependentReviewTests {
         b.terminate()
     }
 
+    // MARK: Large values
+
+    /// A subscription with a large note, which is in the record's overflow asset, is deleted and subscribed to again without
+    /// a note before the deletion is uploaded. The new model takes the record, as a local insert, and its upload replaces the
+    /// asset's values, rather than every device reading the deleted model's note from it again.
+    @Test(arguments: [false, true]) func subscribingAgainDoesNotBringBackTheDeletedModelsLargeNote(freshRecordsConflict: Bool) async throws {
+        let server = FakeCloudServer()
+        server.freshRecordsConflict = freshRecordsConflict
+        let a = TestDevice("A", server: server)
+        let b = TestDevice("B", server: server)
+        try await a.launch()
+        try await b.launch()
+        try a.insertSubscriptions(["s1"])
+        try a.editSubscription("s1") { $0.note = String(repeating: "n", count: 300_000) }
+        await a.sync()
+        await b.sync()
+        #expect(try b.subscription("s1")?.note?.count == 300_000)
+
+        // Offline: unsubscribe and subscribe again
+        a.synchronizer.stop()
+        await a.settle()
+        try a.deleteSubscription("s1")
+        try a.insertSubscriptions(["s1"])
+        await a.settle()
+        a.synchronizer.start()
+        await a.settle()
+        await a.sync()
+        await b.sync()
+        await a.sync()
+
+        let noteA = try a.subscription("s1")?.note
+        let noteB = try b.subscription("s1")?.note
+        #expect(noteA == nil, "A's note: \(noteA?.count ?? 0) characters")
+        #expect(noteB == nil, "B's note: \(noteB?.count ?? 0) characters")
+        a.terminate()
+        b.terminate()
+    }
+
     // MARK: Held records
 
     /// A new device downloads many links before the subscription they reference, which was changed after them, so the links

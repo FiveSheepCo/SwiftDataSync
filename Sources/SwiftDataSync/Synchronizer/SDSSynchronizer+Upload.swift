@@ -668,11 +668,14 @@ extension SDSSynchronizer {
 
             let name = record.recordID.recordName
             let isServerRecord = record.recordChangeTag != nil
-            let hasAsset = !overflowKeys(of: name).isEmpty || (isServerRecord && record[SDSOverflow.key] != nil)
+            let knowsAsset = !overflowKeys(of: name).isEmpty
+            let hasAsset = knowsAsset || (isServerRecord && record[SDSOverflow.key] != nil)
             // Values that fit, of a record without an asset, stay in their fields
             guard hasAsset || round.overflowingLocally.contains(name) else { continue }
             placements.append((index, changedKeys, largeKeys))
-            if !isServerRecord && !round.localInserts.contains(name) {
+            // A local insert's record isn't known to exist, unless it's known to have an asset, e.g. as a model created again
+            // with a deleted one's identity took its record, whose asset still has the deleted model's values
+            if !isServerRecord && (!round.localInserts.contains(name) || knowsAsset) {
                 recordIDsToFetch.append(record.recordID)
             }
         }
