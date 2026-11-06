@@ -223,6 +223,8 @@ final class TestDevice: @unchecked Sendable {
     }
     private static let terminated = OSAllocatedUnfairLock<[Terminated]>(initialState: [])
 
+    static let strictSettle = ProcessInfo.processInfo.environment["STRICT_SETTLE"] != nil
+
     /// Waits until no synchronization runs or is about to start after a save.
     func settle() async {
         var idleChecks = 0

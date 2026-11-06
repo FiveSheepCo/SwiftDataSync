@@ -175,6 +175,12 @@ final class FakeCloudServer: @unchecked Sendable {
         set { lock.withLock { _hangDownloadAfterPages = newValue } }
     }
     private var _hangDownloadAfterPages: Int?
+    /// Only this device's download hangs, if set.
+    var hangDownloadDevice: String? {
+        get { lock.withLock { _hangDownloadDevice } }
+        set { lock.withLock { _hangDownloadDevice = newValue } }
+    }
+    private var _hangDownloadDevice: String?
     /// Downloads that never finish keep their operations, so their continuations aren't reported as leaked.
     private var hungOperations: [CKOperation] = []
     private(set) var hungDownloads: Int {
@@ -190,6 +196,13 @@ final class FakeCloudServer: @unchecked Sendable {
         set { lock.withLock { _beforeModifyRecords = newValue } }
     }
     private var _beforeModifyRecords: (@Sendable (String, [String]) -> Void)?
+
+    /// Called with the device when a record operation starts, before CloudKit reads the files of its assets (round 6).
+    var beforeReadingUploadedAssets: (@Sendable (_ device: String) -> Void)? {
+        get { lock.withLock { _beforeReadingUploadedAssets } }
+        set { lock.withLock { _beforeReadingUploadedAssets = newValue } }
+    }
+    private var _beforeReadingUploadedAssets: (@Sendable (String) -> Void)?
 
     /// Called after a device's download failed, with the error.
     var fetchFailed: (@Sendable (_ device: String, _ error: CKError) -> Void)? {
@@ -238,6 +251,18 @@ final class FakeCloudServer: @unchecked Sendable {
     /// Delivers the assets of the matching records with files that don't exist, e.g. as the system removed them, `count` times in all.
     func breakAssetFiles(where matches: @escaping @Sendable (CKRecord.ID) -> Bool, count: Int = .max) {
         lock.withLock { brokenAssets.append(RecordFailure(matches: matches, error: CKError(.assetFileNotFound), remaining: count)) }
+    }
+
+    /// Deletes records while every device's change token expires (harness, from da8c402).
+    func deleteWhileTokensExpire(_ recordNames: [String], account: String, zone: CKRecordZone.ID = .scenario) {
+        lock.withLock {
+            guard let stored = self.account(account).zones[zone.zoneName] else { return }
+            for name in recordNames {
+                stored.records[name] = nil
+                stored.log.removeAll { $0.recordName == name }
+            }
+            stored.incarnation = UUID()
+        }
     }
 
     /// Deletes records directly, e.g. on another device.
@@ -366,6 +391,7 @@ final class FakeCloudServer: @unchecked Sendable {
         switch operation {
         case let operation as CKModifyRecordsOperation:
             // CloudKit reads the files of assets while uploading. Their files are removed once the operation is done.
+            beforeReadingUploadedAssets?(device)
             let assets = (operation.recordsToSave ?? []).map(assetData(of:))
             DispatchQueue.global().async {
                 self.beginOperation(device)
@@ -466,6 +492,9 @@ final class FakeCloudServer: @unchecked Sendable {
                     continue
                 }
                 let result = save(record, assets: assets, policy: operation.savePolicy, in: account)
+                if let type = ProcessInfo.processInfo.environment["FAKE_LOG_TYPE"], record.recordType == type {
+                    print("SAVE \(device)@\(accountName) \(record.recordID.recordName.prefix(8)) \(record.changedKeys().sorted().map { "\($0)=\(record[$0].map { String(describing: $0).prefix(20) } ?? "nil")" }) tag \(record.recordChangeTag ?? "-") -> \(result.map { _ in "ok" })")
+                }
                 if case .success = result {
                     savedInOperation.insert(record.recordID.recordName)
                 }
@@ -475,6 +504,7 @@ final class FakeCloudServer: @unchecked Sendable {
                 saveResults.append((record.recordID, result))
             }
             for recordID in recordIDsToDelete {
+                if ProcessInfo.processInfo.environment["FAKE_LOG_DELETES"] != nil { print("DELETEATTEMPT \(device) \(recordID.recordName.prefix(8))") }
                 if let index = deleteFailures.firstIndex(where: { $0.remaining > 0 && $0.matches(recordID) }) {
                     deleteFailures[index].remaining -= 1
                     deleteResults.append((recordID, .failure(deleteFailures[index].error)))
@@ -492,6 +522,9 @@ final class FakeCloudServer: @unchecked Sendable {
                 zone.sequence += 1
                 zone.log.append(LogEntry(sequence: zone.sequence, recordName: recordID.recordName, recordType: existing.recordType, isDeletion: true))
                 event.deletedNames.append(recordID.recordName)
+                if let type = ProcessInfo.processInfo.environment["FAKE_LOG_TYPE"], existing.recordType == type {
+                    print("DELETE \(device) \(recordID.recordName.prefix(8))")
+                }
                 deleteResults.append((recordID, .success(())))
                 guard _cascadesDeleteSelf else { continue }
                 var deletedNames = [recordID.recordName]
@@ -607,6 +640,9 @@ final class FakeCloudServer: @unchecked Sendable {
             // A record that was saved before, as it has a change tag, was deleted since
             if record.recordChangeTag != nil {
                 return .failure(CKError(.unknownItem))
+            }
+            if ProcessInfo.processInfo.environment["FAKE_LOG_RESURRECT"] != nil, zone.log.contains(where: { $0.recordName == recordID.recordName && $0.isDeletion }) {
+                print("RESURRECT \(recordID.recordName.prefix(30)) keys \(record.changedKeys().sorted())")
             }
         default:
             break
@@ -765,6 +801,9 @@ final class FakeCloudServer: @unchecked Sendable {
                         }
                         switch change {
                         case .changed(let record):
+                            if let type = ProcessInfo.processInfo.environment["FAKE_LOG_TYPE"], record.recordType == type {
+                                print("DELIVER \(device) \(record.recordID.recordName.prefix(8)) \(record["text"].map { String(describing: $0).prefix(20) } ?? "-")")
+                            }
                             let failure: CKError? = lock.withLock {
                                 guard let index = downloadFailures.firstIndex(where: { $0.remaining > 0 && $0.matches(record.recordID) }) else { return nil }
                                 downloadFailures[index].remaining -= 1
@@ -787,7 +826,7 @@ final class FakeCloudServer: @unchecked Sendable {
                     }
 
                     let hangs: Bool = lock.withLock {
-                        guard let hangAfter = _hangDownloadAfterPages, pages >= hangAfter else { return false }
+                        guard let hangAfter = _hangDownloadAfterPages, pages >= hangAfter, _hangDownloadDevice == nil || _hangDownloadDevice == device else { return false }
                         _hangDownloadAfterPages = nil
                         hungOperations.append(operation)
                         _hungDownloads += 1
