@@ -44,6 +44,19 @@ nonisolated(unsafe) private let playlistModel: NSManagedObjectModel = {
     return model
 }()
 
+/// Like `playlistModel`, but items can't exist without their playlist, whose delete rule only nullifies them. It isn't
+/// changed after it's made.
+nonisolated(unsafe) private let requiredPlaylistModel: NSManagedObjectModel = {
+    let model = playlistModel.copy() as! NSManagedObjectModel
+    let playlist = model.entitiesByName["Playlist"]!
+    let item = model.entitiesByName["PlaylistItem"]!
+    playlist.relationshipsByName["items"]!.deleteRule = .nullifyDeleteRule
+    let owner = item.relationshipsByName["playlist"]!
+    owner.isOptional = false
+    owner.minCount = 1
+    return model
+}()
+
 /// Folders in folders, whose parent is of their own entity. It isn't changed after it's made.
 nonisolated(unsafe) private let folderModel: NSManagedObjectModel = {
     let folder = NSEntityDescription()
@@ -634,6 +647,48 @@ struct CoreDataScenarioTests {
         #expect(references(second) == references(first))
         #expect(references(first) == (isCreated ? [] : ["none", "Other"]))
         #expect(server.records(account: "first").filter { $0.recordType == "RItem" }.count == (isCreated ? 0 : 1))
+        first.synchronizer.invalidate()
+        second.synchronizer.invalidate()
+    }
+
+    /// The same, when the relationship is synchronized on the parent's side, as an ordered list of its children: this device
+    /// moves an item into a playlist another device deleted, without uploading it. The item is gone everywhere, whether the
+    /// playlist's delete rule deletes it, or it can't exist without the playlist.
+    @Test(arguments: [false, true]) func itemMovedIntoAPlaylistDeletedElsewhereIsGoneEverywhere(isRequired: Bool) async throws {
+        let server = FakeCloudServer()
+        let model = isRequired ? requiredPlaylistModel : playlistModel
+        let first = try await CoreDataDevice("A", server: server, model: model)
+        let second = try await CoreDataDevice("B", server: server, model: model)
+        try first.change { context in
+            let kept = NSEntityDescription.insertNewObject(forEntityName: "Playlist", into: context)
+            kept.setValue("Kept", forKey: "title")
+            NSEntityDescription.insertNewObject(forEntityName: "Playlist", into: context).setValue("Deleted", forKey: "title")
+            let item = NSEntityDescription.insertNewObject(forEntityName: "PlaylistItem", into: context)
+            item.setValue("Item", forKey: "name")
+            item.setValue(kept, forKey: "playlist")
+        }
+        await first.sync()
+        await second.sync()
+        #expect(try second.playlists() == ["Kept": ["Item"], "Deleted": []])
+
+        try first.change { context in
+            let playlists = try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "Playlist"))
+            context.delete(try #require(playlists.first { $0.value(forKey: "title") as? String == "Deleted" }))
+        }
+        await first.sync()
+        try second.change { context in
+            let playlists = try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "Playlist"))
+            let item = try #require(try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "PlaylistItem")).first)
+            item.setValue(playlists.first { $0.value(forKey: "title") as? String == "Deleted" }, forKey: "playlist")
+        }
+        await second.sync()
+        await first.sync()
+        await second.sync()
+
+        #expect(try second.playlists() == ["Kept": []])
+        #expect(try first.playlists() == ["Kept": []])
+        #expect(first.count("PlaylistItem") == 0)
+        #expect(server.records(account: "first").filter { $0.recordType == "PlaylistItem" }.isEmpty)
         first.synchronizer.invalidate()
         second.synchronizer.invalidate()
     }

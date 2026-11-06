@@ -1767,17 +1767,20 @@ private final class CKDownloadHandler {
         let deletedHere = deletedRecordIds
         let syncContext = synchronizer.context
         // The keys of objects that changed locally, which weren't uploaded, of objects whose records weren't deleted elsewhere
-        let pendingKeys: [String: [String]] = syncContext.performAndWaitUnchecked {
-            let entries = CloudKitLocalEntity.entries(forLocalIds: Array(localIds.keys), in: syncContext).filter { !deletedHere.contains($0.value.id) }
+        // Also of the deleted objects whose records were deleted elsewhere, whose side of a relationship can have the change
+        let pending: [String: (id: String, keys: [String])] = syncContext.performAndWaitUnchecked {
+            let entries = CloudKitLocalEntity.entries(forLocalIds: Array(localIds.keys), in: syncContext)
             let updates = CloudKitUpdate.find(ids: entries.values.map(\.id), in: syncContext)
-            return entries.compactMapValues { updates[$0.id].map(\.changedKeys) }
+            return entries.mapValues { ($0.id, updates[$0.id]?.changedKeys ?? []) }
         }
         var removals: [SDSObjectDeletion] = []
-        for (localId, keys) in pendingKeys {
+        for (localId, entry) in pending where !deletedHere.contains(entry.id) {
             guard let object = localIds[localId] else { continue }
-            let relationshipKeys = keys.filter { object.entity.relationshipsByName[$0] != nil }
+            let relationshipKeys = object.entity.relationshipsByName.keys.filter { key in
+                entry.keys.contains(key) || isChangeOnOtherSide(of: key, of: object, pendingKeys: { pending[$0.objectID.uriRepresentation().absoluteString]?.keys ?? [] })
+            }
             guard !relationshipKeys.isEmpty else { continue }
-            let movedIntoDeleted = object.committedValues(forKeys: relationshipKeys).values.contains { value in
+            let movedIntoDeleted = object.committedValues(forKeys: Array(relationshipKeys)).values.contains { value in
                 if let object = value as? NSManagedObject { return object.isDeleted }
                 if let objects = value as? NSOrderedSet { return objects.contains { ($0 as? NSManagedObject)?.isDeleted == true } }
                 if let objects = value as? NSSet { return objects.contains { ($0 as? NSManagedObject)?.isDeleted == true } }
@@ -1868,6 +1871,18 @@ private final class CKDownloadHandler {
 
     /// Whether a required to-one relationship of a saved object lost its object, as the object was deleted, e.g. by a
     /// downloaded deletion. Has to be called on `context`'s queue.
+    /// Whether a to-one relationship of `object` changed on this device on the other side, which wasn't uploaded: in the
+    /// pending keys of the object it referenced before, e.g. a playlist's ordered list of items, which the playlist's record
+    /// stores rather than the item's.
+    private func isChangeOnOtherSide(of key: String, of object: NSManagedObject, pendingKeys: (NSManagedObject) -> [String]) -> Bool {
+        guard
+            let inverse = object.entity.relationshipsByName[key]?.inverseRelationship,
+            inverse.isToMany,
+            let previous = object.committedValues(forKeys: [key])[key] as? NSManagedObject
+        else { return false }
+        return pendingKeys(previous).contains(inverse.name)
+    }
+
     private func lostRequiredRelationship(_ key: String, of object: NSManagedObject) -> Bool {
         guard
             !object.isDeleted,
@@ -1939,6 +1954,9 @@ private final class CKDownloadHandler {
         if let key = nsError.userInfo[NSValidationKeyErrorKey] as? String, lostRequiredRelationship(key, of: object) {
             let recordName = synchronizer.existingRecordId(of: object)
             let isMovedHere = recordName.map { pendingLocalChange(of: $0).keys.contains(key) } ?? false
+                || isChangeOnOtherSide(of: key, of: object, pendingKeys: { related in
+                    synchronizer.existingRecordId(of: related).map { Array(pendingLocalChange(of: $0).keys) } ?? []
+                })
             context.delete(object)
             if let recordName, !isMovedHere {
                 deletedRecordIds.insert(recordName)
