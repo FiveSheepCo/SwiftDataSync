@@ -213,8 +213,9 @@ extension SDSSynchronizer {
         // Changes that were saved are stored again, so their saved values are uploaded too, see `contextWillSave`. Also of
         // objects this notification doesn't list, as the keys can be of a save this one is nested in, see `takeKeysBeingSaved(by:)`.
         let listedObjects = (userInfo[NSUpdatedObjectsKey] as? NSSet ?? []).compactMap { $0 as? NSManagedObject }
-        let listedIDs = Set(listedObjects.map(\.objectID))
-        let otherObjects = savedChanges.keys.filter { !listedIDs.contains($0) }.compactMap { objectID -> NSManagedObject? in
+        // Not the ones this save deleted, which aren't marked as deleted anymore while its notification is posted
+        let skippedIDs = Set(listedObjects.map(\.objectID)).union(deletedByThisSave)
+        let otherObjects = savedChanges.keys.filter { !skippedIDs.contains($0) }.compactMap { objectID -> NSManagedObject? in
             // Read on the queue of the context, which is posting the notification
             guard let object = savingContext.registeredObject(for: objectID) ?? (try? savingContext.existingObject(with: objectID)) else { return nil }
             return object.isDeleted ? nil : object
