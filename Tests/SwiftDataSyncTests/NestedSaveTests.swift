@@ -85,4 +85,39 @@ struct NestedSaveTests {
         #expect(try b.notes() == expected, "B")
         a.terminate(); b.terminate()
     }
+
+    /// The app edits n1 and saves; nested saves from DidSave observers edit n2, then edit (or delete) n2 again (fuzz seeds
+    /// 72050, 73072, 72005 on 15fd4f6). The innermost DidSave matches both n2 saves and takes them together; the middle
+    /// save's DidSave then matches nothing and takes the newest entry left, the outer save's, whose keys are dropped as n1
+    /// isn't among that notification's objects.
+    @Test(arguments: ["edit", "delete"])
+    func twoNestedSavesOfTheSameObjectKeepTheOuterSavesEdit(innermost: String) async throws {
+        let saver = ReproNestedSaver()
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server), b = TestDevice("B", server: server)
+        try await a.launch(); try await b.launch()
+        try a.change { context in
+            for index in 1...3 { context.insert(ScenarioNote(text: "n\(index)")) }
+        }
+        await a.sync(); await b.sync()
+
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = try #require(a.synchronizer.observedStore)
+        try context.performAndWait {
+            saver.arm(context, steps: [
+                { context in reproNote(context, prefix: "n2")?.setValue("n2 edited", forKey: "text") },
+                { context in
+                    if innermost == "edit" { reproNote(context, prefix: "n2")?.setValue("n2 edited twice", forKey: "text") }
+                    else if let n2 = reproNote(context, prefix: "n2") { context.delete(n2) }
+                }
+            ])
+            reproNote(context, prefix: "n1")?.setValue("n1 edited", forKey: "text")
+            try context.save()
+        }
+        await a.sync(); await a.sync(); await b.sync()
+        let expected = innermost == "edit" ? ["n1 edited", "n2 edited twice", "n3"] : ["n1 edited", "n3"]
+        #expect(try a.notes() == expected, "local")
+        #expect(a.serverNotes() == expected, "server \(a.serverNotes())")
+        a.terminate(); b.terminate()
+    }
 }

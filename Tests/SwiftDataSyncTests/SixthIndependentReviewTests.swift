@@ -233,55 +233,45 @@ struct SixthIndependentReviewTests {
         a.terminate()
     }
 
-    /// The saves a DidSave is matched with, by the objects they started with. Several that match are taken together, and
-    /// none that matches takes the newest, as before.
-    @Test func savesAreMatchedByTheirObjects() async throws {
+    /// A DidSave takes the keys of every save of its context that started, as the others are of saves it's nested in, or of
+    /// saves that failed, and only the deletions of the objects it lists as deleted, as a failed save's mustn't be uploaded.
+    @Test func didSaveTakesEverySavesKeysAndOnlyItsDeletions() async throws {
         let server = FakeCloudServer()
         let a = TestDevice("A", server: server)
         try await a.launch()
-        try a.change { $0.insert(ScenarioNote(text: "n")) }
+        try a.change { context in
+            context.insert(ScenarioNote(text: "n1"))
+            context.insert(ScenarioNote(text: "n2"))
+        }
         let synchronizer = try #require(a.synchronizer)
         let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
         context.persistentStoreCoordinator = try #require(synchronizer.observedStore)
-        let (one, two, three) = (NSObject(), NSObject(), NSObject())
-        let objectID = try #require(context.performAndWait {
-            try? context.fetch(NSFetchRequest<NSManagedObject>(entityName: "ScenarioNote")).first?.objectID
-        })
-        func remember(_ key: String, _ objects: [NSObject]) -> Int {
-            synchronizer.rememberKeysBeingSaved([objectID: [key]], previousReferences: [:], objects: Set(objects.map(ObjectIdentifier.init)), by: context)
+        let ids = try context.performAndWait {
+            try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "ScenarioNote")).map(\.objectID)
         }
+        #expect(ids.count == 2)
+        let deletion = { (id: NSManagedObjectID) in SDSObjectDeletion(localId: id.uriRepresentation().absoluteString, sharableRootLocalId: nil, isSharable: false) }
 
-        // The outer save's DidSave, below a failed save of other objects
-        let outer = remember("outer", [one, two])
-        _ = remember("failed", [three])
-        let first = try #require(synchronizer.takeKeysBeingSaved(by: context, savedObjects: Set([one, two].map(ObjectIdentifier.init))))
-        #expect(first.tokens == [outer])
-        #expect(first.save.keys[objectID] == ["outer"])
+        let outer = synchronizer.rememberKeysBeingSaved([ids[0]: ["outer"]], previousReferences: [:], by: context)
+        synchronizer.rememberDeletionsBeingSaved([ids[1]: deletion(ids[1])], token: outer, by: context)
+        let nested = synchronizer.rememberKeysBeingSaved([ids[1]: ["nested"]], previousReferences: [:], by: context)
+        synchronizer.rememberDeletionsBeingSaved([ids[0]: deletion(ids[0])], token: nested, by: context)
 
-        // A failed save of objects that are saved too is taken with the save
-        _ = remember("failed of the same", [one])
-        let next = remember("next", [one, two])
-        let both = try #require(synchronizer.takeKeysBeingSaved(by: context, savedObjects: Set([one, two].map(ObjectIdentifier.init))))
-        #expect(both.save.token == next)
-        #expect(both.tokens.count == 2)
-        #expect(both.save.keys[objectID] == ["failed of the same", "next"])
+        // The nested save's notification lists the deletion of the second note
+        let keys = try #require(synchronizer.takeKeysBeingSaved(by: context))
+        #expect(keys.token == nested)
+        #expect(keys.keys == [ids[0]: ["outer"], ids[1]: ["nested"]])
+        let deletions = synchronizer.takeDeletionsBeingSaved(by: context, deleted: [ids[1]])
+        #expect(Array(deletions.keys) == [ids[1]])
+        synchronizer.finishStoringRemovals(of: Array(deletions.values))
 
-        // A save that only inserted, below the save whose notification this is, e.g. one whose notification's observer saves
-        // again, isn't taken by it, but by its own notification later
-        let inserting = remember("inserting", [])
-        let fromObserver = remember("from observer", [two])
-        let observers = try #require(synchronizer.takeKeysBeingSaved(by: context, savedObjects: [ObjectIdentifier(two)]))
-        #expect(observers.tokens == [fromObserver])
-        let inserts = try #require(synchronizer.takeKeysBeingSaved(by: context, savedObjects: []))
-        #expect(inserts.tokens == [inserting])
-
-        // Without a match, the newest, which leaves the failed save of other objects from the start
-        let newest = remember("unmatched", [one])
-        let fallback = try #require(synchronizer.takeKeysBeingSaved(by: context, savedObjects: []))
-        #expect(fallback.tokens == [newest])
-        let left = try #require(synchronizer.takeKeysBeingSaved(by: context, savedObjects: [ObjectIdentifier(three)]))
-        #expect(left.save.keys[objectID] == ["failed"])
-        #expect(synchronizer.takeKeysBeingSaved(by: context, savedObjects: []) == nil ? true : false)
+        // The outer save's notification finds no keys left, and the deletion of the first note is still there for it
+        #expect(synchronizer.takeKeysBeingSaved(by: context) == nil ? true : false)
+        #expect(synchronizer.isDeletionPending(localId: ids[0].uriRepresentation().absoluteString))
+        let outerDeletions = synchronizer.takeDeletionsBeingSaved(by: context, deleted: [ids[0]])
+        #expect(Array(outerDeletions.keys) == [ids[0]])
+        synchronizer.finishStoringRemovals(of: Array(outerDeletions.values))
+        #expect(!synchronizer.hasPendingDeletions)
         a.terminate()
     }
 
