@@ -145,6 +145,61 @@ struct SixthIndependentReviewTests {
         a.terminate()
     }
 
+    /// Like `failedNestedSaveFromAnObserverOfTheAppKeepsTheFirstSavesEdits`, with a first save that also inserts a model of
+    /// a unique value that exists, which the context's merge policy folds into the existing one, as SwiftData does for
+    /// `@Attribute(.unique)`. Its DidSave doesn't list the inserted model, and still finds the save's keys.
+    @Test func failedNestedSaveAfterAnUpsertKeepsTheFirstSavesEdits() async throws {
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        let appContext = OSAllocatedUnfairLock<NSManagedObjectContext?>(uncheckedState: nil)
+        let savesAgain = OSAllocatedUnfairLock(initialState: false)
+        let nestedFailed = OSAllocatedUnfairLock(initialState: false)
+        let observer = NotificationCenter.default.addObserver(forName: .NSManagedObjectContextDidSave, object: nil, queue: nil) { notification in
+            guard
+                let context = notification.object as? NSManagedObjectContext,
+                appContext.withLockUnchecked({ $0 === context }),
+                savesAgain.withLock({ isSaving in defer { isSaving = false }; return isSaving })
+            else { return }
+            let notes = try? context.fetch(NSFetchRequest<NSManagedObject>(entityName: "ScenarioNote"))
+            notes?.first { ($0.value(forKey: "text") as? String) == "n2" }?.setValue("n2 never saved", forKey: "text")
+            NSEntityDescription.insertNewObject(forEntityName: "ScenarioTag", into: context).setValue("t", forKey: "name")
+            let policy = context.mergePolicy
+            context.mergePolicy = NSMergePolicy.error
+            do {
+                try context.save()
+            } catch {
+                nestedFailed.withLock { $0 = true }
+                context.rollback()
+            }
+            context.mergePolicy = policy
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        try await a.launch()
+        try a.change { context in
+            for index in 1...2 { context.insert(ScenarioNote(text: "n\(index)")) }
+            context.insert(ScenarioTag(name: "t"))
+        }
+        await a.sync()
+
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = try #require(a.synchronizer.observedStore)
+        context.mergePolicy = NSMergePolicy.mergeByPropertyObjectTrump
+        appContext.withLockUnchecked { $0 = context }
+        try context.performAndWait {
+            let notes = try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "ScenarioNote"))
+            notes.first { ($0.value(forKey: "text") as? String) == "n1" }?.setValue("n1 edited", forKey: "text")
+            NSEntityDescription.insertNewObject(forEntityName: "ScenarioTag", into: context).setValue("t", forKey: "name")
+            savesAgain.withLock { $0 = true }
+            try context.save()
+        }
+        await a.sync()
+        await a.sync()
+
+        #expect(nestedFailed.withLock { $0 })
+        #expect(a.serverNotes() == ["n1 edited", "n2"])
+        a.terminate()
+    }
+
     /// A save fails, and the app saves other changes right after, before the failed save's keys are dropped. The second
     /// save's edit is uploaded, and the failed one's isn't.
     @Test func saveRightAfterAFailedOneKeepsItsEdits() async throws {
@@ -372,6 +427,28 @@ struct SixthIndependentReviewTests {
         #expect(held.load().map(\.recordID.recordName) == ["n1"])
         #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).count == 3)
         #expect(held.loadFailedIDs() == [records[0].recordID])
+    }
+
+    // MARK: Temporary asset files
+
+    /// Setting up a synchronizer removes the files of assets that earlier uploads left behind, but not the ones of uploads
+    /// that are running, e.g. of another synchronizer of the process, which CloudKit would then reject with
+    /// `assetFileNotFound`.
+    @Test func setupLeavesTheAssetFilesOfRunningUploads() async throws {
+        let running = try CKAsset(data: Data("running".utf8))
+        let leftover = try CKAsset(data: Data("leftover".utf8))
+        let runningURL = try #require(running.fileURL)
+        let leftoverURL = try #require(leftover.fileURL)
+        defer { try? FileManager.default.removeItem(at: runningURL) }
+        let old = Date.now.addingTimeInterval(-CKAsset.leftoverTemporaryFileAge - 60)
+        try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: leftoverURL.path)
+
+        let server = FakeCloudServer()
+        let a = TestDevice("A", server: server)
+        try await a.launch()
+        #expect(FileManager.default.fileExists(atPath: runningURL.path))
+        #expect(!FileManager.default.fileExists(atPath: leftoverURL.path))
+        a.terminate()
     }
 
     // MARK: Extensions
