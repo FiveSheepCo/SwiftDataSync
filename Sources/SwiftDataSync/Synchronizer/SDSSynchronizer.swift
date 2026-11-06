@@ -716,7 +716,12 @@ public final class SDSSynchronizer: Sendable {
         mutableState.withLock { state in
             let id = ObjectIdentifier(context)
             guard let saves = state.keysBeingSaved[id], !saves.isEmpty else { return nil }
-            let matching = saves.filter { $0.objects.isSubset(of: savedObjects) }
+            // A save that only inserts has no objects here, and would match every save, e.g. a save of an app's observer of
+            // its `NSManagedObjectContextDidSave`, which would take its keys. It's only the newest's: one below that is
+            // done once a later save's notification arrives, or failed.
+            let matching = saves.indices.filter { index in
+                saves[index].objects.isEmpty ? index == saves.count - 1 : saves[index].objects.isSubset(of: savedObjects)
+            }.map { saves[$0] }
             let taken = matching.isEmpty ? [saves[saves.count - 1]] : matching
             let tokens = Set(taken.map(\.token))
             var save = taken[taken.count - 1]
