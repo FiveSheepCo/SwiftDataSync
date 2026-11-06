@@ -19,6 +19,9 @@ struct SDSObjectChange: Sendable {
     var allKeys: [String] = []
     /// The URIs of the objects the object referenced before its relationships changed, see `CloudKitUpdate.previousReferences`.
     var previousReferenceLocalIds: [String] = []
+    /// The names of records the object's record references in iCloud, whose objects have other records now, e.g. one a
+    /// download replaced, see `CloudKitUpdate.previousReferences`.
+    var previousReferenceRecordIds: [String] = []
 }
 
 /// A deletion of a synchronizable object, read while the object can still be read, when its save starts. It's stored once
