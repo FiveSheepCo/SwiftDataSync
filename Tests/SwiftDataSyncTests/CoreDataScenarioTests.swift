@@ -542,6 +542,36 @@ struct CoreDataScenarioTests {
     /// uploading that yet. The item goes with the folder everywhere, like a child moved into a parent whose delete rule
     /// cascades, and so does what requires it, or what its delete rule deletes. What refers to it doesn't anymore, also with
     /// this device's other edits. Nothing stays pointing at the deleted folder.
+    /// A record that lacks a required relationship, e.g. one uploaded by a device that couldn't reference the related
+    /// model, can't be stored. It's set aside, rather than failing every download, which would also keep every upload
+    /// from running.
+    @Test func downloadedRecordWithoutARequiredRelationshipDoesNotStopSynchronizing() async throws {
+        let server = FakeCloudServer()
+        let device = try await CoreDataDevice("A", server: server, model: requiredFolderModel)
+
+        let broken = CKRecord(recordType: "RItem", recordID: CKRecord.ID(recordName: "broken", zoneID: .scenario))
+        broken["name"] = "Without folder"
+        let alsoBroken = CKRecord(recordType: "RItem", recordID: CKRecord.ID(recordName: "alsoBroken", zoneID: .scenario))
+        alsoBroken["name"] = "Also without folder"
+        server.seed([broken, alsoBroken], account: "first")
+        await device.sync()
+
+        if case .error(let error) = await device.synchronizer.viewModel.state {
+            Issue.record("Synchronizing failed: \(error)")
+        }
+        #expect(device.count("RItem") == 0)
+
+        // Later changes are still uploaded
+        try device.change { context in
+            NSEntityDescription.insertNewObject(forEntityName: "RFolder", into: context).setValue("New", forKey: "name")
+        }
+        await device.sync()
+        #expect(server.records(account: "first").contains { $0.recordType == "RFolder" && $0["name"] as? String == "New" })
+        if case .error(let error) = await device.synchronizer.viewModel.state {
+            Issue.record("Synchronizing failed: \(error)")
+        }
+    }
+
     @Test(arguments: [true, false]) func downloadedDeletionTakesSynchronizedObjectsWithUnuploadedRelationships(isCreated: Bool) async throws {
         let server = FakeCloudServer()
         let first = try await CoreDataDevice("A", server: server, model: requiredFolderModel)

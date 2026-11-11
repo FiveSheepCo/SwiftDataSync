@@ -1896,6 +1896,14 @@ private final class CKDownloadHandler {
         return previous.isDeleted
     }
 
+    /// The key of the errors Core Data collects when a save has several, like `NSDetailedErrorsKey`.
+    ///
+    /// Not the constant itself: Foundation exports a symbol of the same name, whose value is `"NSDetailedErrorsKey"`, and
+    /// depending on the order the frameworks are linked in, it's taken for Core Data's. The sub-errors would never be
+    /// found, so every download with a value the store rejects would be discarded again and again, keeping every upload
+    /// from running too.
+    static let detailedErrorsKey = "NSDetailedErrors"
+
     /// Tries fixing the given error and returns whether the context should try to save again or a fix was not possible.
     /// Has to be called on `context`'s queue.
     ///
@@ -1907,7 +1915,7 @@ private final class CKDownloadHandler {
         let nsError = error as NSError
         
         // If there are detailed sub-errors, recursively try to fix each
-        if let subErrorsAny = nsError.userInfo[NSDetailedErrorsKey] {
+        if let subErrorsAny = nsError.userInfo[Self.detailedErrorsKey] {
             guard let subErrorsArray = subErrorsAny as? [Any] else {
                 synchronizer.logger.log("tryFixingObservedContext: NSDetailedErrors is no array: \("\(subErrorsAny)", privacy: .public)")
                 return false
